@@ -149,6 +149,6 @@ For production:
 
 ## Next Steps
 
-- Review [Full Documentation](CHATGPT_CONNECTOR_README.md)
-- Check [Architecture Overview](docs/CHATGPT_CONNECTOR_FLOW.md)
-- For production deployment, see [Deployment Guide](docs/CHATGPT_DEPLOYMENT.md)
+- Review [Full Documentation](CHATGPT_SETUP.md)
+- Check [Architecture Overview](CHATGPT_CONNECTOR_FLOW.md)
+- For production deployment, see [Deployment Guide](CHATGPT_DEPLOYMENT.md)

@@ -317,7 +317,7 @@ For ChatGPT, you'll need to:
 2. Configure the MCP connector in ChatGPT settings
 3. Add your server URL and authentication
 
-See [ChatGPT Connector Setup](CHATGPT_CONNECTOR_README.md) for detailed instructions.
+See [ChatGPT Connector Setup](docs/CHATGPT_SETUP.md) for detailed instructions.
 
 ## Usage Examples
 

@@ -41,9 +41,9 @@ That's it\! Start chatting with your Jamf data through ChatGPT.
 
 ## 📚 Documentation
 
-- [Full Setup Guide](CHATGPT_CONNECTOR_README.md)
-- [Configuration Options](CHATGPT_CONFIGURATION.md)
-- [Architecture Overview](docs/CHATGPT_CONNECTOR_FLOW.md)
+- [Full Setup Guide](CHATGPT_SETUP.md)
+- [Deployment Guide](CHATGPT_DEPLOYMENT.md)
+- [Architecture Overview](CHATGPT_CONNECTOR_FLOW.md)
 
 ## 🔒 Security Note
 
