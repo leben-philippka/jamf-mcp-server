@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Enhanced Mode Server with Advanced Error Handling and Skills
- * 
+ *
  * This version includes:
  * - Automatic retries with exponential backoff
  * - Rate limiting
@@ -18,29 +18,44 @@ import { registerResources } from './resources/index-compat.js';
 import { registerPrompts } from './prompts/index.js';
 import { SkillsManager } from './skills/manager.js';
 import { registerSkillsAsMCPTools } from './tools/skills-mcp-integration.js';
+import { createLogger } from './server/logger.js';
+import { validateJamfConfig, validateEnhancedModeConfig } from './utils/env-validation.js';
 
-// Environment variables
-const JAMF_URL = process.env.JAMF_URL;
-const JAMF_CLIENT_ID = process.env.JAMF_CLIENT_ID;
-const JAMF_CLIENT_SECRET = process.env.JAMF_CLIENT_SECRET;
-const READ_ONLY_MODE = process.env.JAMF_READ_ONLY === 'true';
+const logger = createLogger('JamfMCPServerEnhanced');
 
-// Enhanced mode configuration
-const ENABLE_RETRY = process.env.JAMF_ENABLE_RETRY !== 'false';
-const ENABLE_RATE_LIMITING = process.env.JAMF_ENABLE_RATE_LIMITING === 'true';
-const ENABLE_CIRCUIT_BREAKER = process.env.JAMF_ENABLE_CIRCUIT_BREAKER === 'true';
-const DEBUG_MODE = process.env.JAMF_DEBUG_MODE === 'true';
-
-// Validate configuration
-if (!JAMF_URL) {
-  console.error('Missing required environment variable: JAMF_URL');
+// Validate environment variables using Zod schemas
+const jamfConfigResult = validateJamfConfig(process.env);
+if (!jamfConfigResult.valid) {
+  logger.error('Environment validation failed:');
+  logger.error(jamfConfigResult.error?.format() || 'Unknown validation error');
   process.exit(1);
 }
 
+const enhancedConfigResult = validateEnhancedModeConfig(process.env);
+if (!enhancedConfigResult.valid) {
+  logger.error('Enhanced mode configuration validation failed:');
+  logger.error(enhancedConfigResult.error?.format() || 'Unknown validation error');
+  process.exit(1);
+}
+
+const jamfConfig = jamfConfigResult.config!;
+const enhancedConfig = enhancedConfigResult.config!;
+
+const JAMF_URL = jamfConfig.JAMF_URL;
+const JAMF_CLIENT_ID = jamfConfig.JAMF_CLIENT_ID;
+const JAMF_CLIENT_SECRET = jamfConfig.JAMF_CLIENT_SECRET;
+const READ_ONLY_MODE = jamfConfig.JAMF_READ_ONLY ?? false;
+
+// Enhanced mode configuration - validated by Zod schema
+const ENABLE_RETRY = enhancedConfig.JAMF_ENABLE_RETRY ?? true;
+const ENABLE_RATE_LIMITING = enhancedConfig.JAMF_ENABLE_RATE_LIMITING ?? false;
+const ENABLE_CIRCUIT_BREAKER = enhancedConfig.JAMF_ENABLE_CIRCUIT_BREAKER ?? false;
+const DEBUG_MODE = enhancedConfig.JAMF_DEBUG_MODE ?? false;
+
 // Enhanced mode requires OAuth2
 if (!JAMF_CLIENT_ID || !JAMF_CLIENT_SECRET) {
-  console.error('Enhanced mode requires OAuth2 authentication.');
-  console.error('Please provide JAMF_CLIENT_ID and JAMF_CLIENT_SECRET.');
+  logger.error('Enhanced mode requires OAuth2 authentication.');
+  logger.error('Please provide JAMF_CLIENT_ID and JAMF_CLIENT_SECRET.');
   process.exit(1);
 }
 
@@ -76,20 +91,20 @@ async function run() {
     // console.error(`  ${DEBUG_MODE ? '✅' : '❌'} Debug mode`);
     // console.error(`  ✅ Skills integration`);
 
-    // Initialize the enhanced client
+    // Initialize the enhanced client with validated config values
     const jamfClient = new JamfApiClientHybrid({
-      baseUrl: JAMF_URL!,
+      baseUrl: JAMF_URL,
       clientId: JAMF_CLIENT_ID,
       clientSecret: JAMF_CLIENT_SECRET,
       readOnlyMode: READ_ONLY_MODE,
       // TLS/SSL configuration - only disable for development with self-signed certs
-      rejectUnauthorized: process.env.JAMF_ALLOW_INSECURE !== 'true',
-      // Enhanced features
+      rejectUnauthorized: !(jamfConfig.JAMF_ALLOW_INSECURE ?? false),
+      // Enhanced features - values validated by Zod schema
       enableRetry: ENABLE_RETRY,
-      maxRetries: parseInt(process.env.JAMF_MAX_RETRIES || '3'),
-      retryDelay: parseInt(process.env.JAMF_RETRY_DELAY || '1000'),
-      retryMaxDelay: parseInt(process.env.JAMF_RETRY_MAX_DELAY || '10000'),
-      retryBackoffMultiplier: parseInt(process.env.JAMF_RETRY_BACKOFF_MULTIPLIER || '2'),
+      maxRetries: enhancedConfig.JAMF_MAX_RETRIES ?? 3,
+      retryDelay: enhancedConfig.JAMF_RETRY_DELAY ?? 1000,
+      retryMaxDelay: enhancedConfig.JAMF_RETRY_MAX_DELAY ?? 10000,
+      retryBackoffMultiplier: enhancedConfig.JAMF_RETRY_BACKOFF_MULTIPLIER ?? 2,
       enableRateLimiting: ENABLE_RATE_LIMITING,
       enableCircuitBreaker: ENABLE_CIRCUIT_BREAKER,
       debugMode: DEBUG_MODE,
@@ -107,15 +122,14 @@ async function run() {
     const transport = new StdioServerTransport();
     await server.connect(transport);
     
-    // console.error('\nJamf MCP server (ENHANCED MODE) started successfully with skills');
-    // console.error('Ready to handle requests with advanced error handling and skills...');
+    // Server started successfully - no logging in MCP servers to avoid breaking JSON-RPC
   } catch (error) {
-    console.error('Failed to initialize enhanced Jamf MCP server:', error);
+    logger.error('Failed to initialize enhanced Jamf MCP server', { error });
     process.exit(1);
   }
 }
 
 run().catch((error) => {
-  console.error('Fatal error:', error);
+  logger.error('Fatal error', { error });
   process.exit(1);
 });

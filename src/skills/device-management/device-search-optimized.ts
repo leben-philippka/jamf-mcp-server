@@ -4,6 +4,7 @@
  */
 
 import { SkillContext, SkillResult } from '../types.js';
+import { buildErrorContext } from '../../utils/error-handler.js';
 
 interface DeviceSearchParams {
   query: string;
@@ -140,9 +141,10 @@ export async function deviceSearchOptimized(
                 }
               }
             }
-          } catch (error: any) {
-            if (error.message !== 'Timeout') {
-              context.logger?.warn(`Failed to get details for device ${device.id}`, error);
+          } catch (error: unknown) {
+            const message = error instanceof Error ? error.message : String(error);
+            if (message !== 'Timeout') {
+              context.logger?.warn(`Failed to get details for device ${device.id}`, { error: message });
             }
           }
         }
@@ -243,11 +245,21 @@ export async function deviceSearchOptimized(
         searchType
       }
     };
-  } catch (error: any) {
+  } catch (error: unknown) {
+    const errorContext = buildErrorContext(
+      error,
+      'Device search',
+      'device-search-optimized',
+      { query: params.query, searchType: params.searchType }
+    );
     return {
       success: false,
-      message: `Device search failed: ${error.message}`,
-      error
+      message: `Device search failed: ${errorContext.message}${errorContext.suggestions ? ` (${errorContext.suggestions[0]})` : ''}`,
+      error: error instanceof Error ? error : new Error(errorContext.message),
+      data: {
+        errorCode: errorContext.code,
+        timestamp: errorContext.timestamp,
+      }
     };
   }
 }

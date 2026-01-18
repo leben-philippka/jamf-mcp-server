@@ -1,0 +1,214 @@
+{
+  "branchName": "ralph/improvements",
+  "description": "High priority improvements and missing features for production readiness",
+  "userStories": [
+    {
+      "id": "IMP-001",
+      "title": "Remove all console.log/error/warn calls",
+      "acceptanceCriteria": [
+        "Remove or replace all console.log with logger in src/",
+        "Remove or replace all console.error with logger.error",
+        "Remove or replace all console.warn with logger.warn",
+        "No console.* calls remain in src/ (except in tests)",
+        "npm run typecheck passes",
+        "npm test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "MCP servers must not write to stdout/stderr. Use createLogger() from src/server/logger.ts. Check: src/index.ts, src/jamf-client-hybrid.ts, src/skills/http-initializer.ts, src/cli/"
+    },
+    {
+      "id": "IMP-002",
+      "title": "Fix any types in error catch blocks",
+      "acceptanceCriteria": [
+        "Replace all 'catch (error: any)' with proper error handling",
+        "Use type guards from src/utils/type-guards.ts or create new ones",
+        "Replace 'catch (e: any)' patterns similarly",
+        "npm run typecheck passes",
+        "npm test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Focus on catch blocks first. Use: if (error instanceof Error) { error.message } else { String(error) }"
+    },
+    {
+      "id": "IMP-003",
+      "title": "Fix any types in skills and tools",
+      "acceptanceCriteria": [
+        "Replace 'as any' casts in src/skills/ with proper types",
+        "Replace 'as any' casts in src/tools/ with proper types",
+        "Add proper types to function parameters marked as any",
+        "npm run typecheck passes",
+        "npm test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Check src/skills/http-initializer.ts, src/tools/skills-integration.ts, src/skills/manager.ts"
+    },
+    {
+      "id": "IMP-004",
+      "title": "Add Zod validation to tool parameters",
+      "acceptanceCriteria": [
+        "Create Zod schemas for tool parameters in src/tools/tool-implementations.ts",
+        "Validate device IDs, policy IDs format",
+        "Validate numeric ranges (e.g., days parameter)",
+        "Validate search query strings",
+        "Return clear validation error messages",
+        "npm run typecheck passes",
+        "npm test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Zod is already a dependency. Add schemas before API calls."
+    },
+    {
+      "id": "IMP-005",
+      "title": "Improve error handling with full context",
+      "acceptanceCriteria": [
+        "Preserve stack traces through promise chains",
+        "Add structured error context to catch blocks in src/tools/",
+        "Add structured error context to catch blocks in src/skills/",
+        "Create error response objects with user-friendly and technical messages",
+        "npm run typecheck passes",
+        "npm test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Check src/utils/error-handler.ts for patterns. Ensure errors have: message, code, context, stack"
+    },
+    {
+      "id": "IMP-006",
+      "title": "Add token refresh mechanism to Jamf client",
+      "acceptanceCriteria": [
+        "Track token expiration time in jamf-client-hybrid.ts",
+        "Check token expiration before requests",
+        "Automatically re-authenticate on 401 responses",
+        "Store token metadata (issued_at, expires_in)",
+        "npm run typecheck passes",
+        "npm test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "Modify src/jamf-client-hybrid.ts. OAuth tokens typically expire in 30 minutes."
+    },
+    {
+      "id": "IMP-007",
+      "title": "Consolidate duplicate Jamf client implementations",
+      "acceptanceCriteria": [
+        "Determine which client is better (jamf-client-hybrid.ts vs jamf-client-hybrid-fixed.ts)",
+        "Merge any unique functionality into one file",
+        "Delete the redundant file",
+        "Update all imports",
+        "npm run typecheck passes",
+        "npm test passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "Two similar files exist. Keep the better one, remove duplication."
+    },
+    {
+      "id": "IMP-008",
+      "title": "Add environment variable validation",
+      "acceptanceCriteria": [
+        "Create Zod schema for all environment variables",
+        "Validate on startup in src/index-main.ts",
+        "Validate port bounds, rate limit values",
+        "Provide helpful error messages for invalid values",
+        "npm run typecheck passes",
+        "npm test passes"
+      ],
+      "priority": 8,
+      "passes": true,
+      "notes": "Created src/utils/env-validation.ts with comprehensive Zod schemas. Validation added to index.ts, index-enhanced.ts, and http-server.ts."
+    },
+    {
+      "id": "IMP-009",
+      "title": "Add circuit breaker for Jamf API calls",
+      "acceptanceCriteria": [
+        "Implement circuit breaker pattern in src/utils/",
+        "Integrate with Jamf client for API calls",
+        "Configure thresholds (failures before open, reset timeout)",
+        "Add circuit state to health check",
+        "npm run typecheck passes",
+        "npm test passes"
+      ],
+      "priority": 9,
+      "passes": true,
+      "notes": "Used existing CircuitBreaker from src/utils/retry.ts. Integrated via JamfApiClientHybrid with configurable thresholds. Added to health check."
+    },
+    {
+      "id": "IMP-010",
+      "title": "Add granular health check with component breakdown",
+      "acceptanceCriteria": [
+        "Extend src/server/health-check.ts with component status",
+        "Add Jamf API connectivity check",
+        "Add authentication status check",
+        "Add skills manager status",
+        "Return JSON with component breakdown",
+        "npm run typecheck passes",
+        "npm test passes"
+      ],
+      "priority": 10,
+      "passes": true,
+      "notes": "Added componentHealthCheck() with component breakdown: jamfApi, auth, skills, cache. Added checkAuthentication(), checkSkillsManager(), checkCache(), and getStatus() to SkillsManager."
+    },
+    {
+      "id": "IMP-011",
+      "title": "Create architecture documentation",
+      "acceptanceCriteria": [
+        "Create docs/ARCHITECTURE.md",
+        "Document component diagram (MCP server, skills, tools, resources)",
+        "Document data flow for requests",
+        "Document hybrid client approach and why",
+        "Document skills execution flow"
+      ],
+      "priority": 11,
+      "passes": true,
+      "notes": "Created comprehensive docs/ARCHITECTURE.md with ASCII component diagrams, data flow diagrams, hybrid client explanation, and skills execution flow."
+    },
+    {
+      "id": "IMP-012",
+      "title": "Add tests for retry and circuit breaker utilities",
+      "acceptanceCriteria": [
+        "Create src/__tests__/utils/retry.test.ts",
+        "Test CircuitBreaker state transitions",
+        "Test RetryableCircuitBreaker retry logic",
+        "Test failure thresholds and reset behavior",
+        "npm test passes",
+        "npm run typecheck passes"
+      ],
+      "priority": 12,
+      "passes": true,
+      "notes": "Created comprehensive test suite with 32 tests covering CircuitBreaker state transitions (CLOSED->OPEN->HALF_OPEN->CLOSED), RetryableCircuitBreaker with per-key breakers, retryWithBackoff with retry conditions, and batchRetryWithBreaker for parallel operations."
+    },
+    {
+      "id": "IMP-013",
+      "title": "Add tests for HTTP agent pool",
+      "acceptanceCriteria": [
+        "Create src/__tests__/utils/http-agent-pool.test.ts",
+        "Test pool initialization",
+        "Test connection reuse",
+        "Test cleanup/shutdown",
+        "npm test passes",
+        "npm run typecheck passes"
+      ],
+      "priority": 13,
+      "passes": true,
+      "notes": "Created comprehensive test suite with 27 tests covering singleton pattern, getAgent URL routing, metrics, destroy/cleanup, updateConfig, keep-alive timeout, and TLS settings."
+    },
+    {
+      "id": "IMP-014",
+      "title": "Commit all improvements and create PR",
+      "acceptanceCriteria": [
+        "All changes committed with conventional commit format",
+        "Push ralph/improvements branch to origin",
+        "Create PR with comprehensive description",
+        "PR includes summary of all improvements",
+        "PR URL returned"
+      ],
+      "priority": 14,
+      "passes": true,
+      "notes": "Created PR #7: https://github.com/dbankscard/jamf-mcp-server/pull/7"
+    }
+  ]
+}

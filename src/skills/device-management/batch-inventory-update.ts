@@ -6,6 +6,7 @@
  */
 
 import { SkillContext, SkillResult } from '../types.js';
+import { buildErrorContext } from '../../utils/error-handler.js';
 
 interface BatchInventoryUpdateParams {
   deviceIdentifiers: string[];
@@ -48,10 +49,16 @@ export async function batchInventoryUpdate(
               error: 'Device not found'
             });
           }
-        } catch (error: any) {
+        } catch (error: unknown) {
+          const errorContext = buildErrorContext(
+            error,
+            `Search device: ${identifier}`,
+            'batch-inventory-update',
+            { identifier, identifierType: params.identifierType }
+          );
           results.failed.push({
             device: identifier,
-            error: `Search failed: ${error.message}`
+            error: `Search failed: ${errorContext.message}`
           });
         }
       }
@@ -67,10 +74,16 @@ export async function batchInventoryUpdate(
         try {
           await context.callTool('updateInventory', { deviceId });
           results.successful.push(deviceId);
-        } catch (error: any) {
+        } catch (error: unknown) {
+          const errorContext = buildErrorContext(
+            error,
+            `Update inventory: ${deviceId}`,
+            'batch-inventory-update',
+            { deviceId }
+          );
           results.failed.push({
             device: deviceId,
-            error: error.message
+            error: errorContext.message
           });
         }
       });
@@ -104,11 +117,21 @@ export async function batchInventoryUpdate(
       message: response,
       data: results
     };
-  } catch (error: any) {
+  } catch (error: unknown) {
+    const errorContext = buildErrorContext(
+      error,
+      'Batch inventory update',
+      'batch-inventory-update',
+      { deviceCount: params.deviceIdentifiers.length, identifierType: params.identifierType }
+    );
     return {
       success: false,
-      message: `Batch update failed: ${error.message}`,
-      error
+      message: `Batch update failed: ${errorContext.message}${errorContext.suggestions ? ` (${errorContext.suggestions[0]})` : ''}`,
+      error: error instanceof Error ? error : new Error(errorContext.message),
+      data: {
+        errorCode: errorContext.code,
+        timestamp: errorContext.timestamp,
+      }
     };
   }
 }

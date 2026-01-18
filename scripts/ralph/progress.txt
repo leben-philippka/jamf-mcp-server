@@ -1,0 +1,401 @@
+# Ralph Progress Log
+Started: 2025-01-07
+Feature: High Priority Improvements & Missing Features
+
+## Codebase Patterns
+- TypeScript project with ES modules ("type": "module")
+- Logger: Use createLogger() from src/server/logger.ts, NOT console.*
+- Types: Define in src/types/, use Zod for validation
+- Error handling: Use type guards, preserve stack traces
+- Skills: Register in src/skills/index.ts
+- Tools: Register in src/tools/index-compat.ts
+- Tests: Jest with experimental VM modules, place in src/__tests__/
+- Build: tsc compiles to dist/
+
+## Error Handling Pattern
+```typescript
+} catch (error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  const stack = error instanceof Error ? error.stack : undefined;
+  // Use message and stack
+}
+```
+
+## Logger Usage Pattern
+```typescript
+import { createLogger } from './server/logger.js';
+const logger = createLogger('ModuleName');
+logger.info('message', { context });
+logger.error('message', { error: message, stack });
+```
+
+## Key Files for Improvements
+- src/server/logger.ts - Winston logger factory
+- src/utils/type-guards.ts - Error type guards
+- src/utils/retry.ts - Has CircuitBreaker class
+- src/utils/error-handler.ts - Error handling patterns
+- src/jamf-client-hybrid.ts - Main Jamf API client
+- src/jamf-client-hybrid-fixed.ts - Duplicate client (to consolidate)
+- src/server/health-check.ts - Health endpoint
+- src/tools/tool-implementations.ts - Tool parameter validation needed
+
+## Commands
+- npm run typecheck - Type checking
+- npm test - Run all tests
+- npm run build:quick - Quick build
+- npm run lint - ESLint
+
+## Previous Session Learnings
+- ESM mocking: jest.unstable_mockModule MUST be called before importing module
+- Use `const { Class } = await import('./module.js')` after mocking
+- Mock JamfApiClientHybrid with config.baseUrl and all API methods
+- Use beforeEach/afterEach to reset process.argv and process.env
+- Generated output directories should be in .gitignore
+- Use conventional commit prefixes: feat, fix, docs, chore, test
+
+---
+## 2026-01-12 - IMP-001
+- Removed all console.log/error/warn calls from src/
+- Created CLI output utilities for proper CLI user output:
+  - src/cli/output.ts - print(), printError(), printWarn()
+  - src/agent/output.ts - same utilities for agent CLI
+- Updated 21 source files to use logger or CLI output utilities
+- **Learnings:**
+  - CLI tools should use process.stdout.write/stderr.write wrappers, not console.*
+  - Use `error: unknown` in catch blocks, then type guard with `error instanceof Error`
+  - MCP servers must never output to stdout/stderr - it breaks JSON-RPC parsing
+  - The SkillsManager tests have stale expectations - they reference non-existent skills
+
+---
+## 2026-01-12 - IMP-002
+- Fixed all `catch (error: any)` patterns in src/ (28 occurrences)
+- Changed to `catch (error: unknown)` with type guard pattern
+- Files changed:
+  - src/skills/http-initializer.ts
+  - src/skills/manager.ts
+  - src/skills/context-provider.ts
+  - src/tools/skills-mcp-integration.ts (2 catch blocks)
+  - src/tools/skills-integration.ts
+  - src/tools/skills-tools.ts
+  - src/skills/device-management/batch-inventory-update.ts (3 catch blocks)
+  - src/skills/device-management/find-outdated-devices.ts
+  - src/skills/device-management/device-search-optimized.ts (2 catch blocks)
+  - src/skills/device-management/device-search.ts
+  - src/skills/policy-management/deploy-policy-by-criteria.ts
+  - src/skills/automation/scheduled-compliance-check.ts
+  - src/tools/tool-implementations.ts
+  - src/jamf-client-hybrid-fixed.ts
+  - src/server/skills-endpoints.ts (4 catch blocks)
+  - src/server/http-server.ts
+  - src/agent/ai/providers/BedrockProvider.ts
+  - src/agent/ai/providers/OpenAIProvider.ts
+  - src/agent/core/TaskExecutor.ts (2 catch blocks)
+  - src/agent/core/AgentCore.ts
+- **Learnings:**
+  - For AWS/Axios errors, cast to typed object to access properties like `.name` or `.response`
+  - Example: `const errorName = (error as { name?: string }).name;`
+  - When returning error in SkillResult, create Error object: `error instanceof Error ? error : new Error(message)`
+  - Pre-existing test failures in SkillsManager tests are unrelated to error handling
+
+---
+## 2026-01-12 - IMP-003
+- Fixed `as any` casts in src/skills/ and src/tools/
+- Key changes:
+  - Added eslint-disable comments for intentional any types in skills/types.ts
+  - Added ToolCallResult type alias for flexible tool return shapes
+  - SkillsManager now has public context setter (was private, needed cast)
+  - JamfApiClientHybrid now has public readOnlyMode getter (was private)
+  - Added proper ComplianceDeviceInfo interface to index-compat.ts
+  - Added ExecutionResult interface to tool-implementations.ts
+- Files changed:
+  - src/skills/types.ts (added eslint-disable, ToolCallResult type)
+  - src/skills/manager.ts (public context setter, executeSkill params)
+  - src/skills/context-provider.ts (type annotations with eslint-disable)
+  - src/skills/http-initializer.ts (removed `as any` cast)
+  - src/skills/automation/scheduled-compliance-check.ts (type imports)
+  - src/jamf-client-hybrid.ts (readOnlyMode getter, renamed private _readOnlyMode)
+  - src/tools/skills-integration.ts (JamfApiClientHybrid type, eslint-disable)
+  - src/tools/skills-mcp-integration.ts (type annotations, eslint-disable)
+  - src/tools/skills-tools.ts (eslint-disable for handleToolCall)
+  - src/tools/tool-implementations.ts (interface exports, readOnlyMode via getter)
+  - src/tools/index-compat.ts (ComplianceDeviceInfo interface)
+- **Learnings:**
+  - Use `// eslint-disable-next-line @typescript-eslint/no-explicit-any` for intentional any
+  - For flexible return types from tools, use type aliases rather than inline any
+  - Private properties can be exposed via getters without breaking existing code
+  - Internal Server __handlers property needs `as any` - no public API for handler access
+  - Pre-existing test failures in SkillsManager tests (expect device-search-optimized, getChatGPTSchema)
+
+---
+## 2026-01-12 - IMP-004
+- Added Zod validation schemas for all tool parameters
+- Created src/tools/validation-schemas.ts with:
+  - ToolValidationError class for structured error messages
+  - ID validators: JamfDeviceIdSchema, JamfPolicyIdSchema, JamfScriptIdSchema, JamfProfileIdSchema, JamfGroupIdSchema
+  - Numeric validators: ComplianceDaysSchema (1-365), LimitSchema (1-1000)
+  - Search validators: SearchQuerySchema (max 500 chars)
+  - Complete tool parameter schemas with proper types
+- Updated src/tools/tool-implementations.ts:
+  - All tool functions now validate params via validateParams()
+  - Removed `any` types - now using `unknown` with validation
+  - Added proper interface types for API responses (PolicyGeneral, PolicyScript, etc.)
+  - Re-exported validation types and ToolValidationError for external use
+- **Learnings:**
+  - Zod .default() on optional fields still infers `T | undefined` - use nullish coalescing at usage site
+  - JamfPolicy has index signature `[key: string]: unknown`, so `general` must be cast to access properties
+  - JamfScope uses `computer_ids` and `computer_group_ids` (not `computers` and `computer_groups`)
+  - Validation schemas should be in a separate file for reusability across the codebase
+
+---
+## 2026-01-12 - IMP-005
+- Added structured error handling with full context
+- Created in src/utils/error-handler.ts:
+  - ErrorContext interface for capturing error details
+  - StructuredErrorResponse interface with user-friendly and technical messages
+  - buildErrorContext() to create structured error objects from unknown errors
+  - createStructuredErrorResponse() for user-friendly error responses
+  - logErrorWithContext() for consistent error logging
+  - captureStackTrace() and combineStacks() for stack trace preservation
+- Updated catch blocks in 13 files:
+  - src/tools/index-compat.ts, skills-integration.ts, skills-mcp-integration.ts, skills-tools.ts
+  - src/skills/manager.ts, context-provider.ts, http-initializer.ts
+  - src/skills/device-management/*.ts, policy-management/*.ts, automation/*.ts
+- Error responses now include: message, code, timestamp, suggestions, stack trace
+- **Learnings:**
+  - TypeScript spread operator requires object types - use `(obj || {})` for optional spreads
+  - After `instanceof` check on `unknown`, still need type assertion to access properties
+  - Import RateLimitError from errors.ts when using it for instanceof checks
+  - Pre-existing test failures in SkillsManager tests are unrelated to error handling changes
+
+---
+## 2026-01-12 - IMP-006
+- Added token refresh mechanism to Jamf client
+- Enhanced JamfAuthToken interface with metadata:
+  - issuedAt: Date when token was obtained
+  - expiresIn: Token lifetime in seconds from server
+- Added TOKEN_REFRESH_BUFFER_MS constant (5 minutes) for proactive refresh
+- Added isTokenExpiredOrExpiring() helper to check if token needs refresh
+- Updated ensureAuthenticated() to refresh tokens before they expire
+- Added response interceptor for automatic 401 retry:
+  - Invalidates current tokens
+  - Re-authenticates and updates headers
+  - Retries original request with fresh token
+  - Uses _retry flag to prevent infinite loops
+- Added getTokenStatus() public method for health checks
+- Added updateAuthorizationHeader() helper (extracted for TypeScript control flow)
+- Files changed:
+  - src/jamf-client-hybrid.ts
+- **Learnings:**
+  - TypeScript control flow analysis infers `never` after assigning `null` in closures
+  - Extract token access to separate methods to avoid control flow issues
+  - Use explicit type annotations when TypeScript inference fails in async closures
+  - Pre-existing test failures in SkillsManager tests continue to be unrelated
+
+---
+## 2026-01-12 - IMP-007
+- Consolidated duplicate Jamf client implementations
+- Analysis:
+  - jamf-client-hybrid.ts (3270 lines): Full-featured, used by 12+ files, has token refresh, HTTP pooling
+  - jamf-client-hybrid-fixed.ts (410 lines): Simpler, older, NOT imported anywhere
+- Decision: Keep jamf-client-hybrid.ts (better), delete jamf-client-hybrid-fixed.ts
+- Changes:
+  - Deleted src/jamf-client-hybrid-fixed.ts (unused, redundant)
+  - Updated prd.json notes to reference correct file name
+- No unique functionality needed to merge (fixed.ts had subset of features)
+- **Learnings:**
+  - Always check import usage before removing files (`grep -r "from.*filename"`)
+  - The "fixed" version was likely an earlier iteration that was superseded
+  - Pre-existing test failures in SkillsManager tests continue to be unrelated
+
+---
+
+---
+## 2026-01-12 - IMP-008
+- Added comprehensive environment variable validation with Zod schemas
+- Created src/utils/env-validation.ts with:
+  - EnvValidationError class for structured error messages with suggestions
+  - JamfConfigSchema: JAMF_URL, auth credentials, read-only mode, TLS settings
+  - EnhancedModeSchema: retry, rate limiting, circuit breaker settings with bounds
+  - HttpServerSchema: PORT (1-65535), RATE_LIMIT_WINDOW, RATE_LIMIT_MAX
+  - OAuthProviderSchema: provider type, Auth0/Okta configs
+  - HttpAgentPoolSchema: connection pool settings with bounds
+  - LoggingSchema, AgentConfigSchema, ExternalApiKeysSchema
+  - validateEnvironment() to validate all config at once
+- Updated src/index.ts: uses validateJamfConfig() for type-safe config
+- Updated src/index-enhanced.ts: uses both Jamf and enhanced mode validation
+- Updated src/server/http-server.ts: validates HTTP server config with warnings
+- All validated values use proper types instead of raw process.env strings
+- Files changed:
+  - src/utils/env-validation.ts (new, 423 lines)
+  - src/index.ts
+  - src/index-enhanced.ts
+  - src/server/http-server.ts
+- **Learnings:**
+  - Zod transform() is ideal for string-to-type coercion (e.g., 'true' -> boolean)
+  - Use .pipe() after transform() to apply additional validation to transformed value
+  - MCP entry points (index-main.ts) can't log to stdout - validate in actual servers
+  - Pre-existing test failures in SkillsManager tests continue to be unrelated
+
+---
+## 2026-01-12 - IMP-009
+- Added circuit breaker for Jamf API calls
+- Used existing CircuitBreaker class from src/utils/retry.ts
+- Extended JamfApiClientConfig with circuit breaker options:
+  - enabled, failureThreshold, resetTimeout, halfOpenRequests
+- Added environment variable validation for circuit breaker:
+  - JAMF_CIRCUIT_BREAKER_THRESHOLD (1-20)
+  - JAMF_CIRCUIT_BREAKER_RESET_TIMEOUT (5000-300000ms)
+  - JAMF_CIRCUIT_BREAKER_HALF_OPEN_REQUESTS (1-10)
+- Added protected HTTP methods for circuit-breaker-wrapped requests
+- Added getCircuitBreakerStatus() for health check integration
+- Updated health-check.ts with checkCircuitBreaker() function
+- Updated readinessProbe to fail if circuit breaker is OPEN
+- Files changed:
+  - src/utils/env-validation.ts
+  - src/jamf-client-hybrid.ts
+  - src/server/health-check.ts
+- **Learnings:**
+  - CircuitBreaker.execute() pattern works well with async functions
+  - Health checks should treat OPEN circuit as 'fail' since API is unavailable
+  - Half-open state should be 'warn' to indicate recovery in progress
+  - Pre-existing test failures in SkillsManager tests continue to be unrelated
+
+---
+## 2026-01-12 - IMP-010
+- Added granular health check with component breakdown
+- Created new interfaces:
+  - ComponentHealthStatus for granular health response
+  - ComponentStatus for individual component status
+- Added SkillsManager.getStatus() method:
+  - Returns initialized, skillCount, registeredSkills, contextAvailable
+- Added new health check functions:
+  - checkAuthentication(): Checks token status, expiration, credentials
+  - checkSkillsManager(): Checks skill registration and initialization
+  - checkCache(): Checks connection pool status as cache
+  - convertStatus(): Helper to convert pass/fail/warn to healthy/degraded/unhealthy
+- Added componentHealthCheck() endpoint:
+  - Returns status for 4 components: jamfApi, auth, skills, cache
+  - Includes summary with counts (total, healthy, degraded, unhealthy)
+  - Calculates overall status from component statuses
+- Files changed:
+  - src/server/health-check.ts
+  - src/skills/manager.ts
+- **Learnings:**
+  - Health check components should map to distinct functional areas
+  - Token expiration check uses 5-minute buffer for "expiring soon" warning
+  - Connection pool doubles as connection cache status
+  - Pre-existing test failures in SkillsManager tests continue to be unrelated
+
+---
+## 2026-01-12 - IMP-011
+- Created comprehensive architecture documentation
+- Created docs/ARCHITECTURE.md with:
+  - ASCII component diagrams showing MCP server, tools, skills, resources layers
+  - Data flow diagrams for standard mode (stdio) and HTTP mode
+  - Hybrid client architecture explanation (why both OAuth2 and Basic Auth)
+  - Skills execution flow from AI request to Jamf API
+  - Tool/skill/resource/prompt registration flow
+  - Health check system with component breakdown
+  - Configuration reference (environment variables)
+  - Extension points for adding new tools/skills/resources
+- Files changed:
+  - docs/ARCHITECTURE.md (new, 446 lines)
+- **Learnings:**
+  - Documentation-only changes don't require typecheck/test pass (but verified anyway)
+  - ASCII diagrams work well in markdown for showing component relationships
+  - Pre-existing test failures in SkillsManager tests continue to be unrelated
+
+---
+## 2026-01-12 - IMP-012
+- Added comprehensive test suite for retry and circuit breaker utilities
+- Created src/__tests__/utils/retry.test.ts with 32 tests:
+  - getRetryConfig: default values and environment variable override
+  - CircuitBreaker state transitions:
+    - CLOSED state with success/failure tracking
+    - Transition to OPEN after reaching failure threshold
+    - JamfAPIError with CIRCUIT_OPEN code and wait time suggestions
+    - Transition to HALF_OPEN after reset timeout
+    - Recovery to CLOSED after successful half-open requests
+    - Return to OPEN on failure during half-open
+    - Failure count reset on success
+  - retryWithBackoff:
+    - First-attempt success without retrying
+    - Retry on retryable errors (NetworkError, 5xx, RateLimitError)
+    - No retry on non-retryable errors (validation, 4xx)
+    - Custom retry conditions
+    - onRetry callback invocation
+    - RateLimitError with retry-after delay
+  - RetryableCircuitBreaker:
+    - Separate circuit breakers per key
+    - Retry logic integration
+    - Reset individual and all breakers
+    - Default options fallback
+  - withRetry: function wrapper with argument passthrough
+  - batchRetryWithBreaker: parallel operations with mixed results
+- Files changed:
+  - src/__tests__/utils/retry.test.ts (new, 432 lines)
+- **Learnings:**
+  - ESM mocking with jest.unstable_mockModule has path resolution issues in this project
+  - Tests can avoid mocking by not triggering code paths that require mocked modules
+  - Use afterEach to restore process.env for clean test isolation
+  - Pre-existing test failures in SkillsManager tests continue to be unrelated
+
+---
+## 2026-01-12 - IMP-013
+- Added comprehensive test suite for HTTP agent pool
+- Created src/__tests__/utils/http-agent-pool.test.ts with 27 tests:
+  - Singleton pattern:
+    - Same instance on multiple getInstance calls
+    - Instance with default options (maxSockets, maxFreeSockets)
+    - Instance with custom options
+    - Options ignored on subsequent calls
+  - getAgent:
+    - Returns HTTPS agent for https:// URLs
+    - Returns HTTP agent for http:// URLs
+  - Metrics:
+    - Initial metrics with zero values
+    - Returns copy of metrics (not reference)
+    - Metrics interval setup when enabled
+  - Destroy:
+    - Destroys both agents
+    - Clears metrics interval
+  - UpdateConfig:
+    - Creates new instance with updated options
+  - Keep-alive timeout:
+    - Configures timeout on both agents
+  - TLS settings:
+    - Certificate verification enabled by default
+    - Certificate verification can be disabled
+  - getDefaultAgentPool:
+    - Default environment values
+    - Environment variable overrides
+    - JAMF_ALLOW_INSECURE disables cert verification
+    - HTTP_ENABLE_METRICS enables metrics
+  - cleanupAgentPool:
+    - Destroys agent pool
+  - Agent configuration:
+    - Keep-alive enabled
+    - FIFO scheduling
+- Files changed:
+  - src/__tests__/utils/http-agent-pool.test.ts (new, 424 lines)
+- **Learnings:**
+  - Singleton patterns require jest.resetModules() to reset between tests
+  - Access internal agent options via type casting: (agent as unknown as { options: T })
+  - HTTP/HTTPS agents expose maxSockets, maxFreeSockets, keepAlive directly
+  - Scheduling option is stored in options sub-object, not on agent directly
+  - Pre-existing test failures in SkillsManager tests continue to be unrelated
+
+---
+## 2026-01-12 - IMP-014
+- Committed all improvements and created PR
+- Pushed ralph/improvements branch to origin
+- Created PR #7 with comprehensive description
+- PR URL: https://github.com/dbankscard/jamf-mcp-server/pull/7
+- Summary of all 13 improvements included
+- Files changed:
+  - scripts/ralph/prd.json (marked IMP-014 as passes: true)
+  - scripts/ralph/progress.txt (added learnings)
+- **Learnings:**
+  - Use `gh pr create` with HEREDOC for multi-line PR body
+  - Pre-existing test failures should be documented in PR notes
+  - Track final commit with conventional commit format: chore: [ID] - [Title]

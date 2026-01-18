@@ -4,6 +4,7 @@ import { createLogger } from './server/logger.js';
 import { getDefaultAgentPool } from './utils/http-agent-pool.js';
 import { JamfComputer, JamfComputerDetails, JamfSearchResponse, JamfApiResponse } from './types/jamf-api.js';
 import { isAxiosError, getErrorMessage, getAxiosErrorStatus, getAxiosErrorData } from './utils/type-guards.js';
+import { CircuitBreaker, CircuitBreakerOptions } from './utils/retry.js';
 
 const logger = createLogger('jamf-client-hybrid');
 const agentPool = getDefaultAgentPool();
@@ -20,12 +21,30 @@ export interface JamfApiClientConfig {
   // TLS/SSL options
   rejectUnauthorized?: boolean; // Default: true for security
   // Note: Set to false only for development/testing with self-signed certificates
+  // Circuit breaker options
+  circuitBreaker?: {
+    /** Enable circuit breaker (default: false) */
+    enabled?: boolean;
+    /** Number of failures before opening circuit (default: 5) */
+    failureThreshold?: number;
+    /** Time in ms to wait before trying again (default: 60000) */
+    resetTimeout?: number;
+    /** Number of successful requests in half-open to close (default: 3) */
+    halfOpenRequests?: number;
+  };
 }
 
 export interface JamfAuthToken {
   token: string;
   expires: Date;
+  /** Timestamp when the token was issued */
+  issuedAt: Date;
+  /** Token lifetime in seconds as reported by the server */
+  expiresIn: number;
 }
+
+/** Buffer time in milliseconds to refresh token before actual expiration */
+const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000; // 5 minutes before expiration
 
 // Computer schemas (same as unified client)
 const ComputerSchema = z.object({
@@ -55,21 +74,25 @@ export class JamfApiClientHybrid {
   private oauth2Token: JamfAuthToken | null = null;
   private bearerToken: JamfAuthToken | null = null;
   private basicAuthHeader: string | null = null;
-  private readOnlyMode: boolean;
+  private _readOnlyMode: boolean;
   private config: JamfApiClientConfig;
-  
+
   // Capabilities flags
   private hasOAuth2: boolean;
   private hasBasicAuth: boolean;
   private oauth2Available: boolean = false;
   private bearerTokenAvailable: boolean = false;
-  
+
   // Cache
   private cachedSearchId: number | null = null;
 
+  // Circuit breaker for API calls
+  private circuitBreaker: CircuitBreaker | null = null;
+  private circuitBreakerEnabled: boolean = false;
+
   constructor(config: JamfApiClientConfig) {
     this.config = config;
-    this.readOnlyMode = config.readOnlyMode ?? false;
+    this._readOnlyMode = config.readOnlyMode ?? false;
     
     // Check available auth methods
     this.hasOAuth2 = !!(config.clientId && config.clientSecret);
@@ -83,7 +106,22 @@ export class JamfApiClientHybrid {
     if (this.hasBasicAuth) {
       this.basicAuthHeader = `Basic ${Buffer.from(`${config.username}:${config.password}`).toString('base64')}`;
     }
-    
+
+    // Initialize circuit breaker if enabled
+    if (config.circuitBreaker?.enabled) {
+      this.circuitBreakerEnabled = true;
+      this.circuitBreaker = new CircuitBreaker({
+        failureThreshold: config.circuitBreaker.failureThreshold ?? 5,
+        resetTimeout: config.circuitBreaker.resetTimeout ?? 60000,
+        halfOpenRequests: config.circuitBreaker.halfOpenRequests ?? 3,
+      });
+      logger.info('Circuit breaker enabled', {
+        failureThreshold: config.circuitBreaker.failureThreshold ?? 5,
+        resetTimeout: config.circuitBreaker.resetTimeout ?? 60000,
+        halfOpenRequests: config.circuitBreaker.halfOpenRequests ?? 3,
+      });
+    }
+
     // Initialize axios instance
     this.axiosInstance = axios.create({
       baseURL: config.baseUrl,
@@ -97,10 +135,17 @@ export class JamfApiClientHybrid {
     
     // Add request interceptor to handle auth based on endpoint
     this.axiosInstance.interceptors.request.use((config) => {
-      // Classic API endpoints need Basic auth
+      // Classic API endpoints - try Bearer token first, fallback to Basic auth
       if (config.url?.includes('/JSSResource/')) {
-        if (this.basicAuthHeader) {
+        // Try Bearer token first (some Jamf environments require this)
+        if (this.bearerTokenAvailable && this.bearerToken) {
+          config.headers['Authorization'] = `Bearer ${this.bearerToken.token}`;
+          logger.info(`  🔑 Setting Bearer token for Classic API endpoint: ${config.url}`);
+        } else if (this.basicAuthHeader) {
           config.headers['Authorization'] = this.basicAuthHeader;
+          logger.info(`  🔑 Setting Basic Auth for Classic API endpoint: ${config.url}`);
+        } else {
+          logger.warn(`Classic API endpoint ${config.url} requested but no auth credentials available`);
         }
         // Note: We keep Accept as application/json for Classic API
         // Jamf Classic API can return JSON if Accept header is set to application/json
@@ -114,11 +159,197 @@ export class JamfApiClientHybrid {
       }
       return config;
     });
-    
+
+    // Add response interceptor to handle 401 errors and re-authenticate
+    this.axiosInstance.interceptors.response.use(
+      (response) => response,
+      async (error: AxiosError) => {
+        const originalRequest = error.config as AxiosError['config'] & { _retry?: boolean };
+
+        // Only retry on 401 and if we haven't already retried
+        if (error.response?.status === 401 && originalRequest && !originalRequest._retry) {
+          originalRequest._retry = true;
+
+          logger.info('Received 401 Unauthorized, attempting to refresh token...');
+
+          // Invalidate current tokens to force refresh
+          this.bearerTokenAvailable = false;
+          this.oauth2Available = false;
+          this.bearerToken = null;
+          this.oauth2Token = null;
+
+          try {
+            // Re-authenticate
+            await this.ensureAuthenticated();
+
+            // Update Authorization header with fresh token
+            this.updateAuthorizationHeader(originalRequest);
+
+            logger.info('Token refreshed successfully, retrying original request');
+            return this.axiosInstance(originalRequest);
+          } catch (refreshError) {
+            logger.error('Failed to refresh token after 401', {
+              error: refreshError instanceof Error ? refreshError.message : String(refreshError),
+            });
+            return Promise.reject(error);
+          }
+        }
+
+        return Promise.reject(error);
+      }
+    );
+
     // MCP servers must not output to stdout/stderr - commenting out logger
     // logger.info(`Jamf Hybrid Client initialized with:`);
     // logger.info(`  - OAuth2 (Client Credentials): ${this.hasOAuth2 ? 'Available' : 'Not configured'}`);
     // logger.info(`  - Basic Auth (Bearer Token): ${this.hasBasicAuth ? 'Available' : 'Not configured'}`);
+  }
+
+  /**
+   * Check if the client is in read-only mode
+   */
+  get readOnlyMode(): boolean {
+    return this._readOnlyMode;
+  }
+
+  /**
+   * Get token status information for health checks and debugging
+   */
+  getTokenStatus(): {
+    bearerToken: { available: boolean; issuedAt?: Date; expiresAt?: Date; expiresIn?: number } | null;
+    oauth2Token: { available: boolean; issuedAt?: Date; expiresAt?: Date; expiresIn?: number } | null;
+    hasBasicAuth: boolean;
+    hasOAuth2: boolean;
+  } {
+    return {
+      bearerToken: this.bearerToken
+        ? {
+            available: this.bearerTokenAvailable,
+            issuedAt: this.bearerToken.issuedAt,
+            expiresAt: this.bearerToken.expires,
+            expiresIn: this.bearerToken.expiresIn,
+          }
+        : null,
+      oauth2Token: this.oauth2Token
+        ? {
+            available: this.oauth2Available,
+            issuedAt: this.oauth2Token.issuedAt,
+            expiresAt: this.oauth2Token.expires,
+            expiresIn: this.oauth2Token.expiresIn,
+          }
+        : null,
+      hasBasicAuth: this.hasBasicAuth,
+      hasOAuth2: this.hasOAuth2,
+    };
+  }
+
+  /**
+   * Get circuit breaker status for health checks
+   */
+  getCircuitBreakerStatus(): {
+    enabled: boolean;
+    state: 'CLOSED' | 'OPEN' | 'HALF_OPEN' | 'DISABLED';
+    failureCount: number;
+    config: {
+      failureThreshold: number;
+      resetTimeout: number;
+      halfOpenRequests: number;
+    } | null;
+  } {
+    if (!this.circuitBreakerEnabled || !this.circuitBreaker) {
+      return {
+        enabled: false,
+        state: 'DISABLED',
+        failureCount: 0,
+        config: null,
+      };
+    }
+
+    return {
+      enabled: true,
+      state: this.circuitBreaker.getState() as 'CLOSED' | 'OPEN' | 'HALF_OPEN',
+      failureCount: this.circuitBreaker.getFailureCount(),
+      config: {
+        failureThreshold: this.config.circuitBreaker?.failureThreshold ?? 5,
+        resetTimeout: this.config.circuitBreaker?.resetTimeout ?? 60000,
+        halfOpenRequests: this.config.circuitBreaker?.halfOpenRequests ?? 3,
+      },
+    };
+  }
+
+  /**
+   * Execute a function through the circuit breaker if enabled
+   * Otherwise, execute directly
+   */
+  private async executeWithCircuitBreaker<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.circuitBreakerEnabled && this.circuitBreaker) {
+      return this.circuitBreaker.execute(fn);
+    }
+    return fn();
+  }
+
+  /**
+   * Make a GET request through the circuit breaker
+   */
+  private async protectedGet<T = unknown>(url: string, config?: Parameters<AxiosInstance['get']>[1]): Promise<T> {
+    return this.executeWithCircuitBreaker(async () => {
+      const response = await this.axiosInstance.get<T>(url, config);
+      return response.data;
+    });
+  }
+
+  /**
+   * Make a POST request through the circuit breaker
+   */
+  private async protectedPost<T = unknown>(
+    url: string,
+    data?: unknown,
+    config?: Parameters<AxiosInstance['post']>[2]
+  ): Promise<T> {
+    return this.executeWithCircuitBreaker(async () => {
+      const response = await this.axiosInstance.post<T>(url, data, config);
+      return response.data;
+    });
+  }
+
+  /**
+   * Make a PUT request through the circuit breaker
+   */
+  private async protectedPut<T = unknown>(
+    url: string,
+    data?: unknown,
+    config?: Parameters<AxiosInstance['put']>[2]
+  ): Promise<T> {
+    return this.executeWithCircuitBreaker(async () => {
+      const response = await this.axiosInstance.put<T>(url, data, config);
+      return response.data;
+    });
+  }
+
+  /**
+   * Make a DELETE request through the circuit breaker
+   */
+  private async protectedDelete<T = unknown>(url: string, config?: Parameters<AxiosInstance['delete']>[1]): Promise<T> {
+    return this.executeWithCircuitBreaker(async () => {
+      const response = await this.axiosInstance.delete<T>(url, config);
+      return response.data;
+    });
+  }
+
+  /**
+   * Update the Authorization header on a request config with the current token
+   * This is extracted to a separate method to avoid TypeScript control flow issues
+   */
+  private updateAuthorizationHeader(config: { headers?: Record<string, unknown>; url?: string }): void {
+    if (!config.headers) return;
+
+    if (this.bearerTokenAvailable && this.bearerToken) {
+      config.headers['Authorization'] = `Bearer ${this.bearerToken.token}`;
+    } else if (this.oauth2Available && this.oauth2Token) {
+      config.headers['Authorization'] = `Bearer ${this.oauth2Token.token}`;
+    } else if (this.basicAuthHeader && config.url?.includes('/JSSResource/')) {
+      config.headers['Authorization'] = this.basicAuthHeader;
+    }
   }
 
   /**
@@ -145,11 +376,15 @@ export class JamfApiClientHybrid {
         }
       );
 
-      const expiresIn = response.data.expires_in ? response.data.expires_in * 1000 : 20 * 60 * 1000;
-      
+      // Default to 20 minutes if expires_in not provided
+      const expiresInSeconds = response.data.expires_in ?? 20 * 60;
+      const issuedAt = new Date();
+
       this.oauth2Token = {
         token: response.data.access_token,
-        expires: new Date(Date.now() + expiresIn),
+        expires: new Date(issuedAt.getTime() + expiresInSeconds * 1000),
+        issuedAt,
+        expiresIn: expiresInSeconds,
       };
       
       this.oauth2Available = true;
@@ -181,10 +416,15 @@ export class JamfApiClientHybrid {
         }
       );
 
-      // Assume token expires in 30 minutes (Jamf default)
+      // Parse expires from response if available, otherwise default to 30 minutes (Jamf default)
+      const expiresInSeconds = response.data.expires ?? 30 * 60;
+      const issuedAt = new Date();
+
       this.bearerToken = {
         token: response.data.token,
-        expires: new Date(Date.now() + 30 * 60 * 1000),
+        expires: new Date(issuedAt.getTime() + expiresInSeconds * 1000),
+        issuedAt,
+        expiresIn: expiresInSeconds,
       };
       
       this.bearerTokenAvailable = true;
@@ -198,23 +438,42 @@ export class JamfApiClientHybrid {
   }
 
   /**
-   * Ensure we have a valid token
+   * Check if a token is expired or will expire soon (within buffer time)
+   */
+  private isTokenExpiredOrExpiring(token: JamfAuthToken | null): boolean {
+    if (!token) return true;
+    const bufferTime = new Date(Date.now() + TOKEN_REFRESH_BUFFER_MS);
+    return token.expires <= bufferTime;
+  }
+
+  /**
+   * Ensure we have a valid token, refreshing proactively before expiration
    */
   private async ensureAuthenticated(): Promise<void> {
     // Try Bearer token from Basic Auth first (it works on Modern API)
     if (this.hasBasicAuth) {
-      if (!this.bearerToken || this.bearerToken.expires <= new Date()) {
+      if (this.isTokenExpiredOrExpiring(this.bearerToken)) {
+        logger.debug('Bearer token expired or expiring soon, refreshing...', {
+          expires: this.bearerToken?.expires,
+          issuedAt: this.bearerToken?.issuedAt,
+          expiresIn: this.bearerToken?.expiresIn,
+        });
         await this.getBearerTokenWithBasicAuth();
       }
     }
-    
+
     // Try OAuth2 if Bearer token failed
     if (!this.bearerTokenAvailable && this.hasOAuth2) {
-      if (!this.oauth2Token || this.oauth2Token.expires <= new Date()) {
+      if (this.isTokenExpiredOrExpiring(this.oauth2Token)) {
+        logger.debug('OAuth2 token expired or expiring soon, refreshing...', {
+          expires: this.oauth2Token?.expires,
+          issuedAt: this.oauth2Token?.issuedAt,
+          expiresIn: this.oauth2Token?.expiresIn,
+        });
         await this.getOAuth2Token();
       }
     }
-    
+
     // We don't set headers here anymore - the interceptor handles it based on the endpoint
     // Just ensure we have at least one valid auth method
     if (!this.bearerTokenAvailable && !this.oauth2Available && !this.hasBasicAuth) {
@@ -243,12 +502,18 @@ export class JamfApiClientHybrid {
     
     // Test Classic API
     try {
-      await this.axiosInstance.get('/JSSResource/categories');
+      logger.info(`  Testing Classic API with Basic Auth: ${this.hasBasicAuth ? 'Available' : 'Not configured'}`);
+      const response = await this.axiosInstance.get('/JSSResource/categories');
       logger.info('  ✅ Classic API: Accessible');
     } catch (error) {
-      logger.warn('Classic API not accessible', { 
+      const axiosError = error as AxiosError;
+      logger.warn('Classic API not accessible', {
         error: error instanceof Error ? error.message : String(error),
-        endpoint: '/JSSResource/categories'
+        endpoint: '/JSSResource/categories',
+        status: axiosError.response?.status,
+        statusText: axiosError.response?.statusText,
+        hasBasicAuth: this.hasBasicAuth,
+        responseData: axiosError.response?.data
       });
     }
   }
@@ -481,7 +746,7 @@ export class JamfApiClientHybrid {
 
   // Execute policy (if not in read-only mode)
   async executePolicy(policyId: string, deviceIds: string[]): Promise<void> {
-    if (this.readOnlyMode) {
+    if (this._readOnlyMode) {
       throw new Error('Cannot execute policies in read-only mode');
     }
     
@@ -494,7 +759,7 @@ export class JamfApiClientHybrid {
 
   // Deploy script (if not in read-only mode)
   async deployScript(scriptId: string, deviceIds: string[]): Promise<void> {
-    if (this.readOnlyMode) {
+    if (this._readOnlyMode) {
       throw new Error('Cannot deploy scripts in read-only mode');
     }
     
@@ -509,7 +774,7 @@ export class JamfApiClientHybrid {
 
   // Update inventory (if not in read-only mode)
   async updateInventory(deviceId: string): Promise<void> {
-    if (this.readOnlyMode) {
+    if (this._readOnlyMode) {
       throw new Error('Cannot update inventory in read-only mode');
     }
     
@@ -542,15 +807,34 @@ export class JamfApiClientHybrid {
   // List policies
   async listPolicies(limit: number = 100): Promise<any[]> {
     await this.ensureAuthenticated();
-    
+
+    // Try Modern API first (v1)
     try {
-      // Try Classic API (policies are typically in Classic API)
-      const response = await this.axiosInstance.get('/JSSResource/policies');
-      const policies = response.data.policies || [];
-      return policies.slice(0, limit);
-    } catch (error) {
-      logger.info('Failed to list policies:', error);
-      return [];
+      const response = await this.axiosInstance.get('/api/v1/policies', {
+        params: {
+          page: 0,
+          'page-size': Math.min(limit, 2000),
+        },
+      });
+      const policies = response.data.results || [];
+      logger.info(`Retrieved ${policies.length} policies from Modern API`);
+      return policies;
+    } catch (modernError) {
+      logger.info('Modern API not available for policies, trying Classic API');
+
+      // Fallback to Classic API
+      try {
+        const response = await this.axiosInstance.get('/JSSResource/policies');
+        const policies = response.data.policies || [];
+        logger.info(`Retrieved ${policies.length} policies from Classic API`);
+        return policies.slice(0, limit);
+      } catch (classicError) {
+        logger.warn('Failed to list policies from both Modern and Classic APIs', {
+          modernError: modernError instanceof Error ? modernError.message : String(modernError),
+          classicError: classicError instanceof Error ? classicError.message : String(classicError),
+        });
+        return [];
+      }
     }
   }
 
@@ -597,7 +881,7 @@ export class JamfApiClientHybrid {
    * Create a new policy
    */
   async createPolicy(policyData: any): Promise<any> {
-    if (this.readOnlyMode) {
+    if (this._readOnlyMode) {
       throw new Error('Cannot create policies in read-only mode');
     }
     
@@ -654,7 +938,7 @@ export class JamfApiClientHybrid {
    * Update an existing policy
    */
   async updatePolicy(policyId: string, policyData: any): Promise<any> {
-    if (this.readOnlyMode) {
+    if (this._readOnlyMode) {
       throw new Error('Cannot update policies in read-only mode');
     }
     
@@ -701,7 +985,7 @@ export class JamfApiClientHybrid {
    * Clone an existing policy
    */
   async clonePolicy(sourcePolicyId: string, newName: string): Promise<any> {
-    if (this.readOnlyMode) {
+    if (this._readOnlyMode) {
       throw new Error('Cannot clone policies in read-only mode');
     }
     
@@ -733,7 +1017,7 @@ export class JamfApiClientHybrid {
    * Enable or disable a policy
    */
   async setPolicyEnabled(policyId: string, enabled: boolean): Promise<any> {
-    if (this.readOnlyMode) {
+    if (this._readOnlyMode) {
       throw new Error('Cannot enable/disable policies in read-only mode');
     }
     
@@ -768,7 +1052,7 @@ export class JamfApiClientHybrid {
     replaceComputers?: string[];
     replaceComputerGroups?: string[];
   }): Promise<any> {
-    if (this.readOnlyMode) {
+    if (this._readOnlyMode) {
       throw new Error('Cannot update policy scope in read-only mode');
     }
     
@@ -1121,7 +1405,7 @@ export class JamfApiClientHybrid {
    * Deploy configuration profile to devices
    */
   async deployConfigurationProfile(profileId: string, deviceIds: string[], type: 'computer' | 'mobiledevice' = 'computer'): Promise<void> {
-    if (this.readOnlyMode) {
+    if (this._readOnlyMode) {
       throw new Error('Cannot deploy configuration profiles in read-only mode');
     }
     
@@ -1193,7 +1477,7 @@ export class JamfApiClientHybrid {
    * Remove configuration profile from devices
    */
   async removeConfigurationProfile(profileId: string, deviceIds: string[], type: 'computer' | 'mobiledevice' = 'computer'): Promise<void> {
-    if (this.readOnlyMode) {
+    if (this._readOnlyMode) {
       throw new Error('Cannot remove configuration profiles in read-only mode');
     }
     
@@ -1524,7 +1808,7 @@ export class JamfApiClientHybrid {
    * Create static computer group
    */
   async createStaticComputerGroup(name: string, computerIds: string[]): Promise<any> {
-    if (this.readOnlyMode) {
+    if (this._readOnlyMode) {
       throw new Error('Cannot create computer groups in read-only mode');
     }
     
@@ -1568,7 +1852,7 @@ export class JamfApiClientHybrid {
    * Update static computer group membership
    */
   async updateStaticComputerGroup(groupId: string, computerIds: string[]): Promise<any> {
-    if (this.readOnlyMode) {
+    if (this._readOnlyMode) {
       throw new Error('Cannot update computer groups in read-only mode');
     }
     
@@ -1629,7 +1913,7 @@ export class JamfApiClientHybrid {
    * Delete computer group
    */
   async deleteComputerGroup(groupId: string): Promise<void> {
-    if (this.readOnlyMode) {
+    if (this._readOnlyMode) {
       throw new Error('Cannot delete computer groups in read-only mode');
     }
     
@@ -1730,7 +2014,7 @@ export class JamfApiClientHybrid {
    * Update mobile device inventory
    */
   async updateMobileDeviceInventory(deviceId: string): Promise<void> {
-    if (this.readOnlyMode) {
+    if (this._readOnlyMode) {
       throw new Error('Cannot update mobile device inventory in read-only mode');
     }
     
@@ -1781,7 +2065,7 @@ export class JamfApiClientHybrid {
    * Send MDM command to mobile device
    */
   async sendMDMCommand(deviceId: string, command: string): Promise<void> {
-    if (this.readOnlyMode) {
+    if (this._readOnlyMode) {
       throw new Error('Cannot send MDM commands in read-only mode');
     }
     
@@ -1920,7 +2204,7 @@ export class JamfApiClientHybrid {
     os_requirements?: string;
     script_contents_encoded?: boolean;
   }): Promise<any> {
-    if (this.readOnlyMode) {
+    if (this._readOnlyMode) {
       throw new Error('Cannot create scripts in read-only mode');
     }
     
@@ -1983,7 +2267,7 @@ export class JamfApiClientHybrid {
     os_requirements?: string;
     script_contents_encoded?: boolean;
   }): Promise<any> {
-    if (this.readOnlyMode) {
+    if (this._readOnlyMode) {
       throw new Error('Cannot update scripts in read-only mode');
     }
     
@@ -2018,7 +2302,7 @@ export class JamfApiClientHybrid {
    * Delete a script
    */
   async deleteScript(scriptId: string): Promise<void> {
-    if (this.readOnlyMode) {
+    if (this._readOnlyMode) {
       throw new Error('Cannot delete scripts in read-only mode');
     }
     
@@ -2847,7 +3131,7 @@ export class JamfApiClientHybrid {
     }>;
     display_fields?: string[];
   }): Promise<any> {
-    if (this.readOnlyMode) {
+    if (this._readOnlyMode) {
       throw new Error('Cannot create advanced computer searches in read-only mode');
     }
 
@@ -2983,7 +3267,7 @@ export class JamfApiClientHybrid {
    * Delete an advanced computer search
    */
   async deleteAdvancedComputerSearch(searchId: string): Promise<void> {
-    if (this.readOnlyMode) {
+    if (this._readOnlyMode) {
       throw new Error('Cannot delete advanced computer searches in read-only mode');
     }
     

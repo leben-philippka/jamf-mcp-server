@@ -6,18 +6,27 @@
 import { SkillContext } from './types.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { createLogger } from '../server/logger.js';
+import { buildErrorContext } from '../utils/error-handler.js';
+
+const skillLogger = createLogger('Skills');
 
 interface JamfMCPServer extends Server {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   jamfClient: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   handleToolCall: (name: string, args: any) => Promise<CallToolResult>;
 }
 
 export function createSkillContext(server: JamfMCPServer): SkillContext {
   return {
+    client: server.jamfClient,
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     callTool: async (toolName: string, params: any): Promise<any> => {
       try {
         const result = await server.handleToolCall(toolName, params);
-        
+
         if (result.content && result.content.length > 0) {
           const content = result.content[0];
           if (content.type === 'text') {
@@ -30,27 +39,36 @@ export function createSkillContext(server: JamfMCPServer): SkillContext {
             }
           }
         }
-        
+
         return { error: 'No content in tool response' };
-      } catch (error: any) {
-        throw new Error(`Tool execution failed: ${error.message}`);
+      } catch (error: unknown) {
+        const errorContext = buildErrorContext(
+          error,
+          `Execute tool: ${toolName}`,
+          'context-provider',
+          { toolName, params }
+        );
+        throw new Error(`Tool execution failed: ${errorContext.message}`);
       }
     },
-    
+
     env: {
       jamfUrl: process.env.JAMF_URL || '',
       jamfClientId: process.env.JAMF_CLIENT_ID || '',
     },
-    
+
     logger: {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       info: (message: string, meta?: any) => {
-        console.log(`[SKILL INFO] ${message}`, meta || '');
+        skillLogger.info(message, meta);
       },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       warn: (message: string, meta?: any) => {
-        console.warn(`[SKILL WARN] ${message}`, meta || '');
+        skillLogger.warn(message, meta);
       },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       error: (message: string, meta?: any) => {
-        console.error(`[SKILL ERROR] ${message}`, meta || '');
+        skillLogger.error(message, meta);
       }
     }
   };

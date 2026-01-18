@@ -3,10 +3,10 @@
  * Unified skill loading and execution for both Claude MCP and ChatGPT HTTP
  */
 
-import { z } from 'zod';
 import { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { SkillContext, SkillResult, SkillMetadata } from './types.js';
 import { createSkillContext } from './context-provider.js';
+import { buildErrorContext } from '../utils/error-handler.js';
 
 // Import all skills
 import { deviceSearchOptimized as deviceSearch, metadata as deviceSearchMetadata } from './device-management/device-search-optimized.js';
@@ -14,6 +14,7 @@ import { findOutdatedDevices, metadata as findOutdatedDevicesMetadata } from './
 import { batchInventoryUpdate, metadata as batchInventoryUpdateMetadata } from './device-management/batch-inventory-update.js';
 import { deployPolicyByCriteria, metadata as deployPolicyByCriteriaMetadata } from './policy-management/deploy-policy-by-criteria.js';
 import { scheduledComplianceCheck, metadata as scheduledComplianceCheckMetadata } from './automation/scheduled-compliance-check.js';
+import { generateEnvironmentDocs, metadata as generateEnvironmentDocsMetadata } from './documentation/generate-environment-docs.js';
 
 interface SkillDefinition {
   execute: (context: SkillContext, params: any) => Promise<SkillResult>;
@@ -22,11 +23,25 @@ interface SkillDefinition {
 
 export class SkillsManager {
   private skills: Map<string, SkillDefinition>;
-  private context: SkillContext | null = null;
+  private _context: SkillContext | null = null;
 
   constructor() {
     this.skills = new Map();
     this.registerSkills();
+  }
+
+  /**
+   * Set the context directly (for HTTP initialization)
+   */
+  set context(ctx: SkillContext | null) {
+    this._context = ctx;
+  }
+
+  /**
+   * Get the current context
+   */
+  get context(): SkillContext | null {
+    return this._context;
   }
 
   private registerSkills(): void {
@@ -57,13 +72,20 @@ export class SkillsManager {
       execute: scheduledComplianceCheck,
       metadata: scheduledComplianceCheckMetadata
     });
+
+    // Register documentation skills
+    this.skills.set('generate-environment-docs', {
+      execute: generateEnvironmentDocs,
+      metadata: generateEnvironmentDocsMetadata
+    });
   }
 
   /**
-   * Initialize with server context
+   * Initialize with server context (creates context from JamfMCPServer)
    */
-  initialize(server: any): void {
-    this.context = createSkillContext(server);
+  initialize(server: unknown): void {
+    // Import createSkillContext expects JamfMCPServer interface
+    this._context = createSkillContext(server as Parameters<typeof createSkillContext>[0]);
   }
 
   /**
@@ -83,8 +105,9 @@ export class SkillsManager {
   /**
    * Execute a skill
    */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   async executeSkill(name: string, params: any): Promise<SkillResult> {
-    if (!this.context) {
+    if (!this._context) {
       throw new Error('SkillsManager not initialized');
     }
 
@@ -100,12 +123,22 @@ export class SkillsManager {
     }
 
     try {
-      return await skill.execute(this.context, params);
-    } catch (error: any) {
+      return await skill.execute(this._context, params);
+    } catch (error: unknown) {
+      const errorContext = buildErrorContext(
+        error,
+        `Execute skill: ${name}`,
+        'skills-manager',
+        { skillName: name, params }
+      );
       return {
         success: false,
-        message: `Skill execution failed: ${error.message}`,
-        error
+        message: `Skill execution failed: ${errorContext.message}${errorContext.suggestions ? ` (${errorContext.suggestions[0]})` : ''}`,
+        error: error instanceof Error ? error : new Error(errorContext.message),
+        data: {
+          errorCode: errorContext.code,
+          timestamp: errorContext.timestamp,
+        }
       };
     }
   }
@@ -117,58 +150,43 @@ export class SkillsManager {
     const tools: Tool[] = [];
 
     for (const [name, skill] of this.skills) {
-      // Create Zod schema from skill metadata
-      const schemaFields: Record<string, any> = {};
-      
+      // Create JSON Schema properties from skill metadata
+      const properties: Record<string, Record<string, unknown>> = {};
+      const required: string[] = [];
+
       for (const [paramName, paramDef] of Object.entries(skill.metadata.parameters)) {
-        let zodType: any;
-        
-        switch (paramDef.type) {
-          case 'string':
-            zodType = z.string();
-            break;
-          case 'number':
-            zodType = z.number();
-            break;
-          case 'boolean':
-            zodType = z.boolean();
-            break;
-          case 'array':
-            zodType = z.array(z.any());
-            break;
-          case 'object':
-            zodType = z.record(z.any());
-            break;
-          default:
-            zodType = z.any();
-        }
+        const propSchema: Record<string, unknown> = {
+          type: paramDef.type === 'array' ? 'array' : paramDef.type,
+          description: paramDef.description,
+        };
 
         if (paramDef.enum) {
-          zodType = z.enum(paramDef.enum as [string, ...string[]]);
+          propSchema.enum = paramDef.enum;
         }
 
-        if (paramDef.description) {
-          zodType = zodType.describe(paramDef.description);
+        if (paramDef.default !== undefined) {
+          propSchema.default = paramDef.default;
         }
 
-        if (!paramDef.required && paramDef.default !== undefined) {
-          zodType = zodType.optional().default(paramDef.default);
-        } else if (!paramDef.required) {
-          zodType = zodType.optional();
+        if (paramDef.type === 'array') {
+          propSchema.items = { type: 'string' };
         }
 
-        schemaFields[paramName] = zodType;
+        properties[paramName] = propSchema;
+
+        if (paramDef.required) {
+          required.push(paramName);
+        }
       }
-
-      const inputSchema = z.object(schemaFields);
 
       tools.push({
         name: `skill_${name.replace(/-/g, '_')}`,
         description: skill.metadata.description,
         inputSchema: {
           type: 'object' as const,
-          properties: inputSchema.shape
-        } as any
+          properties,
+          required: required.length > 0 ? required : undefined,
+        },
       });
     }
 
@@ -324,6 +342,23 @@ export class SkillsManager {
   }
 
   /**
+   * Get manager status for health checks
+   */
+  getStatus(): {
+    initialized: boolean;
+    skillCount: number;
+    registeredSkills: string[];
+    contextAvailable: boolean;
+  } {
+    return {
+      initialized: this._context !== null,
+      skillCount: this.skills.size,
+      registeredSkills: Array.from(this.skills.keys()),
+      contextAvailable: this._context !== null,
+    };
+  }
+
+  /**
    * Get skill catalog for discovery
    */
   getSkillCatalog(): any[] {
@@ -333,6 +368,7 @@ export class SkillsManager {
       const category = name.includes('device') ? 'device-management' :
                       name.includes('policy') ? 'policy-management' :
                       name.includes('compliance') || name.includes('scheduled') ? 'automation' :
+                      name.includes('documentation') || name.includes('environment-docs') ? 'documentation' :
                       'other';
 
       catalog.push({

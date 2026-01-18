@@ -6,6 +6,10 @@
 import { SkillsManager } from './manager.js';
 import { SkillContext } from './types.js';
 import { JamfApiClientHybrid } from '../jamf-client-hybrid.js';
+import { createLogger } from '../server/logger.js';
+import { buildErrorContext } from '../utils/error-handler.js';
+
+const skillLogger = createLogger('Skills');
 
 // Import tool functions directly
 import { 
@@ -59,8 +63,14 @@ export function initializeSkillsForHttp(
         }
         
         return { data: result };
-      } catch (error: any) {
-        throw new Error(`Tool execution failed: ${error.message}`);
+      } catch (error: unknown) {
+        const errorContext = buildErrorContext(
+          error,
+          `Execute tool: ${toolName}`,
+          'http-initializer',
+          { toolName, params }
+        );
+        throw new Error(`Tool execution failed: ${errorContext.message}`);
       }
     },
     
@@ -70,18 +80,18 @@ export function initializeSkillsForHttp(
     },
     
     logger: {
-      info: (message: string, meta?: any) => {
-        console.log(`[SKILL INFO] ${message}`, meta || '');
+      info: (message: string, meta?: Record<string, unknown>) => {
+        skillLogger.info(message, meta);
       },
-      warn: (message: string, meta?: any) => {
-        console.warn(`[SKILL WARN] ${message}`, meta || '');
+      warn: (message: string, meta?: Record<string, unknown>) => {
+        skillLogger.warn(message, meta);
       },
-      error: (message: string, meta?: any) => {
-        console.error(`[SKILL ERROR] ${message}`, meta || '');
+      error: (message: string, meta?: Record<string, unknown>) => {
+        skillLogger.error(message, meta);
       }
     }
   };
   
   // Initialize the skills manager with this context
-  (skillsManager as any).context = context;
+  skillsManager.context = context;
 }

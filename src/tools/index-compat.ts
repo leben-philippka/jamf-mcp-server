@@ -1,11 +1,17 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { 
+import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
   Tool,
   TextContent,
 } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
+import { DocumentationGenerator } from '../documentation/generator.js';
+import { DocumentationOptions } from '../documentation/types.js';
+import { createLogger } from '../server/logger.js';
+import { buildErrorContext, logErrorWithContext } from '../utils/error-handler.js';
+
+const logger = createLogger('Tools');
 // import { parseJamfDate } from '../jamf-client-classic.js';
 // Helper function to parse Jamf dates
 const parseJamfDate = (date: string | Date | undefined): Date => {
@@ -443,6 +449,25 @@ const GetSoftwareVersionReportSchema = z.object({
 });
 
 const GetDeviceComplianceSummarySchema = z.object({});
+
+// Documentation schemas
+const DocumentJamfEnvironmentSchema = z.object({
+  outputPath: z.string().optional().describe('Directory path where documentation files will be saved'),
+  formats: z.array(z.enum(['markdown', 'json'])).optional().describe('Output formats to generate'),
+  components: z.array(z.enum([
+    'computers',
+    'mobile-devices',
+    'policies',
+    'configuration-profiles',
+    'scripts',
+    'packages',
+    'computer-groups',
+    'mobile-device-groups',
+  ])).optional().describe('Specific components to document'),
+  detailLevel: z.enum(['summary', 'standard', 'full']).optional().describe('Level of detail to include'),
+  includeScriptContent: z.boolean().optional().describe('Include full script content in documentation'),
+  includeProfilePayloads: z.boolean().optional().describe('Include configuration profile payload details'),
+});
 
 export function registerTools(server: Server, jamfClient: any): void {
   server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -1729,6 +1754,63 @@ export function registerTools(server: Server, jamfClient: any): void {
           properties: {},
         },
       },
+      // Documentation Tools
+      {
+        name: 'documentJamfEnvironment',
+        description: 'Generate comprehensive documentation of the Jamf Pro environment including computers, mobile devices, policies, configuration profiles, scripts, packages, and groups. Outputs both markdown and JSON formats to the specified directory.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            outputPath: {
+              type: 'string',
+              description: 'Directory path where documentation files will be saved',
+              default: './jamf-documentation',
+            },
+            formats: {
+              type: 'array',
+              items: {
+                type: 'string',
+                enum: ['markdown', 'json'],
+              },
+              description: 'Output formats to generate (markdown, json, or both)',
+              default: ['markdown', 'json'],
+            },
+            components: {
+              type: 'array',
+              items: {
+                type: 'string',
+                enum: [
+                  'computers',
+                  'mobile-devices',
+                  'policies',
+                  'configuration-profiles',
+                  'scripts',
+                  'packages',
+                  'computer-groups',
+                  'mobile-device-groups',
+                ],
+              },
+              description: 'Specific components to document. If not provided, all components will be documented.',
+            },
+            detailLevel: {
+              type: 'string',
+              enum: ['summary', 'standard', 'full'],
+              description: 'Level of detail to include in documentation',
+              default: 'full',
+            },
+            includeScriptContent: {
+              type: 'boolean',
+              description: 'Include full script content in documentation',
+              default: true,
+            },
+            includeProfilePayloads: {
+              type: 'boolean',
+              description: 'Include configuration profile payload details',
+              default: true,
+            },
+          },
+        },
+      },
     ];
 
     return { tools };
@@ -1883,7 +1965,37 @@ export function registerTools(server: Server, jamfClient: any): void {
           const now = new Date();
           const cutoffDate = new Date(now.getTime() - (days * 24 * 60 * 60 * 1000));
           
-          const results = {
+          /** Device compliance info structure */
+          interface ComplianceDeviceInfo {
+            id: string | undefined;
+            name: string | undefined;
+            serialNumber: string | undefined;
+            username: string | undefined;
+            lastContact: string;
+            lastContactReadable: string;
+            daysSinceContact: number | null;
+            status: string;
+            severity?: string;
+          }
+
+          const results: {
+            totalDevices: number;
+            compliant: number;
+            nonCompliant: number;
+            notReporting: number;
+            unknown: number;
+            complianceRate: string;
+            summary: {
+              totalDevices: number;
+              compliant: number;
+              warning: number;
+              critical: number;
+              unknown: number;
+              criticalDevices: ComplianceDeviceInfo[];
+              warningDevices: ComplianceDeviceInfo[];
+            };
+            devices: ComplianceDeviceInfo[] | undefined;
+          } = {
             totalDevices: allComputers.length,
             compliant: 0,
             nonCompliant: 0,
@@ -1896,10 +2008,10 @@ export function registerTools(server: Server, jamfClient: any): void {
               warning: 0,
               critical: 0,
               unknown: 0,
-              criticalDevices: [] as any[],
-              warningDevices: [] as any[],
+              criticalDevices: [],
+              warningDevices: [],
             },
-            devices: includeDetails ? [] as any[] : undefined,
+            devices: includeDetails ? [] : undefined,
           };
           
           // Process all computers without fetching individual details
@@ -2055,9 +2167,16 @@ export function registerTools(server: Server, jamfClient: any): void {
                 devices.push(device);
               }
             } catch (error) {
+              const errorContext = buildErrorContext(
+                error,
+                `Get device details: ${deviceId}`,
+                'index-compat',
+                { deviceId }
+              );
               errors.push({
                 deviceId,
-                error: error instanceof Error ? error.message : 'Unknown error',
+                error: errorContext.message,
+                code: errorContext.code,
               });
             }
           }
@@ -2121,10 +2240,20 @@ export function registerTools(server: Server, jamfClient: any): void {
                     fullDetails: scriptDetails,
                   };
                 } catch (error) {
-                  console.error(`Failed to fetch script details for script ${script.id}:`, error);
+                  const errorContext = buildErrorContext(
+                    error,
+                    `Fetch script details: ${script.id}`,
+                    'index-compat',
+                    { scriptId: script.id }
+                  );
+                  logger.error('Failed to fetch script details', {
+                    scriptId: script.id,
+                    error: errorContext.message,
+                    code: errorContext.code
+                  });
                   policyDetails.scripts[i] = {
                     ...script,
-                    scriptContentError: `Failed to fetch script content: ${error instanceof Error ? error.message : 'Unknown error'}`,
+                    scriptContentError: `Failed to fetch script content: ${errorContext.message}`,
                   };
                 }
               }
@@ -2206,6 +2335,8 @@ export function registerTools(server: Server, jamfClient: any): void {
               };
               return { content: [content] };
             }
+            // Log and re-throw with context
+            logErrorWithContext(error, `Deploy script: ${scriptId}`, 'index-compat', { scriptId, deviceIds });
             throw error;
           }
         }
@@ -3206,10 +3337,60 @@ export function registerTools(server: Server, jamfClient: any): void {
         case 'getDeviceComplianceSummary': {
           GetDeviceComplianceSummarySchema.parse(args);
           const summary = await jamfClient.getDeviceComplianceSummary();
-          
+
           const content: TextContent = {
             type: 'text',
             text: JSON.stringify(summary, null, 2),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'documentJamfEnvironment': {
+          const options = DocumentJamfEnvironmentSchema.parse(args);
+
+          const documentationOptions: DocumentationOptions = {
+            outputPath: options.outputPath || './jamf-documentation',
+            formats: options.formats || ['markdown', 'json'],
+            components: options.components || [
+              'computers',
+              'mobile-devices',
+              'policies',
+              'configuration-profiles',
+              'scripts',
+              'packages',
+              'computer-groups',
+              'mobile-device-groups',
+            ],
+            detailLevel: options.detailLevel || 'full',
+            includeScriptContent: options.includeScriptContent !== false,
+            includeProfilePayloads: options.includeProfilePayloads !== false,
+          };
+
+          const generator = new DocumentationGenerator(jamfClient);
+          const documentation = await generator.generateDocumentation(documentationOptions);
+          const progress = generator.getProgress();
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: true,
+                message: `Documentation generated successfully for ${progress.completedComponents.length}/${progress.totalComponents} components`,
+                overview: documentation.overview,
+                progress: {
+                  completedComponents: progress.completedComponents,
+                  errors: progress.errors,
+                  duration: progress.endTime && progress.startTime
+                    ? progress.endTime.getTime() - progress.startTime.getTime()
+                    : 0,
+                },
+                outputPath: documentationOptions.outputPath,
+                formats: documentationOptions.formats,
+              },
+              null,
+              2
+            ),
           };
 
           return { content: [content] };
@@ -3219,10 +3400,15 @@ export function registerTools(server: Server, jamfClient: any): void {
           throw new Error(`Unknown tool: ${name}`);
       }
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+      const errorContext = logErrorWithContext(
+        error,
+        `Execute tool: ${name}`,
+        'index-compat',
+        { toolName: name, args }
+      );
       const content: TextContent = {
         type: 'text',
-        text: `Error: ${errorMessage}`,
+        text: `Error: ${errorContext.message}${errorContext.suggestions ? ` (${errorContext.suggestions[0]})` : ''}`,
       };
       return { content: [content], isError: true };
     }

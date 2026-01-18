@@ -1,5 +1,8 @@
 import { AIProvider, AIRequest, AIResponse, AIToolCall, AIProviderConfig } from '../AIProvider.js';
 import axios, { AxiosInstance } from 'axios';
+import { createLogger } from '../../../server/logger.js';
+
+const logger = createLogger('OpenAIProvider');
 
 interface OpenAIMessage {
   role: 'system' | 'user' | 'assistant';
@@ -99,7 +102,7 @@ export class OpenAIProvider extends AIProvider {
               arguments: JSON.parse(toolCall.function.arguments),
             });
           } catch (error) {
-            console.error('Failed to parse tool arguments:', error);
+            logger.error('Failed to parse tool arguments', { error });
           }
         }
       }
@@ -113,9 +116,11 @@ export class OpenAIProvider extends AIProvider {
           totalTokens: response.data.usage.total_tokens,
         } : undefined,
       };
-    } catch (error: any) {
-      if (error.response) {
-        throw new Error(`OpenAI API error: ${error.response.data.error?.message || error.message}`);
+    } catch (error: unknown) {
+      const axiosError = error as { response?: { data?: { error?: { message?: string } } } };
+      if (axiosError.response) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`OpenAI API error: ${axiosError.response.data?.error?.message || message}`);
       }
       throw error;
     }

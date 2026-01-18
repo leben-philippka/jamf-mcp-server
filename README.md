@@ -4,12 +4,102 @@
 [![Node.js Version](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen)](https://nodejs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.8-blue)](https://www.typescriptlang.org/)
 [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-1.0.0-purple)](https://github.com/modelcontextprotocol/sdk)
-[![MCP Badge](https://lobehub.com/badge/mcp-full/dbankscard-jamf-mcp-server)]
-(https://lobehub.com/badge/mcp-full/dbankscard-jamf-mcp-server)
+[![MCP Badge](https://lobehub.com/badge/mcp-full/dbankscard-jamf-mcp-server)](https://lobehub.com/mcp/dbankscard-jamf-mcp-server)
 
 A comprehensive MCP (Model Context Protocol) server that enables AI assistants to interact with Jamf Pro for complete Apple device management. Works with Claude Desktop, Cody, and now **ChatGPT** (via MCP Connectors).
 
 ![Tests](https://github.com/dbankscard/jamf-mcp-server/actions/workflows/test.yml/badge.svg)
+
+## Overview
+
+**Jamf Pro MCP Server** bridges the gap between AI assistants and enterprise Apple device management. Built on the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/), this server transforms complex Jamf Pro operations into natural language conversations, enabling IT administrators to manage thousands of devices through simple queries.
+
+### What is MCP?
+
+The Model Context Protocol is an open standard that allows AI assistants to securely connect to external data sources and tools. Think of it as a universal adapter that lets AI models like Claude and ChatGPT interact with your enterprise systems through a standardized interface.
+
+### Why This Project?
+
+Managing Apple devices at scale is complex. Jamf Pro administrators typically juggle multiple tasks:
+- Searching through device inventories across departments
+- Deploying policies and configuration profiles to specific device groups
+- Troubleshooting compliance issues and tracking outdated devices
+- Generating reports for security audits
+- Running scripts and executing MDM commands
+
+This server eliminates the complexity by letting you accomplish these tasks through natural conversation with AI assistants. Instead of navigating web interfaces, writing scripts, or memorizing API endpoints, you can simply ask: *"Find all MacBooks that haven't checked in for 30 days"* or *"Deploy the WiFi profile to the marketing team's iPads"*.
+
+### Key Capabilities
+
+**🎯 Natural Language Device Management**
+- Search and manage Mac computers and iOS/iPadOS devices
+- Execute policies, deploy scripts, and manage configuration profiles
+- Perform compliance checks and generate reports
+- Handle batch operations across device fleets
+
+**🤖 Multi-Platform AI Integration**
+- **Claude Desktop**: Full local integration with comprehensive device management
+- **ChatGPT**: Cloud-based conversations with intelligent skills system (NEW!)
+- **Cody**: AI coding assistant integration (experimental)
+
+**🧠 Intelligent Skills System**
+Advanced multi-step workflows powered by the skills framework:
+- Automated device search with complex filtering
+- Batch inventory updates and compliance monitoring
+- Policy deployment based on device criteria
+- Scheduled compliance checks with automated reporting
+
+**🛡️ Enterprise-Grade Safety**
+- Read-only mode for audit-only operations
+- Confirmation prompts for destructive actions
+- Comprehensive audit trail and logging
+- Rate limiting and circuit breaker patterns
+- Automatic retry with exponential backoff
+
+### Architecture
+
+```
+┌─────────────────┐         ┌──────────────────┐         ┌─────────────┐
+│  AI Assistant   │ ◄─MCP──► │  MCP Server      │ ◄─API──► │  Jamf Pro   │
+│ (Claude/ChatGPT)│         │  (This Project)  │         │  Instance   │
+└─────────────────┘         └──────────────────┘         └─────────────┘
+```
+
+**For Claude Desktop**: Direct local connection via stdio transport
+**For ChatGPT**: HTTP server with OAuth2 authentication via tunnel (Cloudflare/ngrok)
+
+### Who Is This For?
+
+- **IT Administrators**: Manage Jamf Pro fleets through conversational AI
+- **Security Teams**: Automate compliance checks and generate audit reports
+- **DevOps Engineers**: Integrate device management into automated workflows
+- **MSPs**: Streamline multi-tenant device management operations
+- **Developers**: Build custom AI-powered device management tools on MCP
+
+### Real-World Use Cases
+
+**Compliance Monitoring**
+```
+"Show me all devices running macOS versions older than 14.0
+that haven't checked in for 7 days"
+```
+
+**Emergency Response**
+```
+"Lock all iPads assigned to the sales team and enable Lost Mode"
+```
+
+**Automated Deployment**
+```
+"Deploy the latest security policy to all MacBooks in the
+engineering department"
+```
+
+**Reporting**
+```
+"Generate a compliance report showing devices with less than 10%
+battery health and low disk space"
+```
 
 <p align="center">
   <img src="docs/images/chatgpt-apps-connectors-page.png" alt="ChatGPT MCP Connector" width="600">
@@ -24,10 +114,10 @@ Connect ChatGPT to your Jamf Pro instance using natural language:
 # Clone and run
 git clone https://github.com/dbankscard/jamf-mcp-server.git
 cd jamf-mcp-server
-./start-chatgpt-poc.sh
+./scripts/start-chatgpt-poc.sh
 ```
 
-See our [ChatGPT Quick Start Guide](QUICK_START.md) for 5-minute setup.
+See our [ChatGPT Quick Start Guide](docs/QUICK_START.md) for 5-minute setup.
 
 ### For Claude Desktop Users
 ```bash
@@ -138,6 +228,12 @@ Full device management capabilities including:
 - **jamf://reports/mobile-device-compliance**: Mobile device compliance report showing management status and issues
 - **jamf://reports/storage**: Disk usage analytics
 - **jamf://reports/os-versions**: OS version breakdown
+- **jamf://documentation/environment/overview**: Environment documentation overview
+- **jamf://documentation/environment/[component]**: Component-specific documentation (computers, mobile-devices, policies, etc.)
+
+### Documentation Tools
+- **documentJamfEnvironment**: Generate comprehensive environment documentation in markdown and JSON formats for all Jamf Pro components including computers, mobile devices, policies, configuration profiles, scripts, packages, and groups
+- **CLI Tool**: Standalone command-line tool (`npm run document:env`) with AI-powered analysis, pagination, and comprehensive insights - See [CLI Documentation](docs/CLI_DOCUMENTATION_TOOL.md)
 
 ### Skills (ChatGPT Integration)
 Advanced multi-step operations powered by the skills system:
@@ -146,6 +242,7 @@ Advanced multi-step operations powered by the skills system:
 - **skill_batch_inventory_update**: Update multiple devices efficiently
 - **skill_deploy_policy_by_criteria**: Deploy policies based on device criteria
 - **skill_scheduled_compliance_check**: Automated compliance reporting
+- **skill_generate_environment_docs**: Generate complete Jamf Pro environment documentation
 
 ### Prompts (Workflow Templates)
 - **troubleshoot-device**: Step-by-step device troubleshooting
@@ -158,9 +255,9 @@ Advanced multi-step operations powered by the skills system:
 
 ### For ChatGPT Users
 See our detailed guides:
-- [**Quick Start Guide**](QUICK_START.md) - Fork and deploy in 5 minutes
-- [**Full Setup Guide**](CHATGPT_CONNECTOR_README.md) - Detailed setup instructions
-- [**POC Setup**](PROOF_OF_CONCEPT_SETUP.md) - Local development with tunnels
+- [**Quick Start Guide**](docs/QUICK_START.md) - Fork and deploy in 5 minutes
+- [**Full Setup Guide**](docs/CHATGPT_SETUP.md) - Detailed setup instructions
+- [**POC Setup**](docs/PROOF_OF_CONCEPT_SETUP.md) - Local development with tunnels
 - [**Architecture**](docs/CHATGPT_CONNECTOR_FLOW.md) - How it works
 - [**Deployment Guide**](docs/CHATGPT_DEPLOYMENT.md) - Production deployment
 
@@ -364,6 +461,57 @@ npm run inspector
 ```bash
 npm test
 ```
+
+## 📚 Environment Documentation
+
+Generate comprehensive documentation of your Jamf Pro environment with the built-in documentation CLI tool.
+
+### Quick Start
+
+```bash
+# Generate full documentation
+npm run document:env
+
+# Generate with AI-powered insights
+npm run document:env -- --ai-analysis
+
+# Document specific components
+npm run document:env -- --components policies,scripts,configuration-profiles
+```
+
+### Features
+
+- **Comprehensive Coverage**: Documents computers, mobile devices, policies, configuration profiles, scripts, packages, and groups
+- **AI-Powered Analysis**: Optional Claude AI integration for intelligent insights, security analysis, and recommendations
+- **Multiple Formats**: Generates both JSON (machine-readable) and Markdown (human-readable) output
+- **Efficient Pagination**: Handles large environments with configurable page sizes
+
+### Output Structure
+
+```
+jamf-documentation/
+├── README.md                     # Overview with statistics
+├── data/                         # JSON data files
+│   ├── complete-environment.json
+│   ├── computers.json
+│   └── ...
+└── markdown/                     # Human-readable documentation
+    ├── computers.md
+    ├── policies.md
+    └── ...
+```
+
+### Common Options
+
+| Option | Description |
+|--------|-------------|
+| `--output <path>` | Output directory (default: `./jamf-documentation`) |
+| `--components <list>` | Components to document (e.g., `policies,scripts`) |
+| `--ai-analysis` | Enable AI-powered insights |
+| `--formats <list>` | Output formats: `markdown`, `json`, or both |
+| `--detail-level <level>` | Detail level: `summary`, `standard`, `full` |
+
+For full CLI documentation, see [CLI Documentation Tool](docs/CLI_DOCUMENTATION_TOOL.md).
 
 ## API Requirements
 
