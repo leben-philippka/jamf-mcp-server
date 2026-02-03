@@ -67,6 +67,7 @@ test-handbook/
 *.tmp
 *.temp
 .cache/
+.worktrees/
 
 # Backup files
 *.backup
