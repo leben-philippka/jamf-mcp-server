@@ -79,14 +79,59 @@ export interface JamfScope {
 }
 
 // Script types
+export interface JamfScriptParameters {
+  parameter4?: string;
+  parameter5?: string;
+  parameter6?: string;
+  parameter7?: string;
+  parameter8?: string;
+  parameter9?: string;
+  parameter10?: string;
+  parameter11?: string;
+}
+
 export interface JamfScript {
   id: string | number;
   name: string;
   category?: string;
   filename?: string;
   priority?: string;
-  parameters?: Record<string, string>;
+  parameters?: JamfScriptParameters;
   [key: string]: unknown;
+}
+
+export interface JamfScriptDetails extends JamfScript {
+  info?: string;
+  notes?: string;
+  osRequirements?: string;
+  scriptContents?: string;
+  scriptContentsEncoded?: boolean;
+}
+
+export interface JamfScriptCreateInput {
+  name: string;
+  script_contents: string;
+  category?: string;
+  filename?: string;
+  info?: string;
+  notes?: string;
+  priority?: string;
+  parameters?: JamfScriptParameters;
+  os_requirements?: string;
+  script_contents_encoded?: boolean;
+}
+
+export interface JamfScriptUpdateInput {
+  name?: string;
+  script_contents?: string;
+  category?: string;
+  filename?: string;
+  info?: string;
+  notes?: string;
+  priority?: string;
+  parameters?: JamfScriptParameters;
+  os_requirements?: string;
+  script_contents_encoded?: boolean;
 }
 
 // Profile types

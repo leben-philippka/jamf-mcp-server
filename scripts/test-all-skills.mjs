@@ -4,8 +4,8 @@
  * Run this before building to ensure all skills are working correctly
  */
 
-import { SkillsManager } from './dist/skills/manager.js';
-import { createSkillContext } from './dist/skills/context-provider.js';
+import { SkillsManager } from '../dist/skills/manager.js';
+import { createSkillContext } from '../dist/skills/context-provider.js';
 import chalk from 'chalk';
 
 // Mock Jamf API responses

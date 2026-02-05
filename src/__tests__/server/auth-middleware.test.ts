@@ -1,25 +1,32 @@
 import { describe, expect, test, jest, beforeEach, afterEach } from '@jest/globals';
 import { Request, Response, NextFunction } from 'express';
-import { authenticateToken, cleanupAuthMiddleware } from '../../server/auth-middleware.js';
 
-// Mock jwks-rsa
-jest.mock('jwks-rsa', () => ({
+class JsonWebTokenError extends Error {}
+
+const mockJwt = {
+  default: {
+    verify: jest.fn(),
+    decode: jest.fn(),
+    JsonWebTokenError
+  }
+};
+
+const mockJwks = {
   default: jest.fn(() => ({
     getSigningKey: jest.fn()
   }))
-}));
+};
 
-// Mock jsonwebtoken
-jest.mock('jsonwebtoken', () => ({
-  default: {
-    verify: jest.fn(),
-    decode: jest.fn()
-  }
-}));
+jest.unstable_mockModule('jsonwebtoken', () => mockJwt);
+jest.unstable_mockModule('jwks-rsa', () => mockJwks);
+
+const { authMiddleware, cleanupAuthMiddleware } = await import('../../server/auth-middleware.js');
+const jwt = (await import('jsonwebtoken')).default;
+const jwksRsa = (await import('jwks-rsa')).default;
 
 describe('Auth Middleware', () => {
-  let mockReq: Partial<Request>;
-  let mockRes: Partial<Response>;
+  let mockReq: any;
+  let mockRes: any;
   let mockNext: NextFunction;
 
   beforeEach(() => {
@@ -27,53 +34,60 @@ describe('Auth Middleware', () => {
       headers: {},
       ip: '127.0.0.1',
       method: 'GET',
-      originalUrl: '/test'
+      originalUrl: '/test',
+      path: '/test'
     };
 
     mockRes = {
-      status: jest.fn(() => mockRes as Response),
-      json: jest.fn(() => mockRes as Response),
+      status: jest.fn().mockReturnThis(),
+      json: jest.fn().mockReturnThis(),
       setHeader: jest.fn()
     };
 
     mockNext = jest.fn();
 
     // Reset environment variables
-    process.env.OAUTH_PROVIDER = 'test';
+    process.env.OAUTH_PROVIDER = 'dev';
     process.env.JWT_SECRET = 'test-secret';
+    process.env.NODE_ENV = 'development';
   });
 
   afterEach(() => {
     jest.clearAllMocks();
   });
 
-  describe('authenticateToken', () => {
+  describe('authMiddleware', () => {
     test('should reject requests without Authorization header', async () => {
-      await authenticateToken(mockReq as Request, mockRes as Response, mockNext);
+      await authMiddleware(mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockRes.status).toHaveBeenCalledWith(401);
       expect(mockRes.json).toHaveBeenCalledWith({
-        error: 'No authorization token provided'
+        error: 'Missing authorization header'
       });
       expect(mockNext).not.toHaveBeenCalled();
     });
 
     test('should reject requests with invalid Bearer format', async () => {
-      mockReq.headers = { authorization: 'InvalidFormat token123' };
+      mockReq.headers = { authorization: 'BearerToken' };
 
-      await authenticateToken(mockReq as Request, mockRes as Response, mockNext);
+      await authMiddleware(mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockRes.status).toHaveBeenCalledWith(401);
       expect(mockRes.json).toHaveBeenCalledWith({
-        error: 'Invalid authorization format'
+        error: 'Invalid authorization header format'
       });
     });
 
     test('should authenticate with dev token in development', async () => {
       process.env.OAUTH_PROVIDER = 'dev';
       mockReq.headers = { authorization: 'Bearer dev-token' };
+      const mockVerify = jwt.verify as jest.Mock;
+      mockVerify.mockReturnValue({
+        sub: 'dev-user',
+        permissions: ['read:all', 'write:all']
+      });
 
-      await authenticateToken(mockReq as Request, mockRes as Response, mockNext);
+      await authMiddleware(mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockNext).toHaveBeenCalled();
       expect((mockReq as any).user).toEqual({
@@ -82,40 +96,49 @@ describe('Auth Middleware', () => {
       });
     });
 
-    test('should handle JWT validation with local secret', async () => {
-      process.env.OAUTH_PROVIDER = 'local';
-      const jwt = await import('jsonwebtoken');
-      const mockVerify = jwt.default.verify as jest.Mock;
+    test('should handle Okta token validation', async () => {
+      process.env.OAUTH_PROVIDER = 'okta';
+      process.env.OKTA_DOMAIN = 'https://test.okta.com';
+      process.env.OKTA_CLIENT_ID = 'test-client-id';
+      const mockVerify = jwt.verify as jest.Mock;
+      const mockJwksClient = jwksRsa as unknown as jest.Mock;
+      mockJwksClient.mockReturnValue({
+        getSigningKey: (_kid: string, callback: (err: Error | null, key?: { publicKey: string }) => void) => {
+          callback(null, { publicKey: 'test-public-key' });
+        }
+      });
       
-      mockVerify.mockImplementation((token, secret, options, callback) => {
-        callback(null, { sub: 'local-user', scope: 'read write' });
+      mockVerify.mockImplementation((_token: any, _getKey: any, _options: any, callback: any) => {
+        callback(null, { sub: 'okta-user', permissions: ['read', 'write'] });
       });
 
       mockReq.headers = { authorization: 'Bearer valid-jwt' };
 
-      await authenticateToken(mockReq as Request, mockRes as Response, mockNext);
+      await authMiddleware(mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockNext).toHaveBeenCalled();
       expect((mockReq as any).user).toMatchObject({
-        sub: 'local-user',
+        sub: 'okta-user',
         permissions: ['read', 'write']
       });
     });
 
     test('should handle JWT validation errors', async () => {
-      process.env.OAUTH_PROVIDER = 'local';
-      const jwt = await import('jsonwebtoken');
-      const mockVerify = jwt.default.verify as jest.Mock;
+      process.env.OAUTH_PROVIDER = 'dev';
+      const mockVerify = jwt.verify as jest.Mock;
       
-      mockVerify.mockImplementation((token, secret, options, callback) => {
-        callback(new Error('Invalid token'), null);
+      mockVerify.mockImplementation(() => {
+        throw new Error('Invalid token');
       });
 
       mockReq.headers = { authorization: 'Bearer invalid-jwt' };
 
-      await authenticateToken(mockReq as Request, mockRes as Response, mockNext);
+      await authMiddleware(mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockRes.status).toHaveBeenCalledWith(401);
+      expect(mockRes.json).toHaveBeenCalledWith({
+        error: 'Invalid token'
+      });
       expect(mockNext).not.toHaveBeenCalled();
     });
 
@@ -124,27 +147,19 @@ describe('Auth Middleware', () => {
       process.env.AUTH0_DOMAIN = 'test.auth0.com';
       process.env.AUTH0_AUDIENCE = 'https://api.test.com';
 
-      const jwt = await import('jsonwebtoken');
-      const mockDecode = jwt.default.decode as jest.Mock;
-      const mockVerify = jwt.default.verify as jest.Mock;
+      const mockVerify = jwt.verify as jest.Mock;
 
-      mockDecode.mockReturnValue({
-        header: { kid: 'test-kid' },
-        payload: { sub: 'auth0|user123' }
-      });
-
-      const jwksRsa = await import('jwks-rsa');
-      const mockJwksClient = jwksRsa.default as jest.Mock;
-      const mockGetSigningKey = jest.fn().mockResolvedValue({
-        getPublicKey: () => 'test-public-key'
+      const mockJwksClient = jwksRsa as unknown as jest.Mock;
+      const mockGetSigningKey = jest.fn((_kid: string, callback: any) => {
+        callback(null, { publicKey: 'test-public-key' });
       });
 
       mockJwksClient.mockReturnValue({
         getSigningKey: mockGetSigningKey
       });
 
-      mockVerify.mockImplementation((token, key, options, callback) => {
-        callback(null, { 
+      mockVerify.mockImplementation((_token: any, _key: any, _options: any, callback: any) => {
+        callback(null, {
           sub: 'auth0|user123', 
           permissions: ['read:devices', 'write:devices']
         });
@@ -152,7 +167,7 @@ describe('Auth Middleware', () => {
 
       mockReq.headers = { authorization: 'Bearer valid-auth0-token' };
 
-      await authenticateToken(mockReq as Request, mockRes as Response, mockNext);
+      await authMiddleware(mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockNext).toHaveBeenCalled();
       expect((mockReq as any).user).toMatchObject({
@@ -162,14 +177,17 @@ describe('Auth Middleware', () => {
     });
 
     test('should handle missing JWT_SECRET', async () => {
-      process.env.OAUTH_PROVIDER = 'local';
+      process.env.OAUTH_PROVIDER = 'dev';
       delete process.env.JWT_SECRET;
 
       mockReq.headers = { authorization: 'Bearer some-token' };
 
-      await authenticateToken(mockReq as Request, mockRes as Response, mockNext);
+      await authMiddleware(mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockRes.status).toHaveBeenCalledWith(401);
+      expect(mockRes.json).toHaveBeenCalledWith({
+        error: 'JWT_SECRET not configured for dev mode'
+      });
       expect(mockNext).not.toHaveBeenCalled();
     });
   });

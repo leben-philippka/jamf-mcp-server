@@ -32,16 +32,18 @@ JAMF_CLIENT_SECRET=your-api-client-secret
 - ✅ Mobile Device Groups
 - ✅ Most Modern API endpoints
 
-**Limited Operations (requires Classic API):**
-- ⚠️ Configuration Profiles
-- ⚠️ Scripts
-- ⚠️ Packages
-- ⚠️ Computer Groups
+**Limited Operations (Modern-first, Classic fallback):**
+- ⚠️ Configuration Profiles (Modern API ⚠️ Limited; Classic API for full coverage)
+- ⚠️ Scripts (Modern-first, Classic fallback)
+- ⚠️ Packages (Modern-first, Classic fallback)
+- ⚠️ Computer Groups (Modern-first, Classic fallback)
 - ⚠️ Some advanced features
+
+**Note:** Scripts, packages, and computer groups now attempt Modern API first (Jamf Pro API v1/v2), with Classic API fallback for legacy or unsupported servers.
 
 ### Basic Auth (Classic API)
 
-**Best for:** Legacy endpoints, scripts, configuration profiles, packages
+**Best for:** Legacy endpoints, scripts, configuration profiles, packages, computer groups
 
 **Setup:**
 1. Create a Jamf Pro user account
@@ -88,20 +90,20 @@ JAMF_PASSWORD=your-jamf-password
 
 ### Fully Supported with OAuth2 Only
 
-| Component | Modern API | Classic API | OAuth2 Only |
+| Component | Modern API | Classic API | OAuth2 Only? |
 |-----------|------------|-------------|-------------|
 | Computers | ✅ | ✅ | ✅ |
 | Mobile Devices | ✅ | ✅ | ✅ |
 | Policies | ✅ | ✅ | ✅ |
 | Mobile Device Groups | ✅ | ✅ | ✅ |
 
-### Requires Classic API (Basic Auth)
+### Classic API recommended for full coverage
 
-| Component | Modern API | Classic API | OAuth2 Only |
+| Component | Modern API | Classic API | OAuth2 Only? |
 |-----------|------------|-------------|-------------|
 | Configuration Profiles | ⚠️ Limited | ✅ | ❌ |
-| Scripts | ❌ | ✅ | ❌ |
-| Packages | ❌ | ✅ | ❌ |
+| Scripts | ⚠️ Limited | ✅ | ❌ |
+| Packages | ⚠️ Limited | ✅ | ❌ |
 | Computer Groups | ⚠️ Limited | ✅ | ❌ |
 
 ## Troubleshooting
@@ -122,9 +124,9 @@ JAMF_PASSWORD=your-password
 
 ### Some Components Return 0 Items
 
-**Symptom:** Configuration profiles, scripts, or packages show 0 items even though they exist
+**Symptom:** Configuration profiles, scripts, packages, or computer groups show 0 items even though they exist
 
-**Cause:** These components require Classic API access
+**Cause:** These components may require Classic API access for full coverage or older servers
 
 **Solution:** Add Basic Auth credentials as shown above
 
@@ -176,8 +178,8 @@ JAMF_URL=https://your-instance.jamfcloud.com
 JAMF_CLIENT_ID=abc123
 JAMF_CLIENT_SECRET=secret123
 ```
-✅ Documents: Computers, Mobile Devices, Policies
-❌ Missing: Scripts, Packages, Configuration Profiles, Groups
+✅ Documents: Computers, Mobile Devices, Policies, Mobile Device Groups
+⚠️ Limited: Configuration Profiles, Scripts, Packages, Computer Groups (Modern-first, may be incomplete)
 
 ### Complete (Hybrid)
 ```bash

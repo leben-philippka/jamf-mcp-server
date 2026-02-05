@@ -2,12 +2,33 @@ import axios, { AxiosInstance, AxiosError } from 'axios';
 import { z } from 'zod';
 import { createLogger } from './server/logger.js';
 import { getDefaultAgentPool } from './utils/http-agent-pool.js';
-import { JamfComputer, JamfComputerDetails, JamfSearchResponse, JamfApiResponse } from './types/jamf-api.js';
+import {
+  JamfComputer,
+  JamfComputerDetails,
+  JamfSearchResponse,
+  JamfApiResponse,
+  JamfSearchCriteria,
+  JamfScriptCreateInput,
+  JamfScriptUpdateInput,
+  JamfScriptDetails,
+  JamfScriptParameters,
+  JamfPackage,
+} from './types/jamf-api.js';
 import { isAxiosError, getErrorMessage, getAxiosErrorStatus, getAxiosErrorData } from './utils/type-guards.js';
 import { CircuitBreaker, CircuitBreakerOptions } from './utils/retry.js';
 
 const logger = createLogger('jamf-client-hybrid');
 const agentPool = getDefaultAgentPool();
+
+type SmartGroupCriteriaInput = JamfSearchCriteria & {
+  andOr?: 'and' | 'or';
+  searchType?: string;
+};
+
+type SmartGroupCriteriaContainer = {
+  criterion?: SmartGroupCriteriaInput[];
+  criteria?: SmartGroupCriteriaInput[];
+};
 
 export interface JamfApiClientConfig {
   baseUrl: string;
@@ -1246,17 +1267,81 @@ export class JamfApiClientHybrid {
     return xml;
   }
 
+  private normalizeScript(script: {
+    id?: string | number;
+    name?: string;
+    category?: string;
+    filename?: string;
+    info?: string;
+    notes?: string;
+    priority?: string;
+    parameters?: JamfScriptParameters;
+    osRequirements?: string;
+    os_requirements?: string;
+    scriptContents?: string;
+    script_contents?: string;
+    scriptContentsEncoded?: boolean;
+    script_contents_encoded?: boolean;
+  }): JamfScriptDetails {
+    const normalized: JamfScriptDetails = {
+      id: script.id as string | number,
+      name: script.name as string,
+      category: script.category,
+      filename: script.filename,
+      info: script.info,
+      notes: script.notes,
+      priority: script.priority,
+      parameters: script.parameters,
+      osRequirements: script.osRequirements ?? script.os_requirements,
+      scriptContents: script.scriptContents ?? script.script_contents,
+      scriptContentsEncoded: script.scriptContentsEncoded ?? script.script_contents_encoded,
+    };
+
+    return Object.fromEntries(
+      Object.entries(normalized).filter(([, value]) => value !== undefined)
+    ) as JamfScriptDetails;
+  }
+
+  private normalizePackage(pkg: {
+    id?: string | number;
+    name?: string;
+    category?: string;
+    filename?: string;
+    fileName?: string;
+    size?: number;
+    priority?: number;
+    fill_user_template?: boolean;
+    fillUserTemplate?: boolean;
+  }): JamfPackage {
+    const normalized: JamfPackage = {
+      id: pkg.id as string | number,
+      name: pkg.name ?? pkg.filename ?? pkg.fileName ?? '',
+      category: pkg.category,
+      filename: pkg.filename ?? pkg.fileName,
+      size: pkg.size,
+      priority: pkg.priority,
+      fill_user_template: pkg.fill_user_template ?? pkg.fillUserTemplate,
+    };
+
+    return Object.fromEntries(
+      Object.entries(normalized).filter(([, value]) => value !== undefined)
+    ) as JamfPackage;
+  }
+
   // Get script details
-  async getScriptDetails(scriptId: string): Promise<any> {
+  async getScriptDetails(scriptId: string): Promise<JamfScriptDetails> {
     await this.ensureAuthenticated();
     
     // Try Modern API first
     try {
       logger.info(`Getting script details for ${scriptId} using Modern API...`);
       const response = await this.axiosInstance.get(`/api/v1/scripts/${scriptId}`);
-      return response.data;
+      return this.normalizeScript(response.data);
     } catch (error) {
-      logger.info(`Modern API failed with status ${getAxiosErrorStatus(error)}, trying Classic API...`);
+      logger.info('Modern API failed, trying Classic API...', {
+        status: getAxiosErrorStatus(error),
+        data: getAxiosErrorData(error),
+      });
       // Fall back to Classic API for any error
     }
     
@@ -1265,29 +1350,7 @@ export class JamfApiClientHybrid {
       logger.info(`Getting script details for ${scriptId} using Classic API...`);
       const response = await this.axiosInstance.get(`/JSSResource/scripts/id/${scriptId}`);
       const script = response.data.script;
-      
-      // Transform Classic API response to a consistent format
-      return {
-        id: script.id,
-        name: script.name,
-        category: script.category,
-        filename: script.filename,
-        info: script.info,
-        notes: script.notes,
-        priority: script.priority,
-        parameters: {
-          parameter4: script.parameters?.parameter4,
-          parameter5: script.parameters?.parameter5,
-          parameter6: script.parameters?.parameter6,
-          parameter7: script.parameters?.parameter7,
-          parameter8: script.parameters?.parameter8,
-          parameter9: script.parameters?.parameter9,
-          parameter10: script.parameters?.parameter10,
-          parameter11: script.parameters?.parameter11,
-        },
-        osRequirements: script.os_requirements,
-        scriptContents: script.script_contents,
-      };
+      return this.normalizeScript(script);
     } catch (error) {
       logger.info(`Failed to get script details for ${scriptId}:`, error);
       throw error;
@@ -1550,36 +1613,58 @@ export class JamfApiClientHybrid {
   /**
    * List all packages
    */
-  async listPackages(limit: number = 100): Promise<any[]> {
+  async listPackages(limit: number = 100): Promise<JamfPackage[]> {
     await this.ensureAuthenticated();
     
-    // Packages are only available through Classic API
-    // Modern API doesn't have a packages endpoint
+    // Try Modern API first
     try {
-      logger.info('Listing packages using Classic API...');
-      const response = await this.axiosInstance.get('/JSSResource/packages');
-      const packages = response.data.packages || [];
-      return packages.slice(0, limit);
+      logger.info('Listing packages using Modern API...');
+      const response = await this.axiosInstance.get('/api/v1/packages', {
+        params: { 'page-size': limit },
+      });
+      const packages = response.data?.results || response.data?.packages || [];
+      return packages.map((pkg: JamfPackage) => this.normalizePackage(pkg));
     } catch (error) {
-      logger.info('Failed to list packages:', error);
-      throw error;
+      logger.info('Modern API failed, trying Classic API...', {
+        status: getAxiosErrorStatus(error),
+        data: getAxiosErrorData(error),
+      });
+      try {
+        logger.info('Listing packages using Classic API...');
+        const response = await this.axiosInstance.get('/JSSResource/packages');
+        const packages = response.data.packages || [];
+        return packages.slice(0, limit).map((pkg: JamfPackage) => this.normalizePackage(pkg));
+      } catch (classicError) {
+        logger.info('Failed to list packages:', classicError);
+        throw classicError;
+      }
     }
   }
 
   /**
    * Get package details
    */
-  async getPackageDetails(packageId: string): Promise<any> {
+  async getPackageDetails(packageId: string): Promise<JamfPackage> {
     await this.ensureAuthenticated();
     
-    // Packages are only available through Classic API
+    // Try Modern API first
     try {
-      logger.info(`Getting package details for ${packageId} using Classic API...`);
-      const response = await this.axiosInstance.get(`/JSSResource/packages/id/${packageId}`);
-      return response.data.package;
+      logger.info(`Getting package details for ${packageId} using Modern API...`);
+      const response = await this.axiosInstance.get(`/api/v1/packages/${packageId}`);
+      return this.normalizePackage(response.data);
     } catch (error) {
-      logger.info('Failed to get package details:', error);
-      throw error;
+      logger.info('Modern API failed, trying Classic API...', {
+        status: getAxiosErrorStatus(error),
+        data: getAxiosErrorData(error),
+      });
+      try {
+        logger.info(`Getting package details for ${packageId} using Classic API...`);
+        const response = await this.axiosInstance.get(`/JSSResource/packages/id/${packageId}`);
+        return this.normalizePackage(response.data.package);
+      } catch (classicError) {
+        logger.info('Failed to get package details:', classicError);
+        throw classicError;
+      }
     }
   }
 
@@ -1804,6 +1889,260 @@ export class JamfApiClientHybrid {
     return groupDetails.computers || [];
   }
 
+  private normalizeSmartGroupCriteria(
+    criteriaInput:
+      | SmartGroupCriteriaInput[]
+      | SmartGroupCriteriaContainer
+      | null
+      | undefined
+  ): JamfSearchCriteria[] {
+    if (!criteriaInput) return [];
+
+    let criteriaList: SmartGroupCriteriaInput[] = [];
+
+    if (Array.isArray(criteriaInput)) {
+      criteriaList = criteriaInput;
+    } else if (typeof criteriaInput === 'object') {
+      if (Array.isArray(criteriaInput.criterion)) {
+        criteriaList = criteriaInput.criterion;
+      } else if (Array.isArray(criteriaInput.criteria)) {
+        criteriaList = criteriaInput.criteria;
+      }
+    }
+
+    return criteriaList
+      .map((criterion) => ({
+        name: criterion.name,
+        priority: criterion.priority,
+        and_or: criterion.and_or ?? criterion.andOr,
+        search_type: criterion.search_type ?? criterion.searchType,
+        value: criterion.value,
+        opening_paren: criterion.opening_paren,
+        closing_paren: criterion.closing_paren,
+      }))
+      .filter((criterion) => this.isValidSmartGroupCriterion(criterion));
+  }
+
+  private isValidSmartGroupCriterion(criterion: JamfSearchCriteria): boolean {
+    const name = typeof criterion.name === 'string' ? criterion.name.trim() : '';
+    const andOr = typeof criterion.and_or === 'string' ? criterion.and_or.trim() : '';
+    const searchType = typeof criterion.search_type === 'string' ? criterion.search_type.trim() : '';
+    const value = typeof criterion.value === 'string' ? criterion.value.trim() : '';
+
+    return name !== '' && andOr !== '' && searchType !== '' && value !== '';
+  }
+
+  /**
+   * Build Modern API payload for smart computer groups
+   */
+  private buildModernSmartGroupPayload(
+    name: string,
+    criteria: JamfSearchCriteria[],
+    siteId?: number
+  ): Record<string, unknown> {
+    const mappedCriteria = criteria.map((criterion) => ({
+      name: criterion.name,
+      priority: criterion.priority,
+      andOr: criterion.and_or,
+      searchType: criterion.search_type,
+      value: criterion.value,
+    }));
+
+    return {
+      name,
+      criteria: mappedCriteria,
+      ...(siteId !== undefined ? { siteId } : {}),
+    };
+  }
+
+  private buildModernStaticGroupPayload(
+    name: string,
+    computerIds: number[]
+  ): { name: string; computerIds: number[] } {
+    return {
+      name,
+      computerIds,
+    };
+  }
+
+  private normalizeComputerIds(computerIds: string[]): number[] {
+    return computerIds
+      .map((id) => (typeof id === 'string' ? id.trim() : String(id).trim()))
+      .filter((id) => id !== '' && /^\d+$/.test(id))
+      .map((id) => Number(id))
+      .filter((id) => Number.isSafeInteger(id) && id > 0);
+  }
+
+  /**
+   * Build Classic API XML payload for smart computer groups
+   */
+  private buildClassicSmartGroupXml(
+    name: string,
+    criteria: SmartGroupCriteriaInput[] | SmartGroupCriteriaContainer | null | undefined,
+    siteId?: number
+  ): string {
+    const normalizedCriteria = this.normalizeSmartGroupCriteria(criteria);
+    const mappedCriteria = normalizedCriteria
+      .map((criterion) => {
+        const andOrValue = criterion.and_or ?? '';
+        const searchTypeValue = criterion.search_type ?? '';
+        const priorityValue = criterion.priority ?? '';
+        const valueValue = criterion.value ?? '';
+        const nameValue = criterion.name ?? '';
+
+        return `
+    <criterion>
+      <name>${this.escapeXml(String(nameValue))}</name>
+      <priority>${this.escapeXml(String(priorityValue))}</priority>
+      <and_or>${this.escapeXml(String(andOrValue))}</and_or>
+      <search_type>${this.escapeXml(String(searchTypeValue))}</search_type>
+      <value>${this.escapeXml(String(valueValue))}</value>
+    </criterion>`;
+      })
+      .join('');
+
+    const siteXml =
+      siteId !== undefined
+        ? `
+  <site>
+    <id>${siteId}</id>
+  </site>`
+        : '';
+
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<computer_group>
+  <name>${this.escapeXml(name)}</name>
+  <is_smart>true</is_smart>${siteXml}
+  <criteria>${mappedCriteria}
+  </criteria>
+</computer_group>`;
+  }
+
+  /**
+   * Create smart computer group
+   */
+  async createSmartComputerGroup(
+    name: string,
+    criteria: SmartGroupCriteriaInput[],
+    siteId?: number
+  ): Promise<any> {
+    if (this._readOnlyMode) {
+      throw new Error('Cannot create computer groups in read-only mode');
+    }
+
+    await this.ensureAuthenticated();
+
+    const normalizedCriteria = this.normalizeSmartGroupCriteria(criteria);
+    if (normalizedCriteria.length === 0) {
+      throw new Error('Smart group criteria cannot be empty');
+    }
+
+    // Try Modern API first
+    try {
+      logger.info(`Creating smart computer group "${name}" using Modern API...`);
+
+      const modernPayload = this.buildModernSmartGroupPayload(name, normalizedCriteria, siteId);
+      const response = await this.axiosInstance.post('/api/v2/computer-groups/smart-groups', modernPayload);
+      const createdId = response.data?.id ? String(response.data.id) : null;
+
+      if (createdId) {
+        return await this.getComputerGroupDetails(createdId);
+      }
+
+      return response.data;
+    } catch (error) {
+      logger.info('Modern API failed, trying Classic API...', {
+        status: getAxiosErrorStatus(error),
+        data: getAxiosErrorData(error),
+      });
+
+      // Fall back to Classic API
+      try {
+        const xmlPayload = this.buildClassicSmartGroupXml(name, criteria, siteId);
+        const response = await this.axiosInstance.post(
+          '/JSSResource/computergroups/id/0',
+          xmlPayload,
+          {
+            headers: {
+              'Content-Type': 'application/xml',
+              'Accept': 'application/xml',
+            }
+          }
+        );
+        const createdId = response.data?.id ? String(response.data.id) : null;
+
+        if (createdId) {
+          return await this.getComputerGroupDetails(createdId);
+        }
+
+        return response.data;
+      } catch (classicError) {
+        logger.info('Classic API also failed:', classicError);
+        throw classicError;
+      }
+    }
+  }
+
+  /**
+   * Update smart computer group
+   */
+  async updateSmartComputerGroup(
+    groupId: string,
+    updates: { name?: string; criteria?: SmartGroupCriteriaInput[]; siteId?: number }
+  ): Promise<any> {
+    if (this._readOnlyMode) {
+      throw new Error('Cannot update computer groups in read-only mode');
+    }
+
+    await this.ensureAuthenticated();
+
+    const groupDetails = await this.getComputerGroupDetails(groupId);
+    const newName = updates.name ?? groupDetails.name;
+    const newCriteria = this.normalizeSmartGroupCriteria(updates.criteria ?? groupDetails.criteria);
+    if (newCriteria.length === 0) {
+      throw new Error('Smart group criteria cannot be empty');
+    }
+    const resolvedSiteId = updates.siteId ?? groupDetails.site?.id;
+
+    // Try Modern API first
+    try {
+      logger.info(`Updating smart computer group ${groupId} using Modern API...`);
+
+      const modernPayload = this.buildModernSmartGroupPayload(newName, newCriteria, resolvedSiteId);
+      const response = await this.axiosInstance.put(
+        `/api/v2/computer-groups/smart-groups/${groupId}`,
+        modernPayload
+      );
+
+      return response.data;
+    } catch (error) {
+      logger.info('Modern API failed, trying Classic API...', {
+        status: getAxiosErrorStatus(error),
+        data: getAxiosErrorData(error),
+      });
+
+      // Fall back to Classic API
+      try {
+        const xmlPayload = this.buildClassicSmartGroupXml(newName, newCriteria, resolvedSiteId);
+        const response = await this.axiosInstance.put(
+          `/JSSResource/computergroups/id/${groupId}`,
+          xmlPayload,
+          {
+            headers: {
+              'Content-Type': 'application/xml',
+              'Accept': 'application/xml',
+            }
+          }
+        );
+
+        return response.data;
+      } catch (classicError) {
+        logger.info('Classic API also failed:', classicError);
+        throw classicError;
+      }
+    }
+  }
+
   /**
    * Create static computer group
    */
@@ -1813,33 +2152,49 @@ export class JamfApiClientHybrid {
     }
     
     await this.ensureAuthenticated();
+
+    const normalizedComputerIds = this.normalizeComputerIds(computerIds);
+    if (normalizedComputerIds.length === 0) {
+      throw new Error('Static group computer IDs cannot be empty');
+    }
     
     try {
       // Try Modern API first
       logger.info(`Creating static computer group "${name}" using Modern API...`);
-      
-      const payload = {
-        name: name,
-        isSmart: false,
-        computers: computerIds.map(id => ({ id: parseInt(id) })),
-      };
-      
-      const response = await this.axiosInstance.post('/api/v1/computer-groups', payload);
+
+      const payload = this.buildModernStaticGroupPayload(name, normalizedComputerIds);
+      const response = await this.axiosInstance.post('/api/v2/computer-groups/static-groups', payload);
+      const createdId = response.data?.id ? String(response.data.id) : null;
+
+      if (createdId) {
+        return await this.getComputerGroupDetails(createdId);
+      }
+
       return response.data;
     } catch (error) {
       logger.info('Modern API failed, trying Classic API...');
       
       // Fall back to Classic API
       try {
-        const payload = {
-          computer_group: {
-            name: name,
-            is_smart: false,
-            computers: computerIds.map(id => ({ id: parseInt(id) })),
+        const xmlPayload = `<?xml version="1.0" encoding="UTF-8"?>
+<computer_group>
+  <name>${this.escapeXml(name)}</name>
+  <is_smart>false</is_smart>
+  <computers>
+    ${normalizedComputerIds.map(id => `<computer><id>${this.escapeXml(String(id))}</id></computer>`).join('\n    ')}
+  </computers>
+</computer_group>`;
+
+        const response = await this.axiosInstance.post(
+          '/JSSResource/computergroups/id/0',
+          xmlPayload,
+          {
+            headers: {
+              'Content-Type': 'application/xml',
+              'Accept': 'application/xml',
+            }
           }
-        };
-        
-        const response = await this.axiosInstance.post('/JSSResource/computergroups/id/0', payload);
+        );
         return response.data.computer_group;
       } catch (classicError) {
         logger.info('Classic API also failed:', classicError);
@@ -1863,49 +2218,68 @@ export class JamfApiClientHybrid {
     if (groupDetails.is_smart || groupDetails.isSmart) {
       throw new Error('Cannot update membership of a smart group. Smart groups are defined by criteria.');
     }
-    
-    // Computer groups are only available through Classic API
-    // Classic API requires XML format for updates
+
+    const normalizedComputerIds = this.normalizeComputerIds(computerIds);
+    if (normalizedComputerIds.length === 0) {
+      throw new Error('Static group computer IDs cannot be empty');
+    }
+
+    // Try Modern API first
     try {
-      logger.info(`Updating static computer group ${groupId} using Classic API with XML...`);
+      logger.info(`Updating static computer group ${groupId} using Modern API...`);
+
+      const payload = this.buildModernStaticGroupPayload(groupDetails.name, normalizedComputerIds);
+      const response = await this.axiosInstance.put(
+        `/api/v2/computer-groups/static-groups/${groupId}`,
+        { name: payload.name, computerIds: payload.computerIds }
+      );
+
+      return response.data;
+    } catch (error) {
+      logger.info('Modern API failed, trying Classic API...');
       
-      // Build XML payload
-      const xmlPayload = `<?xml version="1.0" encoding="UTF-8"?>
+      // Classic API requires XML format for updates
+      try {
+        logger.info(`Updating static computer group ${groupId} using Classic API with XML...`);
+        
+        // Build XML payload
+        const xmlPayload = `<?xml version="1.0" encoding="UTF-8"?>
 <computer_group>
-  <name>${groupDetails.name}</name>
+  <name>${this.escapeXml(groupDetails.name)}</name>
   <is_smart>false</is_smart>
   <computers>
-    ${computerIds.map(id => `<computer><id>${id}</id></computer>`).join('\n    ')}
+    ${normalizedComputerIds.map(id => `<computer><id>${this.escapeXml(String(id))}</id></computer>`).join('\n    ')}
   </computers>
 </computer_group>`;
-      
-      logger.info('Sending XML payload:', xmlPayload);
-      
-      const response = await this.axiosInstance.put(
-        `/JSSResource/computergroups/id/${groupId}`,
-        xmlPayload,
-        {
-          headers: {
-            'Content-Type': 'application/xml',
-            'Accept': 'application/xml',
+        
+        logger.info('Sending XML payload:', xmlPayload);
+        
+        const response = await this.axiosInstance.put(
+          `/JSSResource/computergroups/id/${groupId}`,
+          xmlPayload,
+          {
+            headers: {
+              'Content-Type': 'application/xml',
+              'Accept': 'application/xml',
+            }
           }
+        );
+        
+        // The Classic API returns XML, but might also return an empty response on success
+        // Let's return the updated group details by fetching them
+        logger.info('Update request completed, fetching updated group details...');
+        try {
+          const updatedGroup = await this.getComputerGroupDetails(groupId);
+          return updatedGroup;
+        } catch (fetchError) {
+          // If we can't fetch the updated details, just return a success indicator
+          logger.info('Could not fetch updated group details, but update likely succeeded');
+          return { id: groupId, success: true };
         }
-      );
-      
-      // The Classic API returns XML, but might also return an empty response on success
-      // Let's return the updated group details by fetching them
-      logger.info('Update request completed, fetching updated group details...');
-      try {
-        const updatedGroup = await this.getComputerGroupDetails(groupId);
-        return updatedGroup;
-      } catch (fetchError) {
-        // If we can't fetch the updated details, just return a success indicator
-        logger.info('Could not fetch updated group details, but update likely succeeded');
-        return { id: groupId, success: true };
+      } catch (classicError) {
+        logger.info('Failed to update computer group:', getAxiosErrorStatus(classicError), getAxiosErrorData(classicError));
+        throw classicError;
       }
-    } catch (error) {
-      logger.info('Failed to update computer group:', getAxiosErrorStatus(error), getAxiosErrorData(error));
-      throw error;
     }
   }
 
@@ -2137,15 +2511,33 @@ export class JamfApiClientHybrid {
   /**
    * List all scripts
    */
-  async listScripts(limit: number = 100): Promise<any[]> {
+  async listScripts(limit: number = 100): Promise<JamfScriptDetails[]> {
     await this.ensureAuthenticated();
     
-    // Scripts are only available through Classic API
+    // Try Modern API first
+    try {
+      logger.info('Listing scripts using Modern API...');
+      const response = await this.axiosInstance.get('/api/v1/scripts', {
+        params: {
+          page: 0,
+          'page-size': Math.min(limit, 2000),
+        },
+      });
+      const scripts = response.data.results || [];
+      return scripts.map((script: JamfScriptDetails) => this.normalizeScript(script));
+    } catch (error) {
+      logger.info('Modern API failed, trying Classic API...', {
+        status: getAxiosErrorStatus(error),
+        data: getAxiosErrorData(error),
+      });
+    }
+
+    // Fall back to Classic API
     try {
       logger.info('Listing scripts using Classic API...');
       const response = await this.axiosInstance.get('/JSSResource/scripts');
       const scripts = response.data.scripts || [];
-      return scripts.slice(0, limit);
+      return scripts.slice(0, limit).map((script: JamfScriptDetails) => this.normalizeScript(script));
     } catch (error) {
       logger.info('Failed to list scripts:', error);
       throw error;
@@ -2184,39 +2576,50 @@ export class JamfApiClientHybrid {
   /**
    * Create a new script
    */
-  async createScript(scriptData: {
-    name: string;
-    script_contents: string;
-    category?: string;
-    info?: string;
-    notes?: string;
-    priority?: string;
-    parameters?: {
-      parameter4?: string;
-      parameter5?: string;
-      parameter6?: string;
-      parameter7?: string;
-      parameter8?: string;
-      parameter9?: string;
-      parameter10?: string;
-      parameter11?: string;
-    };
-    os_requirements?: string;
-    script_contents_encoded?: boolean;
-  }): Promise<any> {
+  async createScript(scriptData: JamfScriptCreateInput): Promise<JamfScriptDetails> {
     if (this._readOnlyMode) {
       throw new Error('Cannot create scripts in read-only mode');
     }
     
     await this.ensureAuthenticated();
-    
+
+    const modernPayload = {
+      name: scriptData.name,
+      category: scriptData.category,
+      info: scriptData.info,
+      notes: scriptData.notes,
+      priority: scriptData.priority,
+      scriptContents: scriptData.script_contents,
+      scriptContentsEncoded: scriptData.script_contents_encoded,
+      parameters: scriptData.parameters,
+      osRequirements: scriptData.os_requirements,
+    };
+
+    // Try Modern API first
+    try {
+      logger.info('Creating script using Modern API...');
+      const response = await this.axiosInstance.post('/api/v1/scripts', modernPayload);
+      if (response.data?.id) {
+        return await this.getScriptDetails(String(response.data.id));
+      }
+      return this.normalizeScript(response.data);
+    } catch (error) {
+      logger.info('Modern API failed, trying Classic API...', {
+        status: getAxiosErrorStatus(error),
+        data: getAxiosErrorData(error),
+      });
+    }
+
+    // Fall back to Classic API
     try {
       logger.info('Creating script using Classic API with XML...');
-      
+
       // Build XML payload
       const xmlPayload = this.buildScriptXml(scriptData);
-      logger.info('XML Payload:', xmlPayload);
-      
+      logger.info('Classic script XML payload prepared', {
+        name: scriptData.name ?? 'unknown',
+      });
+
       const response = await this.axiosInstance.post(
         '/JSSResource/scripts/id/0',
         xmlPayload,
@@ -2227,17 +2630,17 @@ export class JamfApiClientHybrid {
           }
         }
       );
-      
+
       // Extract the created script ID from the response
       const locationHeader = response.headers.location;
       const scriptId = locationHeader ? locationHeader.split('/').pop() : null;
-      
-      if (scriptId) {
-        // Fetch and return the created script details
-        return await this.getScriptDetails(scriptId);
+
+      if (!scriptId) {
+        throw new Error('Classic API did not return a script id for the created script');
       }
-      
-      return { success: true };
+
+      // Fetch and return the created script details
+      return await this.getScriptDetails(scriptId);
     } catch (error) {
       logger.info('Failed to create script:', error);
       throw error;
@@ -2247,39 +2650,48 @@ export class JamfApiClientHybrid {
   /**
    * Update an existing script
    */
-  async updateScript(scriptId: string, scriptData: {
-    name?: string;
-    script_contents?: string;
-    category?: string;
-    info?: string;
-    notes?: string;
-    priority?: string;
-    parameters?: {
-      parameter4?: string;
-      parameter5?: string;
-      parameter6?: string;
-      parameter7?: string;
-      parameter8?: string;
-      parameter9?: string;
-      parameter10?: string;
-      parameter11?: string;
-    };
-    os_requirements?: string;
-    script_contents_encoded?: boolean;
-  }): Promise<any> {
+  async updateScript(scriptId: string, scriptData: JamfScriptUpdateInput): Promise<JamfScriptDetails> {
     if (this._readOnlyMode) {
       throw new Error('Cannot update scripts in read-only mode');
     }
     
     await this.ensureAuthenticated();
-    
+
+    const modernPayload = {
+      name: scriptData.name,
+      category: scriptData.category,
+      info: scriptData.info,
+      notes: scriptData.notes,
+      priority: scriptData.priority,
+      scriptContents: scriptData.script_contents,
+      scriptContentsEncoded: scriptData.script_contents_encoded,
+      parameters: scriptData.parameters,
+      osRequirements: scriptData.os_requirements,
+    };
+
+    // Try Modern API first
+    try {
+      logger.info(`Updating script ${scriptId} using Modern API...`);
+      const response = await this.axiosInstance.put(`/api/v1/scripts/${scriptId}`, modernPayload);
+      if (response.data?.id) {
+        return await this.getScriptDetails(String(response.data.id));
+      }
+      return this.normalizeScript(response.data);
+    } catch (error) {
+      logger.info('Modern API failed, trying Classic API...', {
+        status: getAxiosErrorStatus(error),
+        data: getAxiosErrorData(error),
+      });
+    }
+
+    // Fall back to Classic API
     try {
       logger.info(`Updating script ${scriptId} using Classic API with XML...`);
-      
+
       // Build XML payload
       const xmlPayload = this.buildScriptXml(scriptData);
-      
-      const response = await this.axiosInstance.put(
+
+      await this.axiosInstance.put(
         `/JSSResource/scripts/id/${scriptId}`,
         xmlPayload,
         {
@@ -2289,7 +2701,7 @@ export class JamfApiClientHybrid {
           }
         }
       );
-      
+
       // Fetch and return the updated script details
       return await this.getScriptDetails(scriptId);
     } catch (error) {
@@ -2307,7 +2719,21 @@ export class JamfApiClientHybrid {
     }
     
     await this.ensureAuthenticated();
-    
+
+    // Try Modern API first
+    try {
+      logger.info(`Deleting script ${scriptId} using Modern API...`);
+      await this.axiosInstance.delete(`/api/v1/scripts/${scriptId}`);
+      logger.info(`Successfully deleted script ${scriptId}`);
+      return;
+    } catch (error) {
+      logger.info('Modern API failed, trying Classic API...', {
+        status: getAxiosErrorStatus(error),
+        data: getAxiosErrorData(error),
+      });
+    }
+
+    // Fall back to Classic API
     try {
       logger.info(`Deleting script ${scriptId} using Classic API...`);
       await this.axiosInstance.delete(`/JSSResource/scripts/id/${scriptId}`);
@@ -2321,7 +2747,7 @@ export class JamfApiClientHybrid {
   /**
    * Build XML payload for script creation/update
    */
-  private buildScriptXml(scriptData: any): string {
+  private buildScriptXml(scriptData: JamfScriptCreateInput | JamfScriptUpdateInput): string {
     const escapeXml = (str: string): string => {
       return str
         .replace(/&/g, '&amp;')

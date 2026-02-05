@@ -5,20 +5,29 @@ import { SkillContext, SkillResult } from '../../skills/types.js';
 describe('SkillsManager', () => {
   let manager: SkillsManager;
   let mockContext: SkillContext;
+  let callToolMock: any;
+  const setCallToolMock = () => {
+    callToolMock = jest.fn();
+    mockContext.callTool = callToolMock as unknown as SkillContext['callTool'];
+    return callToolMock;
+  };
 
   beforeEach(() => {
     manager = new SkillsManager();
     
     // Create mock context
     mockContext = {
-      callTool: jest.fn(),
+      callTool: jest.fn() as unknown as SkillContext['callTool'],
+      env: {
+        jamfUrl: 'https://jamf.example.test'
+      },
       logger: {
         info: jest.fn(),
         warn: jest.fn(),
-        error: jest.fn(),
-        debug: jest.fn()
+        error: jest.fn()
       }
     };
+    setCallToolMock();
   });
 
   describe('initialization', () => {
@@ -39,11 +48,8 @@ describe('SkillsManager', () => {
       const uninitializedManager = new SkillsManager();
       
       await expect(uninitializedManager.executeSkill('test', {}))
-        .resolves
-        .toMatchObject({
-          success: false,
-          message: 'SkillsManager not initialized'
-        });
+        .rejects
+        .toThrow('SkillsManager not initialized');
     });
   });
 
@@ -70,11 +76,11 @@ describe('SkillsManager', () => {
         { id: '1', name: 'Test Device', serialNumber: 'ABC123' }
       ];
       
-      mockContext.callTool = jest.fn().mockResolvedValue({
+      setCallToolMock().mockResolvedValue({
         data: { devices: mockDevices }
       });
 
-      const result = await manager.executeSkill('device-search-optimized', {
+      const result = await manager.executeSkill('device-search', {
         query: 'Test',
         searchType: 'device'
       });
@@ -89,18 +95,18 @@ describe('SkillsManager', () => {
       
       expect(result.success).toBe(false);
       expect(result.message).toContain('not found');
-      expect(result.data.availableSkills).toContain('device-search-optimized');
+      expect(result.data.availableSkills).toContain('device-search');
     });
 
     test('should handle skill execution errors', async () => {
-      mockContext.callTool = jest.fn().mockRejectedValue(new Error('API Error'));
+      setCallToolMock().mockRejectedValue(new Error('API Error'));
 
       const result = await manager.executeSkill('find-outdated-devices', {
         daysSinceLastContact: 7
       });
 
       expect(result.success).toBe(false);
-      expect(result.message).toContain('Skill execution failed');
+      expect(result.message).toContain('Failed to check device status');
       expect(result.error).toBeDefined();
     });
   });
@@ -111,7 +117,7 @@ describe('SkillsManager', () => {
       
       expect(tools.length).toBeGreaterThan(0);
       
-      const deviceSearchTool = tools.find(t => t.name === 'skill_device-search-optimized');
+      const deviceSearchTool = tools.find(t => t.name === 'skill_device_search');
       expect(deviceSearchTool).toBeDefined();
       expect(deviceSearchTool?.description).toContain('device search');
       expect(deviceSearchTool?.inputSchema).toBeDefined();
@@ -121,7 +127,7 @@ describe('SkillsManager', () => {
 
   describe('ChatGPT schema generation', () => {
     test('should generate valid OpenAPI schema', () => {
-      const schema = manager.getChatGPTSchema();
+      const schema = manager.generateOpenAPISpec();
       
       expect(schema.openapi).toBe('3.0.0');
       expect(schema.info.title).toBe('Jamf MCP Skills API');
@@ -135,13 +141,13 @@ describe('SkillsManager', () => {
     });
 
     test('should include all skills in components schema', () => {
-      const schema = manager.getChatGPTSchema();
+      const schema = manager.generateOpenAPISpec();
       const components = schema.components.schemas;
       
       // Check that skill schemas are included
-      const skills = manager.getAllSkills();
-      skills.forEach(skill => {
-        const schemaName = `${skill.metadata.name}Params`;
+      const skillNames = manager.getStatus().registeredSkills;
+      skillNames.forEach((skillName) => {
+        const schemaName = `${skillName}Parameters`;
         expect(components[schemaName]).toBeDefined();
       });
     });
@@ -165,7 +171,7 @@ describe('SkillsManager', () => {
     });
 
     test('should find outdated devices', async () => {
-      mockContext.callTool = jest.fn().mockResolvedValue({
+      setCallToolMock().mockResolvedValue({
         success: true,
         data: {
           totalDevices: 100,
@@ -181,8 +187,8 @@ describe('SkillsManager', () => {
       });
 
       expect(result.success).toBe(true);
-      expect(result.data.summary.totalDevices).toBe(100);
-      expect(result.data.summary.outdatedDevices).toBe(10);
+      expect(result.data.totalDevices).toBe(100);
+      expect(result.data.outdatedDevices).toBe(10);
       expect(mockContext.callTool).toHaveBeenCalledWith(
         'checkDeviceCompliance',
         expect.objectContaining({
@@ -194,12 +200,11 @@ describe('SkillsManager', () => {
 
     test('should execute scheduled compliance check', async () => {
       // Mock searchDevices for outdated check
-      mockContext.callTool = jest.fn()
-        .mockImplementation((toolName: string) => {
-          if (toolName === 'searchDevices') {
-            return Promise.resolve({
-              data: { 
-                devices: [
+      setCallToolMock().mockImplementation((toolName: string) => {
+        if (toolName === 'searchDevices') {
+          return Promise.resolve({
+            data: { 
+              devices: [
                   { id: '1', name: 'Device1', osVersion: '13.0' },
                   { id: '2', name: 'Device2', osVersion: '14.0' }
                 ]
