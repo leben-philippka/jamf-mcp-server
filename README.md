@@ -107,6 +107,13 @@ battery health and low disk space"
 
 ## 🚀 Quick Start
 
+### Safety Defaults (Important)
+
+When running in MCP mode (`--mcp` or `MCP_MODE=true`), this server defaults to **read-only** to prevent accidental changes in production.
+
+- To enable write operations, set `JAMF_WRITE_ENABLED=true` and restart the MCP server.
+- Some write operations (like inventory update) also require an explicit `confirm: true` parameter.
+
 ### For ChatGPT Users (NEW!)
 Connect ChatGPT to your Jamf Pro instance using natural language:
 
