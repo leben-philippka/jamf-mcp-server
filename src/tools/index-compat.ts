@@ -450,6 +450,9 @@ const GetSoftwareVersionReportSchema = z.object({
 
 const GetDeviceComplianceSummarySchema = z.object({});
 
+// Debug schemas
+const GetAuthStatusSchema = z.object({});
+
 // Documentation schemas
 const DocumentJamfEnvironmentSchema = z.object({
   outputPath: z.string().optional().describe('Directory path where documentation files will be saved'),
@@ -572,6 +575,14 @@ export function registerTools(server: Server, jamfClient: any): void {
               default: 3,
             },
           },
+        },
+      },
+      {
+        name: 'getAuthStatus',
+        description: 'Get non-sensitive Jamf API auth status (debugging)',
+        inputSchema: {
+          type: 'object',
+          properties: {},
         },
       },
       {
@@ -2141,6 +2152,18 @@ export function registerTools(server: Server, jamfClient: any): void {
             text: JSON.stringify(debugInfo, null, 2),
           };
           
+          return { content: [content] };
+        }
+
+        case 'getAuthStatus': {
+          GetAuthStatusSchema.parse(args);
+          const status = jamfClient.getAuthStatus();
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify(status, null, 2),
+          };
+
           return { content: [content] };
         }
 

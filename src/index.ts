@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { loadDotenv } from './utils/dotenv-loader.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { JamfApiClientHybrid } from './jamf-client-hybrid.js';
@@ -15,6 +16,9 @@ import { cleanupAgentPool } from './utils/http-agent-pool.js';
 import { validateJamfConfig } from './utils/env-validation.js';
 
 const logger = createLogger('main');
+
+// Load environment variables from .env if present (non-destructive)
+loadDotenv(import.meta.url);
 
 // Validate environment variables using Zod schema
 const configResult = validateJamfConfig(process.env);

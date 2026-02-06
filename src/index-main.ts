@@ -4,6 +4,11 @@
  * based on environment configuration
  */
 
+import { loadDotenv } from './utils/dotenv-loader.js';
+
+// Load environment variables from .env if present (non-destructive)
+loadDotenv(import.meta.url);
+
 // Check if enhanced mode is enabled
 const USE_ENHANCED_MODE = 
   process.env.JAMF_USE_ENHANCED_MODE === 'true' ||

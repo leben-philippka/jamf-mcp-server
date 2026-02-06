@@ -10,6 +10,7 @@
  * - Skills integration
  */
 
+import { loadDotenv } from './utils/dotenv-loader.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { JamfApiClientHybrid } from './jamf-client-hybrid.js';
@@ -22,6 +23,9 @@ import { createLogger } from './server/logger.js';
 import { validateJamfConfig, validateEnhancedModeConfig } from './utils/env-validation.js';
 
 const logger = createLogger('JamfMCPServerEnhanced');
+
+// Load environment variables from .env if present (non-destructive)
+loadDotenv(import.meta.url);
 
 // Validate environment variables using Zod schemas
 const jamfConfigResult = validateJamfConfig(process.env);

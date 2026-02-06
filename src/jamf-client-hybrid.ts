@@ -171,11 +171,14 @@ export class JamfApiClientHybrid {
         // Note: We keep Accept as application/json for Classic API
         // Jamf Classic API can return JSON if Accept header is set to application/json
       } else {
-        // Modern API endpoints use Bearer token
-        if (this.bearerTokenAvailable && this.bearerToken) {
-          config.headers['Authorization'] = `Bearer ${this.bearerToken.token}`;
-        } else if (this.oauth2Available && this.oauth2Token) {
+        // Modern API endpoints:
+        // Prefer OAuth2 client-credentials token if configured, since it is the
+        // intended Modern API auth method and may differ in permissions from a
+        // Basic-derived bearer token.
+        if (this.oauth2Available && this.oauth2Token) {
           config.headers['Authorization'] = `Bearer ${this.oauth2Token.token}`;
+        } else if (this.bearerTokenAvailable && this.bearerToken) {
+          config.headers['Authorization'] = `Bearer ${this.bearerToken.token}`;
         }
       }
       return config;
@@ -299,6 +302,39 @@ export class JamfApiClientHybrid {
   }
 
   /**
+   * Get non-sensitive auth status for debugging
+   */
+  getAuthStatus(): {
+    hasOAuth2: boolean;
+    hasBasicAuth: boolean;
+    oauth2Available: boolean;
+    bearerTokenAvailable: boolean;
+    oauth2: { issuedAt?: Date; expiresAt?: Date; expiresIn?: number } | null;
+    bearer: { issuedAt?: Date; expiresAt?: Date; expiresIn?: number } | null;
+  } {
+    return {
+      hasOAuth2: this.hasOAuth2,
+      hasBasicAuth: this.hasBasicAuth,
+      oauth2Available: this.oauth2Available,
+      bearerTokenAvailable: this.bearerTokenAvailable,
+      oauth2: this.oauth2Token
+        ? {
+            issuedAt: this.oauth2Token.issuedAt,
+            expiresAt: this.oauth2Token.expires,
+            expiresIn: this.oauth2Token.expiresIn,
+          }
+        : null,
+      bearer: this.bearerToken
+        ? {
+            issuedAt: this.bearerToken.issuedAt,
+            expiresAt: this.bearerToken.expires,
+            expiresIn: this.bearerToken.expiresIn,
+          }
+        : null,
+    };
+  }
+
+  /**
    * Execute a function through the circuit breaker if enabled
    * Otherwise, execute directly
    */
@@ -364,10 +400,10 @@ export class JamfApiClientHybrid {
   private updateAuthorizationHeader(config: { headers?: Record<string, unknown>; url?: string }): void {
     if (!config.headers) return;
 
-    if (this.bearerTokenAvailable && this.bearerToken) {
-      config.headers['Authorization'] = `Bearer ${this.bearerToken.token}`;
-    } else if (this.oauth2Available && this.oauth2Token) {
+    if (!config.url?.includes('/JSSResource/') && this.oauth2Available && this.oauth2Token) {
       config.headers['Authorization'] = `Bearer ${this.oauth2Token.token}`;
+    } else if (this.bearerTokenAvailable && this.bearerToken) {
+      config.headers['Authorization'] = `Bearer ${this.bearerToken.token}`;
     } else if (this.basicAuthHeader && config.url?.includes('/JSSResource/')) {
       config.headers['Authorization'] = this.basicAuthHeader;
     }
@@ -471,33 +507,29 @@ export class JamfApiClientHybrid {
    * Ensure we have a valid token, refreshing proactively before expiration
    */
   private async ensureAuthenticated(): Promise<void> {
-    // Try Bearer token from Basic Auth first (it works on Modern API)
-    if (this.hasBasicAuth) {
-      if (this.isTokenExpiredOrExpiring(this.bearerToken)) {
-        logger.debug('Bearer token expired or expiring soon, refreshing...', {
-          expires: this.bearerToken?.expires,
-          issuedAt: this.bearerToken?.issuedAt,
-          expiresIn: this.bearerToken?.expiresIn,
-        });
-        await this.getBearerTokenWithBasicAuth();
-      }
+    // Refresh both auth methods independently if configured.
+    // This prevents "Basic-derived bearer token" from shadowing OAuth2 on Modern endpoints.
+    if (this.hasBasicAuth && this.isTokenExpiredOrExpiring(this.bearerToken)) {
+      logger.debug('Bearer token expired or expiring soon, refreshing...', {
+        expires: this.bearerToken?.expires,
+        issuedAt: this.bearerToken?.issuedAt,
+        expiresIn: this.bearerToken?.expiresIn,
+      });
+      await this.getBearerTokenWithBasicAuth();
     }
 
-    // Try OAuth2 if Bearer token failed
-    if (!this.bearerTokenAvailable && this.hasOAuth2) {
-      if (this.isTokenExpiredOrExpiring(this.oauth2Token)) {
-        logger.debug('OAuth2 token expired or expiring soon, refreshing...', {
-          expires: this.oauth2Token?.expires,
-          issuedAt: this.oauth2Token?.issuedAt,
-          expiresIn: this.oauth2Token?.expiresIn,
-        });
-        await this.getOAuth2Token();
-      }
+    if (this.hasOAuth2 && this.isTokenExpiredOrExpiring(this.oauth2Token)) {
+      logger.debug('OAuth2 token expired or expiring soon, refreshing...', {
+        expires: this.oauth2Token?.expires,
+        issuedAt: this.oauth2Token?.issuedAt,
+        expiresIn: this.oauth2Token?.expiresIn,
+      });
+      await this.getOAuth2Token();
     }
 
     // We don't set headers here anymore - the interceptor handles it based on the endpoint
     // Just ensure we have at least one valid auth method
-    if (!this.bearerTokenAvailable && !this.oauth2Available && !this.hasBasicAuth) {
+    if (!this.bearerTokenAvailable && !this.oauth2Available) {
       throw new Error('No valid authentication method available');
     }
   }
