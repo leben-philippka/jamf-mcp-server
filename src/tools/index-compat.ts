@@ -31,6 +31,7 @@ const GetDeviceDetailsSchema = z.object({
 
 const UpdateInventorySchema = z.object({
   deviceId: z.string().describe('The device ID to update inventory for'),
+  confirm: z.boolean().optional().default(false).describe('Confirmation flag for inventory update'),
 });
 
 const CheckDeviceComplianceSchema = z.object({
@@ -517,6 +518,11 @@ export function registerTools(server: Server, jamfClient: any): void {
             deviceId: {
               type: 'string',
               description: 'The device ID to update inventory for',
+            },
+            confirm: {
+              type: 'boolean',
+              description: 'Confirmation flag for inventory update (required)',
+              default: false,
             },
           },
           required: ['deviceId'],
@@ -1956,7 +1962,12 @@ export function registerTools(server: Server, jamfClient: any): void {
         }
 
         case 'updateInventory': {
-          const { deviceId } = UpdateInventorySchema.parse(args);
+          const { deviceId, confirm } = UpdateInventorySchema.parse(args);
+
+          if (!confirm) {
+            throw new Error('Inventory update requires confirmation. Set confirm: true to proceed.');
+          }
+
           await jamfClient.updateInventory(deviceId);
           
           const content: TextContent = {

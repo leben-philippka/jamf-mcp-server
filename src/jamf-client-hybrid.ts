@@ -114,6 +114,14 @@ export class JamfApiClientHybrid {
   constructor(config: JamfApiClientConfig) {
     this.config = config;
     this._readOnlyMode = config.readOnlyMode ?? false;
+
+    // Guardrail: In MCP mode, default to read-only unless explicitly enabled.
+    // This prevents accidental writes in production environments.
+    const isMcpMode = process.env.MCP_MODE === 'true' || process.argv.includes('--mcp');
+    const writeEnabled = process.env.JAMF_WRITE_ENABLED === 'true';
+    if (isMcpMode && !writeEnabled) {
+      this._readOnlyMode = true;
+    }
     
     // Check available auth methods
     this.hasOAuth2 = !!(config.clientId && config.clientSecret);

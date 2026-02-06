@@ -12,6 +12,8 @@ interface BatchInventoryUpdateParams {
   deviceIdentifiers: string[];
   identifierType: 'id' | 'serialNumber' | 'name';
   maxConcurrent?: number;
+  dryRun?: boolean;
+  confirm?: boolean;
 }
 
 export async function batchInventoryUpdate(
@@ -19,6 +21,8 @@ export async function batchInventoryUpdate(
   params: BatchInventoryUpdateParams
 ): Promise<SkillResult> {
   const maxConcurrent = params.maxConcurrent || 5;
+  const dryRun = params.dryRun ?? true;
+  const confirm = params.confirm ?? false;
   const results = {
     successful: [] as string[],
     failed: [] as { device: string; error: string }[],
@@ -64,6 +68,40 @@ export async function batchInventoryUpdate(
       }
     }
 
+    // In dry-run mode, only report the resolved device IDs.
+    if (dryRun) {
+      let response = `## Batch Inventory Update Plan (Dry Run)\n\n`;
+      response += `- **Total Input Identifiers**: ${params.deviceIdentifiers.length}\n`;
+      response += `- **Resolved Device IDs**: ${deviceIds.length}\n`;
+      response += `- **Would Update Inventory**: ${deviceIds.length}\n\n`;
+      response += `To execute, set \`dryRun: false\` and \`confirm: true\`.\n`;
+
+      return {
+        success: true,
+        message: response,
+        data: {
+          ...results,
+          deviceIds,
+          dryRun: true,
+          requiresConfirmation: true,
+        }
+      };
+    }
+
+    if (!confirm) {
+      let response = `## Batch Inventory Update Requires Confirmation\n\n`;
+      response += `Resolved ${deviceIds.length} devices. To execute, set \`confirm: true\`.\n`;
+      return {
+        success: false,
+        message: response,
+        data: {
+          ...results,
+          deviceIds,
+          requiresConfirmation: true,
+        }
+      };
+    }
+
     // Update inventory in batches
     const updatePromises = [];
     
@@ -72,7 +110,7 @@ export async function batchInventoryUpdate(
       
       const batchPromises = batch.map(async (deviceId) => {
         try {
-          await context.callTool('updateInventory', { deviceId });
+          await context.callTool('updateInventory', { deviceId, confirm: true });
           results.successful.push(deviceId);
         } catch (error: unknown) {
           const errorContext = buildErrorContext(
@@ -157,6 +195,18 @@ export const metadata: any = {
       description: 'Maximum concurrent updates (default: 5)',
       required: false,
       default: 5
+    },
+    dryRun: {
+      type: 'boolean',
+      description: 'Preview resolved devices without executing updates',
+      required: false,
+      default: true
+    },
+    confirm: {
+      type: 'boolean',
+      description: 'Confirm execution (required when dryRun is false)',
+      required: false,
+      default: false
     }
   },
   examples: [

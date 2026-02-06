@@ -96,7 +96,11 @@ export async function getDeviceDetails(client: JamfApiClientHybrid, params: unkn
  */
 export async function updateInventory(client: JamfApiClientHybrid, params: unknown) {
   const validated = validateParams(UpdateInventoryParamsSchema, params);
-  const { deviceId } = validated;
+  const { deviceId, confirm } = validated;
+
+  if (!confirm) {
+    throw new Error('Inventory update requires confirmation. Set confirm: true to proceed.');
+  }
 
   if (client.readOnlyMode) {
     throw new Error('Cannot update inventory in read-only mode');

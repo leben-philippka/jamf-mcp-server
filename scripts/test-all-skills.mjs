@@ -354,7 +354,9 @@ async function runAllTests() {
     { 
       deviceIdentifiers: ['GH-IT-0300', '759'],
       identifierType: 'name',
-      maxConcurrent: 2
+      maxConcurrent: 2,
+      dryRun: false,
+      confirm: true
     },
     [
       Object.assign(

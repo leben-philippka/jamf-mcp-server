@@ -162,6 +162,7 @@ export type DeviceDetailsParams = z.infer<typeof DeviceDetailsParamsSchema>;
  */
 export const UpdateInventoryParamsSchema = z.object({
   deviceId: JamfDeviceIdSchema,
+  confirm: z.boolean().optional().default(false),
 });
 export type UpdateInventoryParams = z.infer<typeof UpdateInventoryParamsSchema>;
 
