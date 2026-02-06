@@ -126,9 +126,38 @@ const CreateStaticComputerGroupSchema = z.object({
   confirm: z.boolean().optional().default(false).describe('Confirmation flag for group creation'),
 });
 
+const CreateSmartComputerGroupSchema = z.object({
+  name: z.string().describe('Name for the new smart computer group'),
+  criteria: z.array(z.object({
+    name: z.string().describe('Criterion name (e.g., "Last Check-in")'),
+    priority: z.number().describe('Criterion priority (0 = first)'),
+    and_or: z.enum(['and', 'or']).describe('Logical operator for combining criteria'),
+    search_type: z.string().describe('Search type (e.g., "more than x days ago")'),
+    value: z.string().describe('Search value'),
+  })).describe('Smart group criteria'),
+  siteId: z.number().optional().describe('Optional site ID for the group'),
+  confirm: z.boolean().optional().default(false).describe('Confirmation flag for group creation'),
+});
+
 const UpdateStaticComputerGroupSchema = z.object({
   groupId: z.string().describe('The static computer group ID to update'),
   computerIds: z.array(z.string()).describe('Array of computer IDs to set as the group membership'),
+  confirm: z.boolean().optional().default(false).describe('Confirmation flag for group update'),
+});
+
+const UpdateSmartComputerGroupSchema = z.object({
+  groupId: z.string().describe('The smart computer group ID to update'),
+  updates: z.object({
+    name: z.string().optional().describe('Updated group name'),
+    criteria: z.array(z.object({
+      name: z.string().describe('Criterion name (e.g., "Last Check-in")'),
+      priority: z.number().describe('Criterion priority (0 = first)'),
+      and_or: z.enum(['and', 'or']).describe('Logical operator for combining criteria'),
+      search_type: z.string().describe('Search type (e.g., "more than x days ago")'),
+      value: z.string().describe('Search value'),
+    })).optional().describe('Updated smart group criteria'),
+    siteId: z.number().optional().describe('Optional site ID for the group'),
+  }).describe('Updates to apply'),
   confirm: z.boolean().optional().default(false).describe('Confirmation flag for group update'),
 });
 
@@ -916,6 +945,44 @@ export function registerTools(server: Server, jamfClient: any): void {
         },
       },
       {
+        name: 'createSmartComputerGroup',
+        description: 'Create a new smart computer group with criteria (requires confirmation)',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            name: {
+              type: 'string',
+              description: 'Name for the new smart computer group',
+            },
+            criteria: {
+              type: 'array',
+              description: 'Array of criteria for the smart group',
+              items: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string', description: 'Criterion name' },
+                  priority: { type: 'number', description: 'Criterion priority' },
+                  and_or: { type: 'string', description: 'Logical operator (and/or)' },
+                  search_type: { type: 'string', description: 'Search type' },
+                  value: { type: 'string', description: 'Search value' },
+                },
+                required: ['name', 'priority', 'and_or', 'search_type', 'value'],
+              },
+            },
+            siteId: {
+              type: 'number',
+              description: 'Optional site ID for the group',
+            },
+            confirm: {
+              type: 'boolean',
+              description: 'Confirmation flag for group creation',
+              default: false,
+            },
+          },
+          required: ['name', 'criteria'],
+        },
+      },
+      {
         name: 'updateStaticComputerGroup',
         description: 'Update the membership of a static computer group (requires confirmation)',
         inputSchema: {
@@ -939,6 +1006,48 @@ export function registerTools(server: Server, jamfClient: any): void {
             },
           },
           required: ['groupId', 'computerIds'],
+        },
+      },
+      {
+        name: 'updateSmartComputerGroup',
+        description: 'Update a smart computer group name and/or criteria (requires confirmation)',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            groupId: {
+              type: 'string',
+              description: 'The smart computer group ID to update',
+            },
+            updates: {
+              type: 'object',
+              description: 'Updates to apply',
+              properties: {
+                name: { type: 'string', description: 'Updated group name' },
+                criteria: {
+                  type: 'array',
+                  description: 'Updated criteria for the smart group',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      name: { type: 'string', description: 'Criterion name' },
+                      priority: { type: 'number', description: 'Criterion priority' },
+                      and_or: { type: 'string', description: 'Logical operator (and/or)' },
+                      search_type: { type: 'string', description: 'Search type' },
+                      value: { type: 'string', description: 'Search value' },
+                    },
+                    required: ['name', 'priority', 'and_or', 'search_type', 'value'],
+                  },
+                },
+                siteId: { type: 'number', description: 'Optional site ID' },
+              },
+            },
+            confirm: {
+              type: 'boolean',
+              description: 'Confirmation flag for group update',
+              default: false,
+            },
+          },
+          required: ['groupId', 'updates'],
         },
       },
       {
@@ -2602,6 +2711,33 @@ export function registerTools(server: Server, jamfClient: any): void {
           return { content: [content] };
         }
 
+        case 'createSmartComputerGroup': {
+          const { name, criteria, siteId, confirm } = CreateSmartComputerGroupSchema.parse(args);
+
+          if (!confirm) {
+            const content: TextContent = {
+              type: 'text',
+              text: 'Smart computer group creation requires confirmation. Please set confirm: true to proceed.',
+            };
+            return { content: [content] };
+          }
+
+          const group = await jamfClient.createSmartComputerGroup(name, criteria, siteId);
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify({
+              message: `Successfully created smart computer group "${name}"`,
+              group: {
+                id: group.id,
+                name: group.name,
+              },
+            }, null, 2),
+          };
+
+          return { content: [content] };
+        }
+
         case 'updateStaticComputerGroup': {
           const { groupId, computerIds, confirm } = UpdateStaticComputerGroupSchema.parse(args);
           
@@ -2623,6 +2759,33 @@ export function registerTools(server: Server, jamfClient: any): void {
                 id: group.id,
                 name: group.name,
                 memberCount: computerIds.length,
+              },
+            }, null, 2),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'updateSmartComputerGroup': {
+          const { groupId, updates, confirm } = UpdateSmartComputerGroupSchema.parse(args);
+
+          if (!confirm) {
+            const content: TextContent = {
+              type: 'text',
+              text: 'Smart computer group update requires confirmation. Please set confirm: true to proceed.',
+            };
+            return { content: [content] };
+          }
+
+          const group = await jamfClient.updateSmartComputerGroup(groupId, updates);
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify({
+              message: `Successfully updated smart computer group ${groupId}`,
+              group: {
+                id: group.id,
+                name: group.name,
               },
             }, null, 2),
           };
