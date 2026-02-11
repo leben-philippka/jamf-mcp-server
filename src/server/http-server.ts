@@ -2,7 +2,7 @@ import express, { Request, Response, NextFunction } from 'express';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { JamfApiClientHybrid } from '../jamf-client-hybrid.js';
-import { registerTools } from '../tools/index-compat.js';
+import { registerAllTools } from '../tools/register-all-tools.js';
 import { registerResources } from '../resources/index-compat.js';
 import { registerPrompts } from '../prompts/index.js';
 import { authMiddleware } from './auth-middleware.js';
@@ -25,7 +25,6 @@ import {
 import path from 'path';
 import { SkillsManager } from '../skills/manager.js';
 import { createSkillsRouter, chatGPTOptimizationMiddleware } from './skills-endpoints.js';
-import { integrateSkillsWithTools, getSkillTools } from '../tools/skills-integration.js';
 import { initializeSkillsForHttp } from '../skills/http-initializer.js';
 import { validateEnvironment } from '../utils/env-validation.js';
 
@@ -54,8 +53,9 @@ for (const warning of envValidation.warnings) {
 const app = express();
 const port = parseInt(process.env.PORT || '3000', 10);
 
-// Initialize Skills Manager
-const skillsManager = new SkillsManager();
+// Initialize Skills Manager for the HTTP skill endpoints.
+// Do not reuse this instance for MCP connections (it stores mutable execution context).
+const skillsManagerHttp = new SkillsManager();
 
 // Initialize Jamf client for skills
 const jamfClientForSkills = new JamfApiClientHybrid({
@@ -144,10 +144,10 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 });
 
 // Initialize skills manager for HTTP context
-initializeSkillsForHttp(skillsManager, jamfClientForSkills);
+initializeSkillsForHttp(skillsManagerHttp, jamfClientForSkills);
 
 // Mount skills router
-app.use('/api/v1/skills', createSkillsRouter(skillsManager));
+app.use('/api/v1/skills', createSkillsRouter(skillsManagerHttp));
 
 // Serve OpenAPI schema for ChatGPT
 app.get('/chatgpt-openapi-schema.json', (_req: Request, res: Response) => {
@@ -328,7 +328,7 @@ app.post('/', async (req: Request, res: Response) => {
       ];
       
       // Add skill tools
-      const skillTools = getSkillTools(skillsManager);
+      const skillTools = skillsManagerHttp.getMCPTools();
       const allTools = [...basicTools, ...skillTools];
       
       res.json({
@@ -538,12 +538,10 @@ app.use('/mcp', authMiddleware, async (req: Request, res: Response) => {
     });
 
     // Register handlers
-    registerTools(server, jamfClient as any);
+    const skillsManagerMcp = new SkillsManager();
+    registerAllTools(server, skillsManagerMcp, jamfClient);
     registerResources(server, jamfClient as any);
     registerPrompts(server);
-    
-    // Integrate skills with existing tools for Claude
-    integrateSkillsWithTools(server, skillsManager, jamfClient);
 
     // Create SSE transport for HTTP
     transport = new SSEServerTransport('/mcp', res);

@@ -10,6 +10,8 @@ import { DocumentationGenerator } from '../documentation/generator.js';
 import { DocumentationOptions } from '../documentation/types.js';
 import { createLogger } from '../server/logger.js';
 import { buildErrorContext, logErrorWithContext } from '../utils/error-handler.js';
+import { isWriteLikeToolName } from './write-queue.js';
+import { parsePolicySelfServiceFromXml } from '../utils/jamf-policy-xml.js';
 
 const logger = createLogger('Tools');
 // import { parseJamfDate } from '../jamf-client-classic.js';
@@ -53,11 +55,17 @@ const ListPoliciesSchema = z.object({
 const GetPolicyDetailsSchema = z.object({
   policyId: z.string().describe('The Jamf policy ID'),
   includeScriptContent: z.boolean().optional().default(false).describe('Include full script content for scripts in the policy'),
+  includeXml: z.boolean().optional().default(false).describe('Include raw Classic policy XML in the response (can be large)'),
 });
 
 const SearchPoliciesSchema = z.object({
   query: z.string().describe('Search query for policy name or description'),
   limit: z.number().optional().default(50).describe('Maximum number of results'),
+});
+
+const GetPolicyXmlSchema = z.object({
+  policyId: z.string().describe('The Jamf policy ID'),
+  includeParsed: z.boolean().optional().default(true).describe('Include parsed Self Service category info from XML'),
 });
 
 const ExecutePolicySchema = z.object({
@@ -248,9 +256,101 @@ const GetPoliciesUsingPackageSchema = z.object({
   packageId: z.string().describe('The Jamf package ID'),
 });
 
+// Patch management schemas
+const ListPatchAvailableTitlesSchema = z.object({
+  sourceId: z.string().optional().default('1').describe('Patch source ID. Use `1` for Jamf patch catalog in most tenants.'),
+  query: z.string().optional().describe('Optional case-insensitive substring filter on title name'),
+  limit: z.number().optional().default(200).describe('Maximum number of patch available titles to return after filtering'),
+});
+
+const ListPatchPoliciesSchema = z.object({
+  limit: z.number().optional().default(100).describe('Maximum number of patch policies to return'),
+});
+
+const GetPatchPolicyLogsSchema = z.object({
+  policyId: z.string().describe('The patch policy ID'),
+  limit: z.number().optional().default(100).describe('Maximum number of patch policy log records to return'),
+});
+
+const RetryPatchPolicyLogsSchema = z.object({
+  policyId: z.string().describe('The patch policy ID'),
+  retryAll: z.boolean().optional().default(false).describe('Retry all eligible failed logs for this policy'),
+  payload: z.record(z.unknown()).optional().describe('Optional payload for targeted retry endpoint'),
+  confirm: z.boolean().optional().default(false).describe('Confirmation flag for patch log retry'),
+});
+
+const ListPatchSoftwareTitleConfigurationsSchema = z.object({
+  limit: z.number().optional().default(100).describe('Maximum number of patch software title configurations to return'),
+});
+
+const GetPatchSoftwareTitleConfigurationSchema = z.object({
+  configId: z.string().describe('The patch software title configuration ID'),
+});
+
+const GetPatchSoftwareTitleConfigurationReportSchema = z.object({
+  configId: z.string().describe('The patch software title configuration ID'),
+});
+
+const GetPatchSoftwareTitleConfigurationSummarySchema = z.object({
+  configId: z.string().describe('The patch software title configuration ID'),
+});
+
+const GetPatchSoftwareTitleConfigurationVersionSummarySchema = z.object({
+  configId: z.string().describe('The patch software title configuration ID'),
+});
+
+const GetPatchSoftwareTitleConfigurationReportSummarySchema = z.object({
+  configId: z.string().describe('The patch software title configuration ID'),
+  deviceNameContains: z.string().optional().describe('Optional case-insensitive filter by device name'),
+  onlyOutdated: z.boolean().optional().default(false).describe('Include only outdated devices in aggregation'),
+  limit: z.number().optional().default(1000).describe('Maximum number of rows to include in aggregation'),
+});
+
+const CreatePatchSoftwareTitleConfigurationSchema = z.object({
+  config: z.record(z.unknown()).describe('Patch software title configuration payload'),
+  confirm: z.boolean().optional().default(false).describe('Confirmation flag for patch software title configuration creation'),
+});
+
+const UpdatePatchSoftwareTitleConfigurationSchema = z.object({
+  configId: z.string().describe('The patch software title configuration ID'),
+  updates: z.record(z.unknown()).describe('Partial patch software title configuration payload'),
+  confirm: z.boolean().optional().default(false).describe('Confirmation flag for patch software title configuration update'),
+});
+
+const DeletePatchSoftwareTitleConfigurationSchema = z.object({
+  configId: z.string().describe('The patch software title configuration ID'),
+  confirm: z.boolean().optional().default(false).describe('Confirmation flag for patch software title configuration deletion'),
+});
+
+// Managed software updates (macOS)
+const GetManagedSoftwareUpdatesAvailableSchema = z.object({});
+const GetManagedSoftwareUpdatePlansFeatureToggleSchema = z.object({});
+const GetManagedSoftwareUpdatePlansFeatureToggleStatusSchema = z.object({});
+
+const GetManagedSoftwareUpdateStatusesSchema = z.object({
+  limit: z.number().optional().default(100).describe('Maximum number of managed software update statuses to return'),
+});
+
+const ListManagedSoftwareUpdatePlansSchema = z.object({
+  limit: z.number().optional().default(100).describe('Maximum number of managed software update plans to return'),
+});
+
+const GetManagedSoftwareUpdatePlanSchema = z.object({
+  planId: z.string().describe('The managed software update plan ID'),
+});
+
+const CreateManagedSoftwareUpdatePlanSchema = z.object({
+  plan: z.record(z.unknown()).describe('Managed software update plan payload'),
+  confirm: z.boolean().optional().default(false).describe('Confirmation flag for managed software update plan creation'),
+});
+
+const CreateManagedSoftwareUpdatePlanForGroupSchema = z.object({
+  plan: z.record(z.unknown()).describe('Managed software update plan-for-group payload'),
+  confirm: z.boolean().optional().default(false).describe('Confirmation flag for managed software update group plan creation'),
+});
+
 // Policy management schemas
-const CreatePolicySchema = z.object({
-  policyData: z.object({
+const CreatePolicyDataSchema = z.object({
     general: z.object({
       name: z.string().describe('Policy name'),
       enabled: z.boolean().optional().describe('Whether the policy is enabled'),
@@ -286,6 +386,40 @@ const CreatePolicySchema = z.object({
       self_service_description: z.string().optional().describe('Description in Self Service'),
       force_users_to_view_description: z.boolean().optional().describe('Force users to view description'),
       feature_on_main_page: z.boolean().optional().describe('Feature on main page'),
+      notification: z.boolean().optional().describe('Show Self Service notification'),
+      notification_type: z.string().optional().describe('Self Service notification type'),
+      notification_subject: z.string().optional().describe('Self Service notification subject'),
+      notification_message: z.string().optional().describe('Self Service notification message'),
+      self_service_category: z
+        .union([
+          z.string(),
+          z
+            .object({
+              id: z.number().optional(),
+              name: z.string().optional(),
+            })
+            .passthrough(),
+        ])
+        .optional()
+        .describe(
+          'Convenience alias for setting a single Self Service category. Prefer using an existing category id (number) when possible.'
+        ),
+      self_service_categories: z
+        .union([
+          z.array(z.object({ id: z.number().optional(), name: z.string().optional() }).passthrough()),
+          z
+            .object({
+              category: z.union([
+                z.object({ id: z.number().optional(), name: z.string().optional() }).passthrough(),
+                z.array(z.object({ id: z.number().optional(), name: z.string().optional() }).passthrough()),
+              ]),
+            })
+            .passthrough(),
+        ])
+        .optional()
+        .describe(
+          'Self Service categories for this policy. The server writes Classic policy XML <self_service_categories><size>... and includes display_in/feature_in defaults.'
+        ),
     }).optional().describe('Self Service settings'),
     package_configuration: z.object({
       packages: z.array(z.object({
@@ -307,13 +441,20 @@ const CreatePolicySchema = z.object({
       parameter10: z.string().optional().describe('Script parameter 10'),
       parameter11: z.string().optional().describe('Script parameter 11'),
     })).optional().describe('Scripts to run'),
-  }).describe('Policy configuration data'),
-  confirm: z.boolean().optional().default(false).describe('Confirmation flag for policy creation'),
-});
+  }).describe('Policy configuration data');
 
-const UpdatePolicySchema = z.object({
-  policyId: z.string().describe('The policy ID to update'),
-  policyData: z.object({
+const CreatePolicySchema = z.union([
+  z.object({
+    policyData: CreatePolicyDataSchema,
+    confirm: z.boolean().optional().default(false).describe('Confirmation flag for policy creation'),
+  }),
+  z.object({
+    policyXml: z.string().min(1).describe('Raw Classic policy XML payload. When provided, policyData is ignored.'),
+    confirm: z.boolean().optional().default(false).describe('Confirmation flag for policy creation'),
+  }),
+]);
+
+const UpdatePolicyDataSchema = z.object({
     general: z.object({
       name: z.string().optional().describe('Policy name'),
       enabled: z.boolean().optional().describe('Whether the policy is enabled'),
@@ -349,6 +490,40 @@ const UpdatePolicySchema = z.object({
       self_service_description: z.string().optional().describe('Description in Self Service'),
       force_users_to_view_description: z.boolean().optional().describe('Force users to view description'),
       feature_on_main_page: z.boolean().optional().describe('Feature on main page'),
+      notification: z.boolean().optional().describe('Show Self Service notification'),
+      notification_type: z.string().optional().describe('Self Service notification type'),
+      notification_subject: z.string().optional().describe('Self Service notification subject'),
+      notification_message: z.string().optional().describe('Self Service notification message'),
+      self_service_category: z
+        .union([
+          z.string(),
+          z
+            .object({
+              id: z.number().optional(),
+              name: z.string().optional(),
+            })
+            .passthrough(),
+        ])
+        .optional()
+        .describe(
+          'Convenience alias for setting a single Self Service category. Prefer using an existing category id (number) when possible.'
+        ),
+      self_service_categories: z
+        .union([
+          z.array(z.object({ id: z.number().optional(), name: z.string().optional() }).passthrough()),
+          z
+            .object({
+              category: z.union([
+                z.object({ id: z.number().optional(), name: z.string().optional() }).passthrough(),
+                z.array(z.object({ id: z.number().optional(), name: z.string().optional() }).passthrough()),
+              ]),
+            })
+            .passthrough(),
+        ])
+        .optional()
+        .describe(
+          'Self Service categories for this policy. The server writes Classic policy XML <self_service_categories><size>... and includes display_in/feature_in defaults.'
+        ),
     }).optional().describe('Self Service settings to update'),
     package_configuration: z.object({
       packages: z.array(z.object({
@@ -370,7 +545,29 @@ const UpdatePolicySchema = z.object({
       parameter10: z.string().optional().describe('Script parameter 10'),
       parameter11: z.string().optional().describe('Script parameter 11'),
     })).optional().describe('Scripts to run'),
-  }).describe('Policy configuration data to update'),
+  }).describe('Policy configuration data to update');
+
+const UpdatePolicySchema = z.union([
+  z.object({
+    policyId: z.string().describe('The policy ID to update'),
+    policyData: UpdatePolicyDataSchema,
+    confirm: z.boolean().optional().default(false).describe('Confirmation flag for policy update'),
+  }),
+  z.object({
+    policyId: z.string().describe('The policy ID to update'),
+    policyXml: z.string().min(1).describe('Raw Classic policy XML payload. When provided, policyData is ignored.'),
+    confirm: z.boolean().optional().default(false).describe('Confirmation flag for policy update'),
+  }),
+]);
+
+const CreatePolicyXmlSchema = z.object({
+  policyXml: z.string().min(1).describe('Raw Classic policy XML payload'),
+  confirm: z.boolean().optional().default(false).describe('Confirmation flag for policy creation'),
+});
+
+const UpdatePolicyXmlSchema = z.object({
+  policyId: z.string().describe('The policy ID to update'),
+  policyXml: z.string().min(1).describe('Raw Classic policy XML payload'),
   confirm: z.boolean().optional().default(false).describe('Confirmation flag for policy update'),
 });
 
@@ -480,6 +677,36 @@ const GetSoftwareVersionReportSchema = z.object({
 
 const GetDeviceComplianceSummarySchema = z.object({});
 
+const GetComputerPolicyLogsSchema = z
+  .object({
+    serialNumber: z.string().optional().describe('Computer serial number (preferred identifier)'),
+    deviceId: z.string().optional().describe('Jamf computer ID (alternative identifier)'),
+    limit: z.number().int().min(1).max(5000).optional().default(50).describe('Maximum number of log entries to return'),
+    includeRaw: z.boolean().optional().default(false).describe('Include the raw Classic API response for debugging'),
+  })
+  .refine((v) => Boolean(v.serialNumber || v.deviceId), {
+    message: 'Either serialNumber or deviceId is required',
+    path: ['serialNumber'],
+  });
+
+// Category / Self Service Category schemas
+const ListSelfServiceCategoriesSchema = z.object({
+  query: z.string().optional().describe('Optional substring filter on category name'),
+  limit: z.number().int().min(1).max(5000).optional().default(200).describe('Maximum number of categories to return'),
+});
+
+const EnsureSelfServiceCategoryExistsSchema = z.object({
+  name: z.string().min(1).describe('Self Service category name to ensure exists'),
+  priority: z.number().int().min(0).max(1000).optional().describe('Optional category priority'),
+  confirm: z.boolean().optional().default(false).describe('Confirmation flag (required if category needs to be created)'),
+});
+
+const CreateCategorySchema = z.object({
+  name: z.string().min(1).describe('Category name to create'),
+  priority: z.number().int().min(0).max(1000).optional().describe('Optional category priority'),
+  confirm: z.boolean().optional().default(false).describe('Confirmation flag for category creation'),
+});
+
 // Debug schemas
 const GetAuthStatusSchema = z.object({});
 
@@ -503,7 +730,64 @@ const DocumentJamfEnvironmentSchema = z.object({
 });
 
 export function registerTools(server: Server, jamfClient: any): void {
-  server.setRequestHandler(ListToolsRequestSchema, async () => {
+  const { listToolsHandler, callToolHandler } = createBaseToolHandlers(jamfClient);
+
+  server.setRequestHandler(ListToolsRequestSchema, listToolsHandler);
+  server.setRequestHandler(CallToolRequestSchema, callToolHandler);
+}
+
+export function createBaseToolHandlers(jamfClient: any): {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  listToolsHandler: (request: any) => Promise<{ tools: Tool[] }>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  callToolHandler: (request: any) => Promise<any>;
+} {
+  const appendOnce = (base: string, note: string): string => {
+    const b = String(base ?? '').trim();
+    const n = String(note ?? '').trim();
+    if (!n) return b;
+    if (!b) return n;
+    if (b.includes(n)) return b;
+    return `${b} ${n}`;
+  };
+
+  const decorateToolDescription = (tool: Tool): Tool => {
+    const name = String(tool.name ?? '');
+    let description = String(tool.description ?? '');
+
+    // Best-practice safety + behavior notes to prevent common LLM misuse.
+    if (isWriteLikeToolName(name)) {
+      description = appendOnce(
+        description,
+        'Writes require `confirm:true` and (in MCP mode) `JAMF_WRITE_ENABLED=true`. Writes are serialized to reduce Jamf 409 conflicts.'
+      );
+    }
+
+    if (/xml$/i.test(name) || /Xml$/.test(name)) {
+      description = appendOnce(
+        description,
+        'XML tools are a Classic API escape hatch. Prefer structured fields (e.g. policyData) when available; XML updates may replace sections if the payload is incomplete.'
+      );
+    }
+
+    if (name === 'createPolicy' || name === 'updatePolicy') {
+      description = appendOnce(
+        description,
+        'For Self Service categories, prefer passing an existing category `id` (use `listSelfServiceCategories`). The server writes Classic XML <self_service_categories> with required fields.'
+      );
+    }
+
+    if (name === 'createCategory' || name === 'ensureSelfServiceCategoryExists') {
+      description = appendOnce(
+        description,
+        '401/403 typically indicates missing Jamf permissions (API role). If your tenant rejects Bearer tokens for Classic writes, configure `JAMF_USERNAME`/`JAMF_PASSWORD` so the server can retry with Basic auth.'
+      );
+    }
+
+    return { ...tool, description };
+  };
+
+  const listToolsHandler = async () => {
     const tools: Tool[] = [
       {
         name: 'searchDevices',
@@ -640,7 +924,8 @@ export function registerTools(server: Server, jamfClient: any): void {
       },
       {
         name: 'getPolicyDetails',
-        description: 'Get detailed information about a specific policy including scope, scripts, and packages. Can optionally include full script content.',
+        description:
+          'Get detailed policy information. Note: Jamf Classic JSON often omits Self Service categories; this tool can parse them from Classic XML (set includeXml:true to include raw XML).',
         inputSchema: {
           type: 'object',
           properties: {
@@ -651,6 +936,11 @@ export function registerTools(server: Server, jamfClient: any): void {
             includeScriptContent: {
               type: 'boolean',
               description: 'Include full script content for scripts in the policy',
+              default: false,
+            },
+            includeXml: {
+              type: 'boolean',
+              description: 'Include raw Classic policy XML in the response (can be large)',
               default: false,
             },
           },
@@ -674,6 +964,26 @@ export function registerTools(server: Server, jamfClient: any): void {
             },
           },
           required: ['query'],
+        },
+      },
+      {
+        name: 'getPolicyXml',
+        description:
+          'Get raw Classic policy XML for a policy. Useful for verifying fields Jamf may omit in JSON (e.g. Self Service categories).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            policyId: {
+              type: 'string',
+              description: 'The Jamf policy ID',
+            },
+            includeParsed: {
+              type: 'boolean',
+              description: 'Include parsed Self Service category info from XML',
+              default: true,
+            },
+          },
+          required: ['policyId'],
         },
       },
       {
@@ -960,15 +1270,23 @@ export function registerTools(server: Server, jamfClient: any): void {
               items: {
                 type: 'object',
                 properties: {
-                  name: { type: 'string', description: 'Criterion name' },
-                  priority: { type: 'number', description: 'Criterion priority' },
-                  and_or: { type: 'string', description: 'Logical operator (and/or)' },
-                  search_type: { type: 'string', description: 'Search type' },
-                  value: { type: 'string', description: 'Search value' },
-                },
-                required: ['name', 'priority', 'and_or', 'search_type', 'value'],
-              },
-            },
+	                  name: { type: 'string', description: 'Criterion name' },
+	                  priority: { type: 'number', description: 'Criterion priority' },
+	                  and_or: {
+	                    type: 'string',
+	                    description: 'Logical operator (and/or)',
+	                    enum: ['and', 'or'],
+	                  },
+	                  search_type: {
+	                    type: 'string',
+	                    description:
+	                      'Search type/operator (varies by criterion, e.g. "is", "like", "more than x days ago"). Common aliases like "contains" will be normalized.',
+	                  },
+	                  value: { type: 'string', description: 'Search value' },
+	                },
+	                required: ['name', 'priority', 'and_or', 'search_type', 'value'],
+	              },
+	            },
             siteId: {
               type: 'number',
               description: 'Optional site ID for the group',
@@ -1031,13 +1349,21 @@ export function registerTools(server: Server, jamfClient: any): void {
                     properties: {
                       name: { type: 'string', description: 'Criterion name' },
                       priority: { type: 'number', description: 'Criterion priority' },
-                      and_or: { type: 'string', description: 'Logical operator (and/or)' },
-                      search_type: { type: 'string', description: 'Search type' },
-                      value: { type: 'string', description: 'Search value' },
-                    },
-                    required: ['name', 'priority', 'and_or', 'search_type', 'value'],
-                  },
-                },
+	                      and_or: {
+	                        type: 'string',
+	                        description: 'Logical operator (and/or)',
+	                        enum: ['and', 'or'],
+	                      },
+	                      search_type: {
+	                        type: 'string',
+	                        description:
+	                          'Search type/operator (varies by criterion, e.g. "is", "like", "more than x days ago"). Common aliases like "contains" will be normalized.',
+	                      },
+	                      value: { type: 'string', description: 'Search value' },
+	                    },
+	                    required: ['name', 'priority', 'and_or', 'search_type', 'value'],
+	                  },
+	                },
                 siteId: { type: 'number', description: 'Optional site ID' },
               },
             },
@@ -1395,11 +1721,384 @@ export function registerTools(server: Server, jamfClient: any): void {
         },
       },
       {
-        name: 'createPolicy',
-        description: 'Create a new policy with configuration (requires confirmation)',
+        name: 'listPatchAvailableTitles',
+        description:
+          'List patch titles available from a patch source (Classic API). Use this before creating Patch Management configurations to discover what can be onboarded.',
         inputSchema: {
           type: 'object',
           properties: {
+            sourceId: {
+              type: 'string',
+              description: 'Patch source ID. Use `1` for Jamf patch catalog in most tenants.',
+              default: '1',
+            },
+            query: {
+              type: 'string',
+              description: 'Optional case-insensitive substring filter on title name',
+            },
+            limit: {
+              type: 'number',
+              description: 'Maximum number of patch available titles to return after filtering',
+              default: 200,
+            },
+          },
+        },
+      },
+      {
+        name: 'listPatchPolicies',
+        description:
+          'List Patch Management policies from Jamf Pro (v2). Use this first to discover patch policy IDs before reading logs or triggering retries.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            limit: {
+              type: 'number',
+              description: 'Maximum number of patch policies to return',
+              default: 100,
+            },
+          },
+        },
+      },
+      {
+        name: 'getPatchPolicyLogs',
+        description:
+          'Get execution logs for a specific Patch Management policy (v2). Use this to inspect device-level status, failures, and retry candidates.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            policyId: {
+              type: 'string',
+              description: 'The patch policy ID',
+            },
+            limit: {
+              type: 'number',
+              description: 'Maximum number of patch policy log records to return',
+              default: 100,
+            },
+          },
+          required: ['policyId'],
+        },
+      },
+      {
+        name: 'retryPatchPolicyLogs',
+        description:
+          'Retry failed/eligible Patch Management log entries for a patch policy (v2). Use `retryAll:true` for bulk retry, or provide `payload` for targeted retry (requires confirmation).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            policyId: {
+              type: 'string',
+              description: 'The patch policy ID',
+            },
+            retryAll: {
+              type: 'boolean',
+              description: 'Retry all eligible failed logs for this policy',
+              default: false,
+            },
+            payload: {
+              type: 'object',
+              description: 'Optional payload for targeted retry endpoint',
+            },
+            confirm: {
+              type: 'boolean',
+              description: 'Confirmation flag for patch log retry',
+              default: false,
+            },
+          },
+          required: ['policyId'],
+        },
+      },
+      {
+        name: 'listPatchSoftwareTitleConfigurations',
+        description:
+          'List Patch Software Title Configurations (v2). Use this to discover configuration IDs before requesting reports/summaries or performing updates.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            limit: {
+              type: 'number',
+              description: 'Maximum number of patch software title configurations to return',
+              default: 100,
+            },
+          },
+        },
+      },
+      {
+        name: 'getPatchSoftwareTitleConfiguration',
+        description:
+          'Get details for one Patch Software Title Configuration (v2), including targeting and reporting context for that title.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            configId: {
+              type: 'string',
+              description: 'The patch software title configuration ID',
+            },
+          },
+          required: ['configId'],
+        },
+      },
+      {
+        name: 'getPatchSoftwareTitleConfigurationReport',
+        description:
+          'Get the detailed patch report rows (device-level) for a Patch Software Title Configuration (v2).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            configId: {
+              type: 'string',
+              description: 'The patch software title configuration ID',
+            },
+          },
+          required: ['configId'],
+        },
+      },
+      {
+        name: 'getPatchSoftwareTitleConfigurationSummary',
+        description:
+          'Get Jamf-provided aggregated patch summary for a Patch Software Title Configuration (v2).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            configId: {
+              type: 'string',
+              description: 'The patch software title configuration ID',
+            },
+          },
+          required: ['configId'],
+        },
+      },
+      {
+        name: 'getPatchSoftwareTitleConfigurationVersionSummary',
+        description:
+          'Get version-based patch summary for a Patch Software Title Configuration (v2), useful for rollout planning and drift analysis.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            configId: {
+              type: 'string',
+              description: 'The patch software title configuration ID',
+            },
+          },
+          required: ['configId'],
+        },
+      },
+      {
+        name: 'getPatchSoftwareTitleConfigurationReportSummary',
+        description:
+          'Build an MCP-side aggregated/filterable summary from patch report rows (device name filter + outdated-only mode + capped result set). Useful for LLM-friendly reporting.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            configId: {
+              type: 'string',
+              description: 'The patch software title configuration ID',
+            },
+            deviceNameContains: {
+              type: 'string',
+              description: 'Optional case-insensitive filter by device name',
+            },
+            onlyOutdated: {
+              type: 'boolean',
+              description: 'Include only outdated devices in aggregation',
+              default: false,
+            },
+            limit: {
+              type: 'number',
+              description: 'Maximum number of rows to include in aggregation',
+              default: 1000,
+            },
+          },
+          required: ['configId'],
+        },
+      },
+      {
+        name: 'createPatchSoftwareTitleConfiguration',
+        description:
+          'Create a new Patch Software Title Configuration (v2) using raw configuration payload (requires confirmation). Uses strict post-write persistence verification by default.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            config: {
+              type: 'object',
+              description: 'Patch software title configuration payload',
+            },
+            confirm: {
+              type: 'boolean',
+              description: 'Confirmation flag for patch software title configuration creation',
+              default: false,
+            },
+          },
+          required: ['config'],
+        },
+      },
+      {
+        name: 'updatePatchSoftwareTitleConfiguration',
+        description:
+          'Update an existing Patch Software Title Configuration (v2) with partial fields in `updates` (requires confirmation). Uses strict post-write persistence verification by default.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            configId: {
+              type: 'string',
+              description: 'The patch software title configuration ID',
+            },
+            updates: {
+              type: 'object',
+              description: 'Partial patch software title configuration payload',
+            },
+            confirm: {
+              type: 'boolean',
+              description: 'Confirmation flag for patch software title configuration update',
+              default: false,
+            },
+          },
+          required: ['configId', 'updates'],
+        },
+      },
+      {
+        name: 'deletePatchSoftwareTitleConfiguration',
+        description:
+          'Delete a Patch Software Title Configuration (v2) by ID (requires confirmation). Uses strict post-delete verification by default.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            configId: {
+              type: 'string',
+              description: 'The patch software title configuration ID',
+            },
+            confirm: {
+              type: 'boolean',
+              description: 'Confirmation flag for patch software title configuration deletion',
+              default: false,
+            },
+          },
+          required: ['configId'],
+        },
+      },
+      {
+        name: 'getManagedSoftwareUpdatesAvailable',
+        description:
+          'Get currently available Managed Software Updates from Jamf (macOS workflow, v1). Use this to identify update products/versions before plan creation.',
+        inputSchema: {
+          type: 'object',
+          properties: {},
+        },
+      },
+      {
+        name: 'getManagedSoftwareUpdatePlansFeatureToggle',
+        description:
+          'Get Managed Software Update plans feature-toggle details (v1). Useful to diagnose tenant-side plan-service availability issues.',
+        inputSchema: {
+          type: 'object',
+          properties: {},
+        },
+      },
+      {
+        name: 'getManagedSoftwareUpdatePlansFeatureToggleStatus',
+        description:
+          'Get Managed Software Update plans feature-toggle status (v1), including enable/disable state diagnostics.',
+        inputSchema: {
+          type: 'object',
+          properties: {},
+        },
+      },
+      {
+        name: 'getManagedSoftwareUpdateStatuses',
+        description:
+          'Get Managed Software Update statuses (v1), typically device-level progress/state for update operations.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            limit: {
+              type: 'number',
+              description: 'Maximum number of managed software update statuses to return',
+              default: 100,
+            },
+          },
+        },
+      },
+      {
+        name: 'listManagedSoftwareUpdatePlans',
+        description:
+          'List Managed Software Update plans (v1). Use this to discover plan IDs and monitor rollout orchestration.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            limit: {
+              type: 'number',
+              description: 'Maximum number of managed software update plans to return',
+              default: 100,
+            },
+          },
+        },
+      },
+      {
+        name: 'getManagedSoftwareUpdatePlan',
+        description:
+          'Get one Managed Software Update plan by ID (v1), including rollout details and plan metadata.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            planId: {
+              type: 'string',
+              description: 'The managed software update plan ID',
+            },
+          },
+          required: ['planId'],
+        },
+      },
+      {
+        name: 'createManagedSoftwareUpdatePlan',
+        description:
+          'Create a Managed Software Update plan (v1) from raw plan payload (requires confirmation).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            plan: {
+              type: 'object',
+              description: 'Managed software update plan payload',
+            },
+            confirm: {
+              type: 'boolean',
+              description: 'Confirmation flag for managed software update plan creation',
+              default: false,
+            },
+          },
+          required: ['plan'],
+        },
+      },
+      {
+        name: 'createManagedSoftwareUpdatePlanForGroup',
+        description:
+          'Create Managed Software Update plan(s) scoped to a group (v1) from raw payload (requires confirmation).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            plan: {
+              type: 'object',
+              description: 'Managed software update plan-for-group payload',
+            },
+            confirm: {
+              type: 'boolean',
+              description: 'Confirmation flag for managed software update group plan creation',
+              default: false,
+            },
+          },
+          required: ['plan'],
+        },
+      },
+      {
+        name: 'createPolicy',
+        description:
+          'Create a new policy. Prefer `policyData` for structured updates; `policyXml` is an advanced Classic-XML escape hatch (requires confirmation).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            policyXml: {
+              type: 'string',
+              description: 'Raw Classic policy XML payload. If set, policyData is ignored.',
+            },
             policyData: {
               type: 'object',
               description: 'Policy configuration data',
@@ -1415,12 +2114,25 @@ export function registerTools(server: Server, jamfClient: any): void {
                     trigger_enrollment_complete: { type: 'boolean', description: 'Trigger on enrollment complete' },
                     trigger_login: { type: 'boolean', description: 'Trigger on login' },
                     trigger_logout: { type: 'boolean', description: 'Trigger on logout' },
-                    trigger_network_state_changed: { type: 'boolean', description: 'Trigger on network state change' },
-                    trigger_startup: { type: 'boolean', description: 'Trigger on startup' },
-                    trigger_other: { type: 'string', description: 'Custom trigger name' },
-                    frequency: { type: 'string', description: 'Execution frequency' },
-                    category: { type: 'string', description: 'Policy category' },
-                  },
+	                    trigger_network_state_changed: { type: 'boolean', description: 'Trigger on network state change' },
+	                    trigger_startup: { type: 'boolean', description: 'Trigger on startup' },
+	                    trigger_other: { type: 'string', description: 'Custom trigger name' },
+	                    frequency: {
+	                      type: 'string',
+	                      description:
+	                        'Execution frequency (Classic values vary by tenant/version; commonly: Once per computer, Once per user per computer, Once per user, Once per day or Once every day, Once per week or Once every week, Once per month or Once every month, Ongoing).',
+	                      enum: [
+	                        'Once per computer',
+	                        'Once per user per computer',
+	                        'Once per user',
+	                        'Once every day',
+	                        'Once every week',
+	                        'Once every month',
+	                        'Ongoing',
+	                      ],
+	                    },
+	                    category: { type: 'string', description: 'Policy category' },
+	                  },
                   required: ['name'],
                 },
                 scope: {
@@ -1438,8 +2150,91 @@ export function registerTools(server: Server, jamfClient: any): void {
                       items: { type: 'object', properties: { id: { type: 'number' } } },
                       description: 'Computer groups',
                     },
+                    buildings: {
+                      type: 'array',
+                      items: { type: 'object', properties: { id: { type: 'number' } } },
+                      description: 'Buildings',
+                    },
+                    departments: {
+                      type: 'array',
+                      items: { type: 'object', properties: { id: { type: 'number' } } },
+                      description: 'Departments',
+                    },
                   },
                 },
+	                self_service: {
+	                  type: 'object',
+	                  description: 'Self Service settings',
+	                  properties: {
+	                    use_for_self_service: { type: 'boolean', description: 'Make available in Self Service' },
+	                    self_service_display_name: { type: 'string', description: 'Display name in Self Service' },
+	                    install_button_text: { type: 'string', description: 'Install button text' },
+	                    reinstall_button_text: { type: 'string', description: 'Reinstall button text' },
+	                    self_service_description: { type: 'string', description: 'Description in Self Service' },
+	                    force_users_to_view_description: { type: 'boolean', description: 'Force users to view description' },
+	                    feature_on_main_page: { type: 'boolean', description: 'Feature on main page' },
+	                    notification: { type: 'boolean', description: 'Show Self Service notification' },
+	                    notification_type: { type: 'string', description: 'Self Service notification type' },
+	                    notification_subject: { type: 'string', description: 'Self Service notification subject' },
+	                    notification_message: { type: 'string', description: 'Self Service notification message' },
+	                    self_service_category: {
+	                      description:
+	                        'Self Service category (policy). Prefer using an existing category id or name.',
+	                      anyOf: [
+	                        { type: 'string' },
+	                        {
+	                          type: 'object',
+	                          properties: {
+	                            id: { type: 'number' },
+	                            name: { type: 'string' },
+	                          },
+	                        },
+	                      ],
+	                    },
+	                    self_service_categories: {
+	                      description:
+	                        'Self Service categories for this policy. The server writes Classic policy XML <self_service_categories><size>... and includes display_in/feature_in defaults.',
+	                      anyOf: [
+	                        {
+	                          type: 'array',
+	                          items: {
+	                            type: 'object',
+	                            properties: {
+	                              id: { type: 'number' },
+	                              name: { type: 'string' },
+	                            },
+	                          },
+	                        },
+	                        {
+	                          type: 'object',
+	                          properties: {
+	                            category: {
+	                              anyOf: [
+	                                {
+	                                  type: 'object',
+	                                  properties: {
+	                                    id: { type: 'number' },
+	                                    name: { type: 'string' },
+	                                  },
+	                                },
+	                                {
+	                                  type: 'array',
+	                                  items: {
+	                                    type: 'object',
+	                                    properties: {
+	                                      id: { type: 'number' },
+	                                      name: { type: 'string' },
+	                                    },
+	                                  },
+	                                },
+	                              ],
+	                            },
+	                          },
+	                        },
+	                      ],
+	                    },
+	                  },
+	                },
                 package_configuration: {
                   type: 'object',
                   description: 'Package configuration',
@@ -1451,6 +2246,8 @@ export function registerTools(server: Server, jamfClient: any): void {
                         properties: {
                           id: { type: 'number', description: 'Package ID' },
                           action: { type: 'string', description: 'Install action' },
+                          fut: { type: 'boolean', description: 'Fill user templates' },
+                          feu: { type: 'boolean', description: 'Fill existing users' },
                         },
                         required: ['id'],
                       },
@@ -1464,7 +2261,19 @@ export function registerTools(server: Server, jamfClient: any): void {
                     type: 'object',
                     properties: {
                       id: { type: 'number', description: 'Script ID' },
-                      priority: { type: 'string', description: 'Script priority (Before, After)' },
+	                      priority: {
+	                        type: 'string',
+	                        description: 'Script priority (Before, After). Case-insensitive aliases will be normalized.',
+	                        enum: ['Before', 'After'],
+	                      },
+                      parameter4: { type: 'string', description: 'Script parameter 4' },
+                      parameter5: { type: 'string', description: 'Script parameter 5' },
+                      parameter6: { type: 'string', description: 'Script parameter 6' },
+                      parameter7: { type: 'string', description: 'Script parameter 7' },
+                      parameter8: { type: 'string', description: 'Script parameter 8' },
+                      parameter9: { type: 'string', description: 'Script parameter 9' },
+                      parameter10: { type: 'string', description: 'Script parameter 10' },
+                      parameter11: { type: 'string', description: 'Script parameter 11' },
                     },
                     required: ['id'],
                   },
@@ -1478,18 +2287,42 @@ export function registerTools(server: Server, jamfClient: any): void {
               default: false,
             },
           },
-          required: ['policyData'],
+        },
+      },
+      {
+        name: 'createPolicyXml',
+        description:
+          'Create a policy using raw Classic XML payload (advanced; requires exact Classic schema) (requires confirmation)',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            policyXml: {
+              type: 'string',
+              description: 'Raw Classic policy XML payload',
+            },
+            confirm: {
+              type: 'boolean',
+              description: 'Confirmation flag for policy creation',
+              default: false,
+            },
+          },
+          required: ['policyXml'],
         },
       },
       {
         name: 'updatePolicy',
-        description: 'Update an existing policy configuration (requires confirmation)',
+        description:
+          'Update an existing policy. Uses strict post-write persistence verification by default (JSON + Classic XML convergence checks) and returns an error if requested fields are not durably observed. Prefer `policyData` for structured updates; `policyXml` is an advanced Classic-XML escape hatch (requires confirmation).',
         inputSchema: {
           type: 'object',
           properties: {
             policyId: {
               type: 'string',
               description: 'The policy ID to update',
+            },
+            policyXml: {
+              type: 'string',
+              description: 'Raw Classic policy XML payload. If set, policyData is ignored.',
             },
             policyData: {
               type: 'object',
@@ -1502,21 +2335,166 @@ export function registerTools(server: Server, jamfClient: any): void {
                     name: { type: 'string', description: 'Policy name' },
                     enabled: { type: 'boolean', description: 'Whether the policy is enabled' },
                     trigger: { type: 'string', description: 'Policy trigger type' },
-                    frequency: { type: 'string', description: 'Execution frequency' },
-                    category: { type: 'string', description: 'Policy category' },
-                  },
+	                    frequency: {
+	                      type: 'string',
+	                      description:
+	                        'Execution frequency (Classic values vary by tenant/version; commonly: Once per computer, Once per user per computer, Once per user, Once per day or Once every day, Once per week or Once every week, Once per month or Once every month, Ongoing).',
+	                      enum: [
+	                        'Once per computer',
+	                        'Once per user per computer',
+	                        'Once per user',
+	                        'Once every day',
+	                        'Once every week',
+	                        'Once every month',
+	                        'Ongoing',
+	                      ],
+	                    },
+	                    category: { type: 'string', description: 'Policy category' },
+	                  },
                 },
                 scope: {
                   type: 'object',
                   description: 'Policy scope settings to update',
+                  properties: {
+                    all_computers: { type: 'boolean', description: 'Apply to all computers' },
+                    computers: {
+                      type: 'array',
+                      items: { type: 'object', properties: { id: { type: 'number' } } },
+                      description: 'Specific computers',
+                    },
+                    computer_groups: {
+                      type: 'array',
+                      items: { type: 'object', properties: { id: { type: 'number' } } },
+                      description: 'Computer groups',
+                    },
+                    buildings: {
+                      type: 'array',
+                      items: { type: 'object', properties: { id: { type: 'number' } } },
+                      description: 'Buildings',
+                    },
+                    departments: {
+                      type: 'array',
+                      items: { type: 'object', properties: { id: { type: 'number' } } },
+                      description: 'Departments',
+                    },
+                  },
                 },
+	                self_service: {
+	                  type: 'object',
+	                  description: 'Self Service settings to update',
+	                  properties: {
+	                    use_for_self_service: { type: 'boolean', description: 'Make available in Self Service' },
+	                    self_service_display_name: { type: 'string', description: 'Display name in Self Service' },
+	                    install_button_text: { type: 'string', description: 'Install button text' },
+	                    reinstall_button_text: { type: 'string', description: 'Reinstall button text' },
+	                    self_service_description: { type: 'string', description: 'Description in Self Service' },
+	                    force_users_to_view_description: { type: 'boolean', description: 'Force users to view description' },
+	                    feature_on_main_page: { type: 'boolean', description: 'Feature on main page' },
+	                    notification: { type: 'boolean', description: 'Show Self Service notification' },
+	                    notification_type: { type: 'string', description: 'Self Service notification type' },
+	                    notification_subject: { type: 'string', description: 'Self Service notification subject' },
+	                    notification_message: { type: 'string', description: 'Self Service notification message' },
+	                    self_service_category: {
+	                      description:
+	                        'Self Service category (policy). Prefer using an existing category id or name.',
+	                      anyOf: [
+	                        { type: 'string' },
+	                        {
+	                          type: 'object',
+	                          properties: {
+	                            id: { type: 'number' },
+	                            name: { type: 'string' },
+	                          },
+	                        },
+	                      ],
+	                    },
+	                    self_service_categories: {
+	                      description:
+	                        'Self Service categories for this policy. The server writes Classic policy XML <self_service_categories><size>... and includes display_in/feature_in defaults.',
+	                      anyOf: [
+	                        {
+	                          type: 'array',
+	                          items: {
+	                            type: 'object',
+	                            properties: {
+	                              id: { type: 'number' },
+	                              name: { type: 'string' },
+	                            },
+	                          },
+	                        },
+	                        {
+	                          type: 'object',
+	                          properties: {
+	                            category: {
+	                              anyOf: [
+	                                {
+	                                  type: 'object',
+	                                  properties: {
+	                                    id: { type: 'number' },
+	                                    name: { type: 'string' },
+	                                  },
+	                                },
+	                                {
+	                                  type: 'array',
+	                                  items: {
+	                                    type: 'object',
+	                                    properties: {
+	                                      id: { type: 'number' },
+	                                      name: { type: 'string' },
+	                                    },
+	                                  },
+	                                },
+	                              ],
+	                            },
+	                          },
+	                        },
+	                      ],
+	                    },
+	                  },
+	                },
                 package_configuration: {
                   type: 'object',
                   description: 'Package configuration to update',
+                  properties: {
+                    packages: {
+                      type: 'array',
+                      items: {
+                        type: 'object',
+                        properties: {
+                          id: { type: 'number', description: 'Package ID' },
+                          action: { type: 'string', description: 'Install action' },
+                          fut: { type: 'boolean', description: 'Fill user templates' },
+                          feu: { type: 'boolean', description: 'Fill existing users' },
+                        },
+                        required: ['id'],
+                      },
+                      description: 'Packages to deploy',
+                    },
+                  },
                 },
                 scripts: {
                   type: 'array',
                   description: 'Scripts to run',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      id: { type: 'number', description: 'Script ID' },
+	                      priority: {
+	                        type: 'string',
+	                        description: 'Script priority (Before, After). Case-insensitive aliases will be normalized.',
+	                        enum: ['Before', 'After'],
+	                      },
+                      parameter4: { type: 'string', description: 'Script parameter 4' },
+                      parameter5: { type: 'string', description: 'Script parameter 5' },
+                      parameter6: { type: 'string', description: 'Script parameter 6' },
+                      parameter7: { type: 'string', description: 'Script parameter 7' },
+                      parameter8: { type: 'string', description: 'Script parameter 8' },
+                      parameter9: { type: 'string', description: 'Script parameter 9' },
+                      parameter10: { type: 'string', description: 'Script parameter 10' },
+                      parameter11: { type: 'string', description: 'Script parameter 11' },
+                    },
+                    required: ['id'],
+                  },
                 },
               },
             },
@@ -1526,7 +2504,31 @@ export function registerTools(server: Server, jamfClient: any): void {
               default: false,
             },
           },
-          required: ['policyId', 'policyData'],
+          required: ['policyId'],
+        },
+      },
+      {
+        name: 'updatePolicyXml',
+        description:
+          'Update a policy using raw Classic XML payload (advanced; may replace sections if incomplete) (requires confirmation)',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            policyId: {
+              type: 'string',
+              description: 'The policy ID to update',
+            },
+            policyXml: {
+              type: 'string',
+              description: 'Raw Classic policy XML payload',
+            },
+            confirm: {
+              type: 'boolean',
+              description: 'Confirmation flag for policy update',
+              default: false,
+            },
+          },
+          required: ['policyId', 'policyXml'],
         },
       },
       {
@@ -1693,10 +2695,11 @@ export function registerTools(server: Server, jamfClient: any): void {
                   type: 'string',
                   description: 'Script notes',
                 },
-                priority: {
-                  type: 'string',
-                  description: 'Script priority',
-                },
+	                priority: {
+	                  type: 'string',
+	                  description: 'Script priority (Before, After). Case-insensitive aliases will be normalized.',
+	                  enum: ['Before', 'After'],
+	                },
                 parameters: {
                   type: 'object',
                   description: 'Script parameter labels',
@@ -1733,7 +2736,7 @@ export function registerTools(server: Server, jamfClient: any): void {
       },
       {
         name: 'updateScript',
-        description: 'Update an existing script (requires confirmation)',
+        description: 'Update an existing script (requires confirmation). Uses strict post-write persistence verification by default.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -1765,10 +2768,11 @@ export function registerTools(server: Server, jamfClient: any): void {
                   type: 'string',
                   description: 'Script notes',
                 },
-                priority: {
-                  type: 'string',
-                  description: 'Script priority',
-                },
+	                priority: {
+	                  type: 'string',
+	                  description: 'Script priority (Before, After). Case-insensitive aliases will be normalized.',
+	                  enum: ['Before', 'After'],
+	                },
                 parameters: {
                   type: 'object',
                   description: 'Script parameter labels',
@@ -1845,11 +2849,93 @@ export function registerTools(server: Server, jamfClient: any): void {
         },
       },
       {
-        name: 'getPackageDeploymentStats',
-        description: 'Get package deployment statistics including policies using the package, deployment success rate, and target device count',
+        name: 'getComputerPolicyLogs',
+        description: 'Get per-computer policy execution logs ("Policy Logs") from Jamf Classic API computer history',
         inputSchema: {
           type: 'object',
           properties: {
+            serialNumber: {
+              type: 'string',
+              description: 'Computer serial number (preferred identifier)',
+            },
+            deviceId: {
+              type: 'string',
+              description: 'Jamf computer ID (alternative identifier)',
+            },
+            limit: {
+              type: 'number',
+              description: 'Maximum number of log entries to return',
+              default: 50,
+            },
+            includeRaw: {
+              type: 'boolean',
+              description: 'Include the raw Classic API response for debugging',
+              default: false,
+            },
+          },
+        },
+      },
+      {
+        name: 'listSelfServiceCategories',
+        description:
+          'List categories (Jamf Pro typically uses the global Categories list for Self Service policy categories). Prefer using category `id` when updating policies.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            query: {
+              type: 'string',
+              description: 'Optional substring filter on category name',
+            },
+            limit: {
+              type: 'number',
+              description: 'Maximum number of categories to return',
+              default: 200,
+            },
+          },
+        },
+      },
+		      {
+		        name: 'ensureSelfServiceCategoryExists',
+		        description:
+		          'Ensure a category exists (creates a Category if missing). Use this before setting policy Self Service categories. Requires confirmation when creation is needed.',
+		        inputSchema: {
+		          type: 'object',
+		          properties: {
+	            name: { type: 'string', description: 'Self Service category name to ensure exists' },
+	            priority: { type: 'number', description: 'Optional category priority' },
+	            confirm: {
+	              type: 'boolean',
+	              description: 'Confirmation flag (required if category needs to be created)',
+	              default: false,
+	            },
+	          },
+	          required: ['name'],
+	        },
+	      },
+		      {
+		        name: 'createCategory',
+		        description:
+		          'Create a Category in Jamf Pro (Modern-first with Classic fallback) (requires confirmation)',
+		        inputSchema: {
+		          type: 'object',
+		          properties: {
+	            name: { type: 'string', description: 'Category name to create' },
+	            priority: { type: 'number', description: 'Optional category priority' },
+	            confirm: {
+	              type: 'boolean',
+	              description: 'Confirmation flag for category creation',
+	              default: false,
+	            },
+	          },
+	          required: ['name'],
+	        },
+	      },
+	      {
+	        name: 'getPackageDeploymentStats',
+	        description: 'Get package deployment statistics including policies using the package, deployment success rate, and target device count',
+	        inputSchema: {
+	          type: 'object',
+	          properties: {
             packageId: {
               type: 'string',
               description: 'The Jamf package ID to get deployment statistics for',
@@ -1939,10 +3025,10 @@ export function registerTools(server: Server, jamfClient: any): void {
       },
     ];
 
-    return { tools };
-  });
+    return { tools: tools.map(decorateToolDescription) };
+  };
 
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const callToolHandler = async (request: z.infer<typeof CallToolRequestSchema>) => {
     const { name, arguments: args } = request.params;
 
     try {
@@ -2366,9 +3452,19 @@ export function registerTools(server: Server, jamfClient: any): void {
         }
 
         case 'getPolicyDetails': {
-          const { policyId, includeScriptContent } = GetPolicyDetailsSchema.parse(args);
+          const { policyId, includeScriptContent, includeXml } = GetPolicyDetailsSchema.parse(args);
           
           const policyDetails = await jamfClient.getPolicyDetails(policyId);
+
+          // Jamf Classic JSON is known to omit certain fields (notably Self Service categories).
+          // Parse those from Classic XML so callers can reliably verify updates.
+          let xmlText: string | null = null;
+          try {
+            xmlText = await (jamfClient as any).getPolicyXml(policyId);
+          } catch (e) {
+            xmlText = null;
+          }
+          const parsedFromXml = xmlText ? parsePolicySelfServiceFromXml(xmlText) : null;
           
           // If includeScriptContent is true, fetch full script details for each script
           if (includeScriptContent && policyDetails.scripts && policyDetails.scripts.length > 0) {
@@ -2402,12 +3498,36 @@ export function registerTools(server: Server, jamfClient: any): void {
               }
             }
           }
+
+          const result = {
+            ...policyDetails,
+            mcp: {
+              ...(policyDetails.mcp && typeof policyDetails.mcp === 'object' ? policyDetails.mcp : {}),
+              parsed_from_xml: parsedFromXml ?? undefined,
+              policy_xml: includeXml ? xmlText ?? undefined : undefined,
+              note:
+                parsedFromXml
+                  ? 'Self Service category fields are parsed from Classic policy XML for reliability.'
+                  : 'Could not fetch/parse Classic policy XML; some fields may be missing from JSON.',
+            },
+          };
           
           const content: TextContent = {
             type: 'text',
-            text: JSON.stringify(policyDetails, null, 2),
+            text: JSON.stringify(result, null, 2),
           };
 
+          return { content: [content] };
+        }
+
+        case 'getPolicyXml': {
+          const { policyId, includeParsed } = GetPolicyXmlSchema.parse(args);
+          const xml = await (jamfClient as any).getPolicyXml(policyId);
+          const parsed = includeParsed ? parsePolicySelfServiceFromXml(xml) : undefined;
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify({ policyId, parsed, xml }, null, 2),
+          };
           return { content: [content] };
         }
 
@@ -3190,8 +4310,481 @@ export function registerTools(server: Server, jamfClient: any): void {
           return { content: [content] };
         }
 
+        case 'listPatchAvailableTitles': {
+          const { sourceId, query, limit } = ListPatchAvailableTitlesSchema.parse(args);
+          const raw = await jamfClient.listPatchAvailableTitles(sourceId);
+
+          const toArray = (value: any): any[] =>
+            Array.isArray(value) ? value : value && typeof value === 'object' ? [value] : [];
+
+          const candidates = [
+            raw?.patch_available_titles?.available_titles?.available_title,
+            raw?.patch_available_titles?.patch_available_title,
+            raw?.available_titles?.available_title,
+            raw?.patch_available_title,
+            raw?.available_title,
+            raw?.results,
+            raw,
+          ];
+
+          const titleRows: any[] = (() => {
+            for (const candidate of candidates) {
+              const arr = toArray(candidate);
+              if (arr.length > 0) return arr;
+            }
+            return [];
+          })();
+
+          const normalized = titleRows.map((row: any) => ({
+            id: row?.id ?? row?.name_id ?? row?.softwareTitleId ?? row?.titleId ?? null,
+            name: row?.app_name ?? row?.name ?? row?.displayName ?? row?.softwareTitle ?? row?.title ?? '',
+            publisher: row?.publisher ?? row?.softwareTitlePublisher ?? '',
+            currentVersion: row?.current_version ?? row?.currentVersion ?? row?.latestVersion ?? '',
+            lastModified: row?.last_modified ?? row?.lastModified ?? '',
+            raw: row,
+          }));
+
+          const q = (query ?? '').trim().toLowerCase();
+          const filtered = q
+            ? normalized.filter((t: any) =>
+                String(t.name ?? '').toLowerCase().includes(q) ||
+                String(t.publisher ?? '').toLowerCase().includes(q)
+              )
+            : normalized;
+
+          const out = filtered.slice(0, limit).map((t: any) => ({
+            id: t.id,
+            name: t.name,
+            publisher: t.publisher,
+            currentVersion: t.currentVersion,
+            lastModified: t.lastModified,
+            raw: t.raw,
+          }));
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify({
+              sourceId,
+              query: query ?? '',
+              sourceReportedSize: raw?.patch_available_titles?.size ?? null,
+              total: filtered.length,
+              returned: out.length,
+              titles: out,
+            }, null, 2),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'listPatchPolicies': {
+          const { limit } = ListPatchPoliciesSchema.parse(args);
+          const policies = await jamfClient.listPatchPolicies(limit);
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify(policies, null, 2),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'getPatchPolicyLogs': {
+          const { policyId, limit } = GetPatchPolicyLogsSchema.parse(args);
+          const logs = await jamfClient.getPatchPolicyLogs(policyId, limit);
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify(logs, null, 2),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'retryPatchPolicyLogs': {
+          const { policyId, retryAll, payload, confirm } = RetryPatchPolicyLogsSchema.parse(args);
+
+          if (!confirm) {
+            const content: TextContent = {
+              type: 'text',
+              text: 'Patch policy log retry requires confirmation. Please set confirm: true to proceed.',
+            };
+            return { content: [content] };
+          }
+
+          const result = await jamfClient.retryPatchPolicyLogs(policyId, retryAll, payload);
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify(result, null, 2),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'listPatchSoftwareTitleConfigurations': {
+          const { limit } = ListPatchSoftwareTitleConfigurationsSchema.parse(args);
+          const configurations = await jamfClient.listPatchSoftwareTitleConfigurations(limit);
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify(configurations, null, 2),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'getPatchSoftwareTitleConfiguration': {
+          const { configId } = GetPatchSoftwareTitleConfigurationSchema.parse(args);
+          const configuration = await jamfClient.getPatchSoftwareTitleConfiguration(configId);
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify(configuration, null, 2),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'getPatchSoftwareTitleConfigurationReport': {
+          const { configId } = GetPatchSoftwareTitleConfigurationReportSchema.parse(args);
+          const report = await jamfClient.getPatchSoftwareTitleConfigurationReport(configId);
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify(report, null, 2),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'getPatchSoftwareTitleConfigurationSummary': {
+          const { configId } = GetPatchSoftwareTitleConfigurationSummarySchema.parse(args);
+          const summary = await jamfClient.getPatchSoftwareTitleConfigurationSummary(configId);
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify(summary, null, 2),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'getPatchSoftwareTitleConfigurationVersionSummary': {
+          const { configId } = GetPatchSoftwareTitleConfigurationVersionSummarySchema.parse(args);
+          const summary = await jamfClient.getPatchSoftwareTitleConfigurationVersionSummary(configId);
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify(summary, null, 2),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'getPatchSoftwareTitleConfigurationReportSummary': {
+          const { configId, deviceNameContains, onlyOutdated, limit } =
+            GetPatchSoftwareTitleConfigurationReportSummarySchema.parse(args);
+          const report = await jamfClient.getPatchSoftwareTitleConfigurationReport(configId);
+
+          const candidates =
+            report?.results ??
+            report?.items ??
+            report?.computers ??
+            report?.devices ??
+            report?.patchReport ??
+            report?.data ??
+            [];
+
+          const rows = Array.isArray(candidates) ? candidates : [];
+          const nameFilter = (deviceNameContains ?? '').trim().toLowerCase();
+
+          const normalizedRows = rows.map((row: any, index: number) => {
+            const deviceName =
+              row?.deviceName ??
+              row?.computerName ??
+              row?.name ??
+              row?.computer_name ??
+              row?.device_name ??
+              row?.serialNumber ??
+              `row-${index + 1}`;
+
+            const rawStatus = String(
+              row?.patchStatus ??
+                row?.status ??
+                row?.state ??
+                row?.patch_state ??
+                row?.patch_status ??
+                ''
+            ).trim();
+            const status = rawStatus.toLowerCase();
+
+            const patchedByStatus =
+              status.includes('up-to-date') ||
+              status.includes('patched') ||
+              status.includes('latest') ||
+              status === 'up_to_date';
+            const outdatedByStatus =
+              status.includes('outdated') ||
+              status.includes('missing') ||
+              status.includes('vulnerable') ||
+              status.includes('needs');
+
+            const patched = Boolean(row?.upToDate ?? row?.patched ?? patchedByStatus);
+            const outdated = Boolean(row?.outdated ?? row?.needsPatch ?? (!patched && outdatedByStatus));
+
+            return {
+              deviceName: String(deviceName),
+              status: rawStatus || (patched ? 'patched' : outdated ? 'outdated' : 'unknown'),
+              patched,
+              outdated,
+              version:
+                row?.installedVersion ??
+                row?.version ??
+                row?.currentVersion ??
+                row?.softwareVersion ??
+                row?.patchVersion ??
+                'Unknown',
+              raw: row,
+            };
+          });
+
+          const filtered = normalizedRows
+            .filter((r) => (nameFilter ? r.deviceName.toLowerCase().includes(nameFilter) : true))
+            .filter((r) => (onlyOutdated ? r.outdated : true))
+            .slice(0, limit);
+
+          const byStatus = filtered.reduce((acc: Record<string, number>, r: any) => {
+            const key = String(r.status || 'unknown');
+            acc[key] = (acc[key] || 0) + 1;
+            return acc;
+          }, {});
+
+          const byVersion = filtered.reduce((acc: Record<string, number>, r: any) => {
+            const key = String(r.version || 'Unknown');
+            acc[key] = (acc[key] || 0) + 1;
+            return acc;
+          }, {});
+
+          const topVersions = Object.entries(byVersion)
+            .map(([version, count]) => ({ version, count }))
+            .sort((a, b) => b.count - a.count)
+            .slice(0, 10);
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                configId,
+                filters: {
+                  deviceNameContains: deviceNameContains ?? '',
+                  onlyOutdated,
+                  limit,
+                },
+                totals: {
+                  sourceRows: rows.length,
+                  matchedRows: filtered.length,
+                  patched: filtered.filter((r) => r.patched).length,
+                  outdated: filtered.filter((r) => r.outdated).length,
+                  unknown: filtered.filter((r) => !r.patched && !r.outdated).length,
+                },
+                byStatus,
+                topVersions,
+                sample: filtered.slice(0, 20).map((r) => ({
+                  deviceName: r.deviceName,
+                  status: r.status,
+                  patched: r.patched,
+                  outdated: r.outdated,
+                  version: r.version,
+                })),
+              },
+              null,
+              2
+            ),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'createPatchSoftwareTitleConfiguration': {
+          const { config, confirm } = CreatePatchSoftwareTitleConfigurationSchema.parse(args);
+
+          if (!confirm) {
+            const content: TextContent = {
+              type: 'text',
+              text: 'Patch software title configuration creation requires confirmation. Please set confirm: true to proceed.',
+            };
+            return { content: [content] };
+          }
+
+          const configuration = await jamfClient.createPatchSoftwareTitleConfiguration(config);
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify({ configuration }, null, 2),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'updatePatchSoftwareTitleConfiguration': {
+          const { configId, updates, confirm } = UpdatePatchSoftwareTitleConfigurationSchema.parse(args);
+
+          if (!confirm) {
+            const content: TextContent = {
+              type: 'text',
+              text: 'Patch software title configuration update requires confirmation. Please set confirm: true to proceed.',
+            };
+            return { content: [content] };
+          }
+
+          const configuration = await jamfClient.updatePatchSoftwareTitleConfiguration(configId, updates);
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify({ configuration }, null, 2),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'deletePatchSoftwareTitleConfiguration': {
+          const { configId, confirm } = DeletePatchSoftwareTitleConfigurationSchema.parse(args);
+
+          if (!confirm) {
+            const content: TextContent = {
+              type: 'text',
+              text: 'Patch software title configuration deletion requires confirmation. Please set confirm: true to proceed.',
+            };
+            return { content: [content] };
+          }
+
+          const result = await jamfClient.deletePatchSoftwareTitleConfiguration(configId);
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify({ deleted: true, configId, result }, null, 2),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'getManagedSoftwareUpdatesAvailable': {
+          GetManagedSoftwareUpdatesAvailableSchema.parse(args);
+          const updates = await jamfClient.getManagedSoftwareUpdatesAvailable();
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify(updates, null, 2),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'getManagedSoftwareUpdatePlansFeatureToggle': {
+          GetManagedSoftwareUpdatePlansFeatureToggleSchema.parse(args);
+          const featureToggle = await jamfClient.getManagedSoftwareUpdatePlansFeatureToggle();
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify(featureToggle, null, 2),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'getManagedSoftwareUpdatePlansFeatureToggleStatus': {
+          GetManagedSoftwareUpdatePlansFeatureToggleStatusSchema.parse(args);
+          const featureToggleStatus = await jamfClient.getManagedSoftwareUpdatePlansFeatureToggleStatus();
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify(featureToggleStatus, null, 2),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'getManagedSoftwareUpdateStatuses': {
+          const { limit } = GetManagedSoftwareUpdateStatusesSchema.parse(args);
+          const statuses = await jamfClient.getManagedSoftwareUpdateStatuses(limit);
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify(statuses, null, 2),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'listManagedSoftwareUpdatePlans': {
+          const { limit } = ListManagedSoftwareUpdatePlansSchema.parse(args);
+          const plans = await jamfClient.listManagedSoftwareUpdatePlans(limit);
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify(plans, null, 2),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'getManagedSoftwareUpdatePlan': {
+          const { planId } = GetManagedSoftwareUpdatePlanSchema.parse(args);
+          const plan = await jamfClient.getManagedSoftwareUpdatePlan(planId);
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify(plan, null, 2),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'createManagedSoftwareUpdatePlan': {
+          const { plan, confirm } = CreateManagedSoftwareUpdatePlanSchema.parse(args);
+
+          if (!confirm) {
+            const content: TextContent = {
+              type: 'text',
+              text: 'Managed software update plan creation requires confirmation. Please set confirm: true to proceed.',
+            };
+            return { content: [content] };
+          }
+
+          const created = await jamfClient.createManagedSoftwareUpdatePlan(plan);
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify({ plan: created }, null, 2),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'createManagedSoftwareUpdatePlanForGroup': {
+          const { plan, confirm } = CreateManagedSoftwareUpdatePlanForGroupSchema.parse(args);
+
+          if (!confirm) {
+            const content: TextContent = {
+              type: 'text',
+              text: 'Managed software update group plan creation requires confirmation. Please set confirm: true to proceed.',
+            };
+            return { content: [content] };
+          }
+
+          const created = await jamfClient.createManagedSoftwareUpdatePlanForGroup(plan);
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify({ plan: created }, null, 2),
+          };
+
+          return { content: [content] };
+        }
+
         case 'createPolicy': {
-          const { policyData, confirm } = CreatePolicySchema.parse(args);
+          const parsed = CreatePolicySchema.parse(args);
+          const confirm = parsed.confirm;
           
           if (!confirm) {
             const content: TextContent = {
@@ -3201,7 +4794,10 @@ export function registerTools(server: Server, jamfClient: any): void {
             return { content: [content] };
           }
 
-          const createdPolicy = await jamfClient.createPolicy(policyData);
+          const createdPolicy =
+            'policyXml' in parsed
+              ? await (jamfClient as any).createPolicyXml(parsed.policyXml)
+              : await jamfClient.createPolicy((parsed as any).policyData);
           
           const content: TextContent = {
             type: 'text',
@@ -3209,7 +4805,7 @@ export function registerTools(server: Server, jamfClient: any): void {
               message: 'Policy created successfully',
               policy: {
                 id: createdPolicy.id,
-                name: createdPolicy.general?.name || policyData.general.name,
+                name: createdPolicy.general?.name,
                 enabled: createdPolicy.general?.enabled,
                 trigger: createdPolicy.general?.trigger,
                 frequency: createdPolicy.general?.frequency,
@@ -3221,8 +4817,45 @@ export function registerTools(server: Server, jamfClient: any): void {
           return { content: [content] };
         }
 
+        case 'createPolicyXml': {
+          const { policyXml, confirm } = CreatePolicyXmlSchema.parse(args);
+
+          if (!confirm) {
+            const content: TextContent = {
+              type: 'text',
+              text: 'Policy creation requires confirmation. Please set confirm: true to proceed.',
+            };
+            return { content: [content] };
+          }
+
+          const createdPolicy = await (jamfClient as any).createPolicyXml(policyXml);
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                message: 'Policy created successfully',
+                policy: {
+                  id: createdPolicy.id,
+                  name: createdPolicy.general?.name,
+                  enabled: createdPolicy.general?.enabled,
+                  trigger: createdPolicy.general?.trigger,
+                  frequency: createdPolicy.general?.frequency,
+                  category: createdPolicy.general?.category,
+                },
+              },
+              null,
+              2
+            ),
+          };
+
+          return { content: [content] };
+        }
+
         case 'updatePolicy': {
-          const { policyId, policyData, confirm } = UpdatePolicySchema.parse(args);
+          const parsed = UpdatePolicySchema.parse(args);
+          const policyId = (parsed as any).policyId;
+          const confirm = (parsed as any).confirm;
           
           if (!confirm) {
             const content: TextContent = {
@@ -3232,7 +4865,33 @@ export function registerTools(server: Server, jamfClient: any): void {
             return { content: [content] };
           }
 
-          const updatedPolicy = await jamfClient.updatePolicy(policyId, policyData);
+          let updatedPolicy: any;
+          try {
+            updatedPolicy =
+              'policyXml' in (parsed as any)
+                ? await (jamfClient as any).updatePolicyXml(policyId, (parsed as any).policyXml)
+                : await jamfClient.updatePolicy(policyId, (parsed as any).policyData);
+          } catch (err: any) {
+            const status = err?.response?.status;
+            const responseData = err?.response?.data;
+            if (status === 409) {
+              const bodyText = typeof responseData === 'string' ? responseData : '';
+              const isCategoryProblem = bodyText.toLowerCase().includes('problem with category');
+              const content: TextContent = {
+                type: 'text',
+                text:
+                  isCategoryProblem
+                    ? `Jamf returned 409 Conflict while updating policy ${policyId}: "Problem with category". ` +
+                      `This typically means the category you referenced does not exist or the payload shape is invalid for your Jamf Pro version. ` +
+                      `Try using an existing Self Service category id (preferred) or create the category in the Jamf UI, then retry.`
+                    : `Jamf returned 409 Conflict while updating policy ${policyId}. ` +
+                      `This can mean the policy is locked for editing (open in the Jamf UI) OR there is a data conflict (Jamf sometimes reports those as 409). ` +
+                      `Close any browser tabs editing that policy, wait ~30-120s, then retry. If it persists, inspect the response body in server logs (combined.log).`,
+              };
+              return { content: [content] };
+            }
+            throw err;
+          }
           
           const content: TextContent = {
             type: 'text',
@@ -3247,6 +4906,64 @@ export function registerTools(server: Server, jamfClient: any): void {
                 category: updatedPolicy.general?.category,
               },
             }, null, 2),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'updatePolicyXml': {
+          const { policyId, policyXml, confirm } = UpdatePolicyXmlSchema.parse(args);
+
+          if (!confirm) {
+            const content: TextContent = {
+              type: 'text',
+              text: 'Policy update requires confirmation. Please set confirm: true to proceed.',
+            };
+            return { content: [content] };
+          }
+
+          let updatedPolicy: any;
+          try {
+            updatedPolicy = await (jamfClient as any).updatePolicyXml(policyId, policyXml);
+          } catch (err: any) {
+            const status = err?.response?.status;
+            const responseData = err?.response?.data;
+            if (status === 409) {
+              const bodyText = typeof responseData === 'string' ? responseData : '';
+              const isCategoryProblem = bodyText.toLowerCase().includes('problem with category');
+              const content: TextContent = {
+                type: 'text',
+                text:
+                  isCategoryProblem
+                    ? `Jamf returned 409 Conflict while updating policy ${policyId}: "Problem with category". ` +
+                      `This typically means the category you referenced does not exist or the payload shape is invalid for your Jamf Pro version. ` +
+                      `Try using an existing Self Service category id (preferred) or create the category in the Jamf UI, then retry.`
+                    : `Jamf returned 409 Conflict while updating policy ${policyId}. ` +
+                      `This can mean the policy is locked for editing (open in the Jamf UI) OR there is a data conflict (Jamf sometimes reports those as 409). ` +
+                      `Close any browser tabs editing that policy, wait ~30-120s, then retry. If it persists, inspect the response body in server logs (combined.log).`,
+              };
+              return { content: [content] };
+            }
+            throw err;
+          }
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                message: 'Policy updated successfully',
+                policy: {
+                  id: updatedPolicy.id,
+                  name: updatedPolicy.general?.name,
+                  enabled: updatedPolicy.general?.enabled,
+                  trigger: updatedPolicy.general?.trigger,
+                  frequency: updatedPolicy.general?.frequency,
+                  category: updatedPolicy.general?.category,
+                },
+              },
+              null,
+              2
+            ),
           };
 
           return { content: [content] };
@@ -3507,11 +5224,160 @@ export function registerTools(server: Server, jamfClient: any): void {
           return { content: [content] };
         }
 
-        case 'getPackageDeploymentStats': {
-          const { packageId } = GetPackageDeploymentStatsSchema.parse(args);
-          const stats = await jamfClient.getPackageDeploymentStats(packageId);
-          
+        case 'getComputerPolicyLogs': {
+          const { serialNumber, deviceId, limit, includeRaw } = GetComputerPolicyLogsSchema.parse(args);
+          const raw = await jamfClient.getComputerPolicyLogs({ serialNumber, deviceId });
+
+          // Jamf Classic API shapes vary by version/config; extract best-effort while keeping raw available.
+          const candidate =
+            raw?.computer_history?.policy_logs?.policy_log ??
+            raw?.computer_history?.policy_logs ??
+            raw?.policy_logs?.policy_log ??
+            raw?.policy_logs ??
+            null;
+
+          const logs: any[] = Array.isArray(candidate) ? candidate : [];
+          const limited = logs.slice(0, limit);
+
           const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                requested: {
+                  serialNumber: serialNumber || undefined,
+                  deviceId: deviceId || undefined,
+                  limit,
+                },
+                total: logs.length,
+                returned: limited.length,
+                logs: limited,
+                raw: includeRaw ? raw : undefined,
+                note:
+                  logs.length === 0
+                    ? 'No policy log entries found in the parsed response shape. Try includeRaw:true to inspect the tenant-specific payload.'
+                    : undefined,
+              },
+              null,
+              2
+            ),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'listSelfServiceCategories': {
+          const { query, limit } = ListSelfServiceCategoriesSchema.parse(args);
+          const categories = await (jamfClient as any).listCategories();
+          const q = (query ?? '').trim().toLowerCase();
+          const filtered = q
+            ? categories.filter((c: any) => String(c.name ?? '').toLowerCase().includes(q))
+            : categories;
+          const out = filtered.slice(0, limit);
+
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                query: query ?? '',
+                total: filtered.length,
+                returned: out.length,
+                categories: out,
+              },
+              null,
+              2
+            ),
+          };
+
+          return { content: [content] };
+        }
+
+	        case 'ensureSelfServiceCategoryExists': {
+	          const { name, priority, confirm } = EnsureSelfServiceCategoryExistsSchema.parse(args);
+
+	          const existing = await (jamfClient as any).getCategoryByName(name);
+	          if (existing) {
+            const content: TextContent = {
+              type: 'text',
+              text: JSON.stringify({ created: false, category: existing }, null, 2),
+            };
+	            return { content: [content] };
+	          }
+
+	          if (!confirm) {
+            const content: TextContent = {
+              type: 'text',
+              text: `Category "${name}" does not exist yet. Creating it requires confirmation. Please re-run with confirm: true.`,
+            };
+	            return { content: [content] };
+	          }
+
+	          let ensured: any;
+	          try {
+	            ensured = await (jamfClient as any).ensureSelfServiceCategoryExists({ name, priority });
+	          } catch (err: any) {
+	            const status = err?.response?.status;
+	            if (status === 401) {
+	              const content: TextContent = {
+	                type: 'text',
+	                text:
+	                  `Jamf returned 401 Unauthorized while creating category "${name}". ` +
+	                  `The MCP server already auto-refreshes tokens; repeated "auth refresh" prompts won't fix this. ` +
+	                  `This usually means the Jamf API credentials configured in the MCP server do not have permission to create Categories, ` +
+	                  `or your tenant rejects Bearer tokens for Classic write endpoints (and JAMF_USERNAME/JAMF_PASSWORD are not configured). ` +
+	                  `Next: run getAuthStatus to confirm hasBasicAuth/hasOAuth2, and ensure your API role allows creating Categories.`,
+	              };
+	              return { content: [content], isError: true };
+	            }
+	            throw err;
+	          }
+	          const content: TextContent = {
+	            type: 'text',
+	            text: JSON.stringify(ensured, null, 2),
+	          };
+	          return { content: [content] };
+	        }
+
+	        case 'createCategory': {
+	          const { name, priority, confirm } = CreateCategorySchema.parse(args);
+
+	          if (!confirm) {
+	            const content: TextContent = {
+	              type: 'text',
+	              text: 'Category creation requires confirmation. Please set confirm: true to proceed.',
+	            };
+	            return { content: [content] };
+	          }
+
+	          let category: any;
+	          try {
+	            category = await (jamfClient as any).createCategory({ name, priority });
+	          } catch (err: any) {
+	            const status = err?.response?.status;
+	            if (status === 401) {
+	              const content: TextContent = {
+	                type: 'text',
+	                text:
+	                  `Jamf returned 401 Unauthorized while creating category "${name}". ` +
+	                  `The MCP server already auto-refreshes tokens; this is almost always a permissions/auth-mode issue, not a transient token expiry. ` +
+	                  `Fix: ensure your OAuth client / Jamf user has rights to create Categories. If your tenant rejects Bearer on Classic writes, ` +
+	                  `configure JAMF_USERNAME/JAMF_PASSWORD so the server can retry Classic writes with Basic auth.`,
+	              };
+	              return { content: [content], isError: true };
+	            }
+	            throw err;
+	          }
+	          const content: TextContent = {
+	            type: 'text',
+	            text: JSON.stringify({ category }, null, 2),
+	          };
+	          return { content: [content] };
+	        }
+
+	        case 'getPackageDeploymentStats': {
+	          const { packageId } = GetPackageDeploymentStatsSchema.parse(args);
+	          const stats = await jamfClient.getPackageDeploymentStats(packageId);
+	          
+	          const content: TextContent = {
             type: 'text',
             text: JSON.stringify(stats, null, 2),
           };
@@ -3609,5 +5475,7 @@ export function registerTools(server: Server, jamfClient: any): void {
       };
       return { content: [content], isError: true };
     }
-  });
+  };
+
+  return { listToolsHandler, callToolHandler };
 }

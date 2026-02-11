@@ -68,6 +68,10 @@ describe('JamfApiClientHybrid scripts (Modern API preferred)', () => {
     mockAxiosInstance.interceptors.request.use.mockReset();
     mockAxiosInstance.interceptors.response.use.mockReset();
     mockedAxios.post.mockReset();
+    process.env.JAMF_SCRIPT_VERIFY_ENABLED = 'true';
+    process.env.JAMF_SCRIPT_VERIFY_ATTEMPTS = '1';
+    process.env.JAMF_SCRIPT_VERIFY_REQUIRED_CONSISTENT_READS = '1';
+    process.env.JAMF_SCRIPT_VERIFY_DELAY_MS = '0';
   });
 
   test('listScripts prefers Modern API', async () => {
@@ -96,13 +100,19 @@ describe('JamfApiClientHybrid scripts (Modern API preferred)', () => {
     const scriptContents = 'echo secret';
 
     mockAxiosInstance.post
-      .mockRejectedValueOnce(new Error('modern fail'))
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 404, data: { message: 'not found' } },
+      })
       .mockResolvedValueOnce({
         headers: { location: 'https://jamf.example.test/JSSResource/scripts/id/101' },
         data: {},
       });
     mockAxiosInstance.get
-      .mockRejectedValueOnce(new Error('modern fail'))
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 404, data: { message: 'not found' } },
+      })
       .mockResolvedValueOnce({
         data: { script: { id: 101, name: 'Classic Script', script_contents: scriptContents } },
       });
@@ -140,10 +150,21 @@ describe('JamfApiClientHybrid scripts (Modern API preferred)', () => {
   test('updateScript falls back to Classic API when Modern fails', async () => {
     const client = createClient();
     mockAxiosInstance.put
-      .mockRejectedValueOnce(new Error('modern fail'))
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 404, data: { message: 'not found' } },
+      })
       .mockResolvedValueOnce({ data: {} });
     mockAxiosInstance.get
-      .mockRejectedValueOnce(new Error('modern fail'))
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 404, data: { message: 'not found' } },
+      })
+      .mockResolvedValueOnce({ data: { script: { id: 33, name: 'Classic Update' } } })
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 404, data: { message: 'not found' } },
+      })
       .mockResolvedValueOnce({ data: { script: { id: 33, name: 'Classic Update' } } });
 
     await client.updateScript('33', { name: 'Classic Update' });
@@ -152,6 +173,18 @@ describe('JamfApiClientHybrid scripts (Modern API preferred)', () => {
     expect(mockAxiosInstance.put.mock.calls[1][0]).toBe('/JSSResource/scripts/id/33');
     expect(mockAxiosInstance.get.mock.calls[0][0]).toBe('/api/v1/scripts/33');
     expect(mockAxiosInstance.get.mock.calls[1][0]).toBe('/JSSResource/scripts/id/33');
+  });
+
+  test('updateScript strict verification fails when post-write readback does not match requested fields', async () => {
+    const client = createClient();
+    mockAxiosInstance.put.mockResolvedValue({ data: { id: '91' } });
+    mockAxiosInstance.get
+      .mockResolvedValueOnce({ data: { id: '91', name: 'Expected Name' } }) // getScriptDetails after put
+      .mockResolvedValueOnce({ data: { id: '91', name: 'Old Name' } }); // strict verify readback
+
+    await expect(client.updateScript('91', { name: 'Expected Name' })).rejects.toThrow(
+      'did not persist requested fields'
+    );
   });
 
   test('deleteScript prefers Modern API', async () => {
@@ -166,7 +199,10 @@ describe('JamfApiClientHybrid scripts (Modern API preferred)', () => {
   test('deleteScript falls back to Classic API when Modern fails', async () => {
     const client = createClient();
     mockAxiosInstance.delete
-      .mockRejectedValueOnce(new Error('modern fail'))
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 404, data: { message: 'not found' } },
+      })
       .mockResolvedValueOnce({ data: {} });
 
     await client.deleteScript('77');
@@ -178,7 +214,10 @@ describe('JamfApiClientHybrid scripts (Modern API preferred)', () => {
   test('getScriptDetails falls back to Classic API and normalizes fields', async () => {
     const client = createClient();
     mockAxiosInstance.get
-      .mockRejectedValueOnce(new Error('modern fail'))
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 404, data: { message: 'not found' } },
+      })
       .mockResolvedValueOnce({
         data: {
           script: {
@@ -217,7 +256,10 @@ describe('JamfApiClientHybrid scripts (Modern API preferred)', () => {
   test('listScripts falls back to Classic API and normalizes fields', async () => {
     const client = createClient();
     mockAxiosInstance.get
-      .mockRejectedValueOnce(new Error('modern fail'))
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 404, data: { message: 'not found' } },
+      })
       .mockResolvedValueOnce({ data: { scripts: [{ id: 3, name: 'Classic A' }] } });
 
     const scripts = await client.listScripts(10);

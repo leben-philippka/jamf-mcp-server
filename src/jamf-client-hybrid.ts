@@ -16,6 +16,14 @@ import {
 } from './types/jamf-api.js';
 import { isAxiosError, getErrorMessage, getAxiosErrorStatus, getAxiosErrorData } from './utils/type-guards.js';
 import { CircuitBreaker, CircuitBreakerOptions } from './utils/retry.js';
+import {
+  normalizePolicyFrequency,
+  normalizePolicyMinimumNetworkConnection,
+  normalizePolicyNetworkRequirements,
+  normalizePolicyXmlFrequencies,
+  normalizeScriptPriority,
+  normalizeSmartGroupCriterion,
+} from './utils/jamf-normalize.js';
 
 const logger = createLogger('jamf-client-hybrid');
 const agentPool = getDefaultAgentPool();
@@ -110,6 +118,69 @@ export class JamfApiClientHybrid {
   // Circuit breaker for API calls
   private circuitBreaker: CircuitBreaker | null = null;
   private circuitBreakerEnabled: boolean = false;
+  private readonly policyWriteLocks: Map<string, Promise<void>> = new Map();
+
+  private async sleep(ms: number): Promise<void> {
+    const waitMs = Number(ms);
+    if (!Number.isFinite(waitMs) || waitMs <= 0) return;
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+  }
+
+  private async with409Retry<T>(
+    fn: () => Promise<T>,
+    ctx: { operation: string; resourceType?: string; resourceId?: string }
+  ): Promise<T> {
+    // Jamf Pro sometimes returns 409 when an admin has the object open in the UI or when an edit lock is held.
+    // Retrying helps for transient locks, but won't help if someone is actively editing.
+    const maxAttempts = Math.max(1, Number(process.env.JAMF_CONFLICT_RETRY_MAX ?? 3));
+    const baseDelayMs = Math.max(0, Number(process.env.JAMF_CONFLICT_RETRY_DELAY_MS ?? 800));
+
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await fn();
+      } catch (err) {
+        lastError = err;
+        const status = getAxiosErrorStatus(err);
+        if (status !== 409 || attempt >= maxAttempts) throw err;
+
+        const jitter = Math.floor(Math.random() * 250);
+        const waitMs = baseDelayMs * attempt + jitter;
+        logger.warn('Received 409 Conflict from Jamf; retrying after backoff', {
+          ...ctx,
+          attempt,
+          maxAttempts,
+          waitMs,
+        });
+        await this.sleep(waitMs);
+      }
+    }
+
+    // Defensive: should never reach here.
+    throw lastError instanceof Error ? lastError : new Error('Request failed after retries');
+  }
+
+  private async withPolicyWriteLock<T>(policyId: string, fn: () => Promise<T>): Promise<T> {
+    const key = String(policyId);
+    const previous = this.policyWriteLocks.get(key) ?? Promise.resolve();
+
+    let releaseCurrent!: () => void;
+    const current = new Promise<void>((resolve) => {
+      releaseCurrent = resolve;
+    });
+    const queued = previous.then(() => current);
+    this.policyWriteLocks.set(key, queued);
+
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      releaseCurrent();
+      if (this.policyWriteLocks.get(key) === queued) {
+        this.policyWriteLocks.delete(key);
+      }
+    }
+  }
 
   constructor(config: JamfApiClientConfig) {
     this.config = config;
@@ -164,18 +235,45 @@ export class JamfApiClientHybrid {
     
     // Add request interceptor to handle auth based on endpoint
     this.axiosInstance.interceptors.request.use((config) => {
+      const requestMethod = String(config.method ?? 'get').toLowerCase();
+
       // Classic API endpoints - try Bearer token first, fallback to Basic auth
       if (config.url?.includes('/JSSResource/')) {
         // Try Bearer token first (some Jamf environments require this)
         if (this.bearerTokenAvailable && this.bearerToken) {
           config.headers['Authorization'] = `Bearer ${this.bearerToken.token}`;
           logger.info(`  🔑 Setting Bearer token for Classic API endpoint: ${config.url}`);
+        } else if (this.oauth2Available && this.oauth2Token) {
+          // Many Jamf tenants accept OAuth2 access tokens for Classic API as well.
+          config.headers['Authorization'] = `Bearer ${this.oauth2Token.token}`;
+          logger.info(`  🔑 Setting OAuth2 Bearer token for Classic API endpoint: ${config.url}`);
         } else if (this.basicAuthHeader) {
           config.headers['Authorization'] = this.basicAuthHeader;
           logger.info(`  🔑 Setting Basic Auth for Classic API endpoint: ${config.url}`);
         } else {
           logger.warn(`Classic API endpoint ${config.url} requested but no auth credentials available`);
         }
+
+        // Reduce stale-read risk across Classic reads by forcing cache bypass headers
+        // and a request-unique query marker.
+        if (requestMethod === 'get') {
+          config.headers = config.headers ?? {};
+          if ((config.headers as any)['Cache-Control'] === undefined) {
+            (config.headers as any)['Cache-Control'] = 'no-cache';
+          }
+          if ((config.headers as any).Pragma === undefined) {
+            (config.headers as any).Pragma = 'no-cache';
+          }
+
+          const currentParams =
+            config.params && typeof config.params === 'object' && !Array.isArray(config.params)
+              ? config.params
+              : {};
+          if ((currentParams as any)._ts === undefined) {
+            config.params = { ...currentParams, _ts: Date.now() };
+          }
+        }
+
         // Note: We keep Accept as application/json for Classic API
         // Jamf Classic API can return JSON if Accept header is set to application/json
       } else {
@@ -196,10 +294,40 @@ export class JamfApiClientHybrid {
     this.axiosInstance.interceptors.response.use(
       (response) => response,
       async (error: AxiosError) => {
-        const originalRequest = error.config as AxiosError['config'] & { _retry?: boolean };
+        const originalRequest = error.config as AxiosError['config'] & {
+          _retry?: boolean;
+          _retryBasicAuth?: boolean;
+        };
+
+        const isClassicEndpoint = Boolean(originalRequest?.url?.includes('/JSSResource/'));
 
         // Only retry on 401 and if we haven't already retried
-        if (error.response?.status === 401 && originalRequest && !originalRequest._retry) {
+        if (error.response?.status === 401 && originalRequest) {
+          // Some Jamf tenants reject Bearer tokens for certain Classic endpoints (especially writes),
+          // while still accepting Basic auth. If we have Basic configured and we just tried Bearer,
+          // retry once with Basic before forcing a token refresh flow.
+          const authHeader =
+            (originalRequest.headers as any)?.Authorization ?? (originalRequest.headers as any)?.authorization;
+          if (
+            isClassicEndpoint &&
+            this.basicAuthHeader &&
+            typeof authHeader === 'string' &&
+            authHeader.startsWith('Bearer ') &&
+            !originalRequest._retryBasicAuth
+          ) {
+            originalRequest._retryBasicAuth = true;
+            (originalRequest.headers as any).Authorization = this.basicAuthHeader;
+            logger.info('Classic endpoint returned 401 with Bearer auth; retrying once with Basic auth', {
+              url: originalRequest.url,
+            });
+            return this.axiosInstance(originalRequest);
+          }
+
+          // Token refresh retry (once per request).
+          if (originalRequest._retry) {
+            return Promise.reject(error);
+          }
+
           originalRequest._retry = true;
 
           logger.info('Received 401 Unauthorized, attempting to refresh token...');
@@ -317,14 +445,22 @@ export class JamfApiClientHybrid {
     hasBasicAuth: boolean;
     oauth2Available: boolean;
     bearerTokenAvailable: boolean;
+    readOnlyMode: boolean;
+    mcpModeDetected: boolean;
+    writeEnabled: boolean;
     oauth2: { issuedAt?: Date; expiresAt?: Date; expiresIn?: number } | null;
     bearer: { issuedAt?: Date; expiresAt?: Date; expiresIn?: number } | null;
   } {
+    const mcpModeDetected = process.env.MCP_MODE === 'true' || process.argv.includes('--mcp');
+    const writeEnabled = process.env.JAMF_WRITE_ENABLED === 'true';
     return {
       hasOAuth2: this.hasOAuth2,
       hasBasicAuth: this.hasBasicAuth,
       oauth2Available: this.oauth2Available,
       bearerTokenAvailable: this.bearerTokenAvailable,
+      readOnlyMode: this._readOnlyMode,
+      mcpModeDetected,
+      writeEnabled,
       oauth2: this.oauth2Token
         ? {
             issuedAt: this.oauth2Token.issuedAt,
@@ -340,6 +476,113 @@ export class JamfApiClientHybrid {
           }
         : null,
     };
+  }
+
+  private canCallClassicApi(): boolean {
+    // Classic API calls require either a bearer token (minted via Basic auth) or Basic auth directly.
+    return (
+      Boolean(this.bearerTokenAvailable && this.bearerToken) ||
+      Boolean(this.oauth2Available && this.oauth2Token) ||
+      Boolean(this.basicAuthHeader)
+    );
+  }
+
+  private shouldFallbackToClassicOnModernError(
+    error: unknown,
+    opts?: { allowOn403?: boolean }
+  ): boolean {
+    if (!this.canCallClassicApi()) return false;
+
+    const status = getAxiosErrorStatus(error);
+    if (!status) return false;
+
+    // Never mask caller errors.
+    if (status === 400 || status === 401) return false;
+
+    // Optional: some read-only resources are available in Classic but forbidden in Modern for a given token.
+    if (status === 403) return Boolean(opts?.allowOn403);
+
+    // Endpoint unavailable in this Jamf Pro version.
+    if (status === 404 || status === 405 || status === 501) return true;
+
+    // Server errors: Modern can be flaky while Classic still works.
+    if (status >= 500 && status <= 599) return true;
+
+    return false;
+  }
+
+  private isClassicPolicyPayload(policyData: any): boolean {
+    if (!policyData || typeof policyData !== 'object') return false;
+    // Classic policy payloads are generally nested and match /JSSResource/policies XML structure.
+    return Boolean(
+      policyData.general ||
+        policyData.scope ||
+        policyData.self_service ||
+        policyData.package_configuration ||
+        policyData.scripts
+    );
+  }
+
+  async createPolicyXml(policyXml: string): Promise<any> {
+    if (this._readOnlyMode) {
+      throw new Error('Cannot create policies in read-only mode');
+    }
+    await this.ensureAuthenticated();
+
+    const xmlPayload = normalizePolicyXmlFrequencies(String(policyXml));
+    const response = await this.axiosInstance.post(
+      '/JSSResource/policies/id/0',
+      xmlPayload,
+      {
+        headers: {
+          'Content-Type': 'application/xml',
+          'Accept': 'application/xml',
+        },
+      }
+    );
+
+    const locationHeader = response.headers.location;
+    const policyId = locationHeader ? locationHeader.split('/').pop() : null;
+    if (policyId) {
+      return await this.getPolicyDetails(policyId);
+    }
+    return { success: true };
+  }
+
+  async updatePolicyXml(
+    policyId: string,
+    policyXml: string,
+    options?: { skipPolicyWriteLock?: boolean }
+  ): Promise<any> {
+    if (this._readOnlyMode) {
+      throw new Error('Cannot update policies in read-only mode');
+    }
+    await this.ensureAuthenticated();
+
+    const run = async (): Promise<any> => {
+      const xmlPayload = normalizePolicyXmlFrequencies(String(policyXml));
+      await this.with409Retry(
+        async () =>
+          await this.axiosInstance.put(
+            `/JSSResource/policies/id/${policyId}`,
+            xmlPayload,
+            {
+              headers: {
+                'Content-Type': 'application/xml',
+                'Accept': 'application/xml',
+              },
+            }
+          ),
+        { operation: 'updatePolicyXml', resourceType: 'policy', resourceId: String(policyId) }
+      );
+
+      return await this.getPolicyDetails(policyId);
+    };
+
+    if (options?.skipPolicyWriteLock) {
+      return await run();
+    }
+    return await this.withPolicyWriteLock(policyId, run);
   }
 
   /**
@@ -408,7 +651,7 @@ export class JamfApiClientHybrid {
   private updateAuthorizationHeader(config: { headers?: Record<string, unknown>; url?: string }): void {
     if (!config.headers) return;
 
-    if (!config.url?.includes('/JSSResource/') && this.oauth2Available && this.oauth2Token) {
+    if (this.oauth2Available && this.oauth2Token) {
       config.headers['Authorization'] = `Bearer ${this.oauth2Token.token}`;
     } else if (this.bearerTokenAvailable && this.bearerToken) {
       config.headers['Authorization'] = `Bearer ${this.bearerToken.token}`;
@@ -598,6 +841,179 @@ export class JamfApiClientHybrid {
     };
   }
 
+  private normalizeClassicCategoryList(payload: any): Array<{ id: number; name: string; priority?: number }> {
+    const raw = payload?.categories ?? payload?.category ?? payload;
+    if (!raw) return [];
+
+    // Common shapes:
+    // 1) { categories: [ { id, name }, ... ] }
+    // 2) { categories: [ { category: { id, name, priority } }, ... ] } (OpenAPI sample)
+    // 3) { categories: { category: [ ... ] } }
+    const arr: any[] = Array.isArray(raw)
+      ? raw
+      : Array.isArray(raw?.category)
+        ? raw.category
+        : raw?.category
+          ? [raw.category]
+          : [];
+
+    const out: Array<{ id: number; name: string; priority?: number }> = [];
+    for (const item of arr) {
+      const c = item?.category ?? item;
+      const id = Number(c?.id);
+      const name = typeof c?.name === 'string' ? c.name : '';
+      const priority = c?.priority !== undefined ? Number(c.priority) : undefined;
+      if (Number.isFinite(id) && id > 0 && name) out.push({ id, name, ...(Number.isFinite(priority) ? { priority } : {}) });
+    }
+    return out;
+  }
+
+  async listCategories(): Promise<Array<{ id: number; name: string; priority?: number }>> {
+    await this.ensureAuthenticated();
+
+    // Modern API categories exist, but Classic is widely available and simple.
+    try {
+      const modern = await this.axiosInstance.get('/api/v1/categories', {
+        params: { page: 0, 'page-size': 2000 },
+      });
+      const results: any[] = modern.data?.results ?? modern.data ?? [];
+      if (Array.isArray(results) && results.length > 0) {
+        return results
+          .map((c: any) => ({
+            id: Number(c.id),
+            name: String(c.name ?? ''),
+            priority: c.priority !== undefined ? Number(c.priority) : undefined,
+          }))
+          .filter((c) => Number.isFinite(c.id) && c.id > 0 && Boolean(c.name));
+      }
+    } catch (error) {
+      // allow Classic fallback
+      if (!this.shouldFallbackToClassicOnModernError(error, { allowOn403: true })) {
+        throw error;
+      }
+    }
+
+    const classic = await this.axiosInstance.get('/JSSResource/categories');
+    return this.normalizeClassicCategoryList(classic.data);
+  }
+
+  async getCategoryByName(name: string): Promise<{ id: number; name: string; priority?: number } | null> {
+    await this.ensureAuthenticated();
+
+    const target = String(name ?? '').trim();
+    if (!target) return null;
+
+    // Classic API supports /categories/name/{name}
+    try {
+      const response = await this.axiosInstance.get(`/JSSResource/categories/name/${encodeURIComponent(target)}`);
+      const c = response.data?.category ?? response.data;
+      const id = Number(c?.id);
+      const nm = typeof c?.name === 'string' ? c.name : '';
+      const pr = c?.priority !== undefined ? Number(c.priority) : undefined;
+      if (Number.isFinite(id) && id > 0 && nm) return { id, name: nm, ...(Number.isFinite(pr) ? { priority: pr } : {}) };
+    } catch (error) {
+      // fallback to list below
+      logger.info('Classic getCategoryByName failed; falling back to listCategories', {
+        status: getAxiosErrorStatus(error),
+        data: getAxiosErrorData(error),
+      });
+    }
+
+    const all = await this.listCategories();
+    const lower = target.toLowerCase();
+    const match = all.find((c) => c.name.toLowerCase() === lower);
+    return match ?? null;
+  }
+
+  private buildCategoryXml(input: { name: string; priority?: number }): string {
+    const name = String(input.name ?? '').trim();
+    const priority = input.priority;
+
+    let xml = '<?xml version="1.0" encoding="UTF-8"?>\n<category>\n';
+    xml += `  <name>${this.escapeXml(name)}</name>\n`;
+    if (priority !== undefined && priority !== null && Number.isFinite(Number(priority))) {
+      xml += `  <priority>${this.escapeXml(String(priority))}</priority>\n`;
+    }
+    xml += '</category>';
+    return xml;
+  }
+
+  async createCategory(input: { name: string; priority?: number }): Promise<{ id: number; name: string; priority?: number }> {
+    if (this._readOnlyMode) {
+      throw new Error('Cannot create categories in read-only mode');
+    }
+    await this.ensureAuthenticated();
+
+    const name = String(input?.name ?? '').trim();
+    if (!name) throw new Error('Category name is required');
+
+    const existing = await this.getCategoryByName(name);
+    if (existing) return existing;
+
+    // Prefer Modern API when available (OAuth2-only deployments often cannot write to Classic for some resources).
+    // We fall back to Classic XML if Modern is not supported or fails.
+    try {
+      const payload: Record<string, unknown> = { name };
+      if (input?.priority !== undefined && input?.priority !== null && Number.isFinite(Number(input.priority))) {
+        payload.priority = Number(input.priority);
+      }
+
+      const response = await this.axiosInstance.post('/api/v1/categories', payload);
+      const id = Number((response.data as any)?.id ?? (response.data as any)?.categoryId);
+      const nm = String((response.data as any)?.name ?? name).trim();
+      const pr =
+        (response.data as any)?.priority !== undefined ? Number((response.data as any).priority) : input?.priority;
+
+      if (Number.isFinite(id) && id > 0) {
+        return { id, name: nm || name, ...(Number.isFinite(Number(pr)) ? { priority: Number(pr) } : {}) };
+      }
+      // If Modern returns an unexpected shape, we still try Classic to be safe.
+      logger.info('Modern createCategory returned unexpected shape; falling back to Classic API', {
+        data: response.data,
+      });
+    } catch (error) {
+      // Fall back to Classic for tenants without the endpoint or when Modern write permissions differ.
+      logger.info('Modern createCategory failed; falling back to Classic API', {
+        status: getAxiosErrorStatus(error),
+        data: getAxiosErrorData(error),
+      });
+    }
+
+    const xmlPayload = this.buildCategoryXml({ name, priority: input?.priority });
+    await this.with409Retry(
+      async () =>
+        await this.axiosInstance.post('/JSSResource/categories/id/0', xmlPayload, {
+          headers: {
+            'Content-Type': 'application/xml',
+            'Accept': 'application/xml',
+          },
+        }),
+      { operation: 'createCategory', resourceType: 'category', resourceId: name }
+    );
+
+    const created = await this.getCategoryByName(name);
+    if (!created) {
+      // Best-effort: list and match.
+      const all = await this.listCategories();
+      const lower = name.toLowerCase();
+      const match = all.find((c) => c.name.toLowerCase() === lower);
+      if (match) return match;
+      throw new Error('Category was created but could not be fetched by name');
+    }
+    return created;
+  }
+
+  async ensureSelfServiceCategoryExists(input: { name: string; priority?: number }): Promise<{ category: { id: number; name: string; priority?: number }; created: boolean }> {
+    const name = String(input?.name ?? '').trim();
+    if (!name) throw new Error('Category name is required');
+
+    const existing = await this.getCategoryByName(name);
+    if (existing) return { category: existing, created: false };
+
+    const created = await this.createCategory({ name, priority: input?.priority });
+    return { category: created, created: true };
+  }
+
   /**
    * Search computers
    */
@@ -747,13 +1163,14 @@ export class JamfApiClientHybrid {
       const response = await this.axiosInstance.get(`/api/v1/computers-inventory-detail/${id}`);
       return response.data;
     } catch (error) {
-      const axiosError = error as AxiosError;
       logger.debug('Modern API computer details failed, falling back to Classic API', {
-        status: axiosError.response?.status,
+        status: getAxiosErrorStatus(error),
         error: error instanceof Error ? error.message : String(error),
         computerId: id
       });
-      // Fall back to Classic API for any error
+      if (!this.shouldFallbackToClassicOnModernError(error, { allowOn403: true })) {
+        throw error;
+      }
     }
     
     // Try Classic API
@@ -770,6 +1187,41 @@ export class JamfApiClientHybrid {
       });
       throw error;
     }
+  }
+
+  /**
+   * Get per-computer policy execution logs ("Policy Logs") via Classic API computer history.
+   *
+   * Note: Jamf Pro's Modern API does not currently expose the same execution history the UI shows.
+   * The Classic API provides this per computer via the computerhistory resource.
+   */
+  async getComputerPolicyLogs(params: { serialNumber?: string; deviceId?: string }): Promise<any> {
+    await this.ensureAuthenticated();
+
+    if (!this.canCallClassicApi()) {
+      throw new Error('Classic API is not available with the current authentication configuration');
+    }
+
+    const serialNumber = params.serialNumber?.trim();
+    const deviceId = params.deviceId?.trim();
+
+    if (!serialNumber && !deviceId) {
+      throw new Error('Either serialNumber or deviceId is required');
+    }
+
+    const subset = 'PolicyLogs';
+    const endpoint = serialNumber
+      ? `/JSSResource/computerhistory/serialnumber/${encodeURIComponent(serialNumber)}/subset/${subset}`
+      : `/JSSResource/computerhistory/id/${encodeURIComponent(deviceId!)}/subset/${subset}`;
+
+    logger.info('Getting computer policy logs via Classic API computerhistory', {
+      serialNumber: serialNumber || undefined,
+      deviceId: deviceId || undefined,
+      endpoint,
+    });
+
+    const response = await this.axiosInstance.get(endpoint);
+    return response.data;
   }
 
   /**
@@ -847,7 +1299,8 @@ export class JamfApiClientHybrid {
       await this.axiosInstance.post(`/api/v1/jamf-management-framework/redeploy/${deviceId}`);
       logger.info(`Inventory update requested for device ${deviceId} via Modern API`);
     } catch (error) {
-      if (getAxiosErrorStatus(error) === 404 || getAxiosErrorStatus(error) === 403) {
+      const status = getAxiosErrorStatus(error);
+      if ((status === 404 || status === 403) && this.canCallClassicApi()) {
         logger.info('Modern API failed, trying Classic API computercommands...');
         // Try Classic API using the correct endpoint
         try {
@@ -881,7 +1334,14 @@ export class JamfApiClientHybrid {
       logger.info(`Retrieved ${policies.length} policies from Modern API`);
       return policies;
     } catch (modernError) {
-      logger.info('Modern API not available for policies, trying Classic API');
+      if (!this.shouldFallbackToClassicOnModernError(modernError, { allowOn403: true })) {
+        throw modernError;
+      }
+
+      logger.info('Modern API not available for policies, trying Classic API', {
+        status: getAxiosErrorStatus(modernError),
+        data: getAxiosErrorData(modernError),
+      });
 
       // Fallback to Classic API
       try {
@@ -930,10 +1390,42 @@ export class JamfApiClientHybrid {
     await this.ensureAuthenticated();
     
     try {
-      const response = await this.axiosInstance.get(`/JSSResource/policies/id/${policyId}`);
+      const response = await this.axiosInstance.get(`/JSSResource/policies/id/${policyId}`, {
+        headers: {
+          'Cache-Control': 'no-cache',
+          Pragma: 'no-cache',
+        },
+        params: {
+          _ts: Date.now(),
+        },
+      });
       return response.data.policy;
     } catch (error) {
       logger.info('Failed to get policy details:', error);
+      throw error;
+    }
+  }
+
+  private async getPolicyDetailsFresh(policyId: string): Promise<any> {
+    return await this.getPolicyDetails(policyId);
+  }
+
+  // Get raw Classic policy XML (useful for fields that Jamf omits in JSON, e.g. Self Service categories).
+  async getPolicyXml(policyId: string): Promise<string> {
+    await this.ensureAuthenticated();
+
+    try {
+      const response = await this.axiosInstance.get(`/JSSResource/policies/id/${policyId}`, {
+        headers: {
+          Accept: 'application/xml',
+        },
+        // axios returns a string for non-JSON content-types in Node.
+        responseType: 'text' as any,
+        transformResponse: (d: any) => d,
+      });
+      return String((response as any).data ?? '');
+    } catch (error) {
+      logger.info('Failed to get policy XML:', error);
       throw error;
     }
   }
@@ -947,6 +1439,38 @@ export class JamfApiClientHybrid {
     }
     
     await this.ensureAuthenticated();
+
+    // If the caller provides a Classic-shaped policy payload, use Classic XML directly.
+    // The Modern /api/v1/policies payload shape differs (e.g. scope schema), and passing Classic-shaped
+    // data produces misleading 400s like "Unrecognized field computer_groups".
+    if (this.isClassicPolicyPayload(policyData)) {
+      try {
+        const xmlPayload = this.buildPolicyXml(policyData);
+        const response = await this.axiosInstance.post(
+          '/JSSResource/policies/id/0',
+          xmlPayload,
+          {
+            headers: {
+              'Content-Type': 'application/xml',
+              'Accept': 'application/xml',
+            },
+          }
+        );
+
+        const locationHeader = response.headers.location;
+        const policyId = locationHeader ? locationHeader.split('/').pop() : null;
+        if (policyId) {
+          return await this.getPolicyDetails(policyId);
+        }
+        return { success: true };
+      } catch (classicError) {
+        logger.info('Classic API policy create failed:', {
+          status: getAxiosErrorStatus(classicError),
+          data: getAxiosErrorData(classicError),
+        });
+        throw classicError;
+      }
+    }
     
     // Try Modern API first
     try {
@@ -957,7 +1481,9 @@ export class JamfApiClientHybrid {
     } catch (error) {
       logger.info(`Modern API failed with status ${getAxiosErrorStatus(error)}, trying Classic API...`);
       logger.info('Error details:', getAxiosErrorData(error));
-      // Fall back to Classic API for any error
+      if (!this.shouldFallbackToClassicOnModernError(error)) {
+        throw error;
+      }
     }
     
     // Fall back to Classic API with XML format
@@ -1004,42 +1530,824 @@ export class JamfApiClientHybrid {
     }
     
     await this.ensureAuthenticated();
-    
-    // Try Modern API first
-    try {
-      logger.info(`Updating policy ${policyId} using Modern API...`);
-      const response = await this.axiosInstance.put(`/api/v1/policies/${policyId}`, policyData);
-      return response.data;
-    } catch (error) {
-      logger.info(`Modern API failed with status ${getAxiosErrorStatus(error)}, trying Classic API...`);
-      logger.info('Error details:', getAxiosErrorData(error));
-      // Fall back to Classic API for any error
-    }
-    
-    // Fall back to Classic API with XML format
-    try {
-      logger.info(`Updating policy ${policyId} using Classic API with XML...`);
-      
-      // Build XML payload
-      const xmlPayload = this.buildPolicyXml(policyData);
-      
-      const response = await this.axiosInstance.put(
-        `/JSSResource/policies/id/${policyId}`,
-        xmlPayload,
-        {
-          headers: {
-            'Content-Type': 'application/xml',
-            'Accept': 'application/xml',
+
+    return await this.withPolicyWriteLock(policyId, async () => {
+      if (this.isClassicPolicyPayload(policyData)) {
+        let updatedPolicy: any;
+        try {
+          // Lossless strategy: patch only requested fields on top of current Classic XML.
+          // This avoids dropping unknown/tenant-specific nodes in touched sections.
+          const existingXml = await this.getPolicyXml(policyId);
+          const xmlPayload = this.patchPolicyXml(existingXml, policyData);
+          updatedPolicy = await this.updatePolicyXml(policyId, xmlPayload, { skipPolicyWriteLock: true });
+        } catch (xmlPatchError) {
+          logger.warn('Classic XML patch update failed; falling back to merged Classic payload update', {
+            status: getAxiosErrorStatus(xmlPatchError),
+            data: getAxiosErrorData(xmlPatchError),
+          });
+
+          try {
+            let existing: any | null = null;
+            try {
+              existing = await this.getPolicyDetails(policyId);
+            } catch (e) {
+              existing = null;
+            }
+
+            const deepMergeDefined = (base: any, patch: any): any => {
+              if (patch === undefined) return base;
+              if (patch === null) return null;
+              if (Array.isArray(patch)) return patch;
+              if (typeof patch === 'object' && patch) {
+                const out: any =
+                  base && typeof base === 'object' && !Array.isArray(base) ? { ...base } : {};
+                for (const [k, v] of Object.entries(patch)) {
+                  if (v === undefined) continue;
+                  out[k] = deepMergeDefined(out[k], v);
+                }
+                return out;
+              }
+              return patch;
+            };
+
+            const merged: any = {};
+            const existingName = existing?.general?.name ?? existing?.general?.policy_name ?? undefined;
+            if (existingName) merged.general = { name: existingName };
+            if (policyData.general !== undefined) {
+              merged.general = deepMergeDefined(
+                merged.general ?? {},
+                deepMergeDefined(existing?.general ?? {}, policyData.general)
+              );
+            }
+            if (policyData.self_service !== undefined) {
+              merged.self_service = deepMergeDefined(existing?.self_service ?? {}, policyData.self_service);
+            }
+            if (policyData.scope !== undefined) {
+              merged.scope = deepMergeDefined(existing?.scope ?? {}, policyData.scope);
+            }
+            if (policyData.package_configuration !== undefined) {
+              merged.package_configuration = deepMergeDefined(
+                existing?.package_configuration ?? {},
+                policyData.package_configuration
+              );
+            }
+            if (policyData.scripts !== undefined) {
+              merged.scripts = deepMergeDefined(existing?.scripts ?? [], policyData.scripts);
+            }
+
+            const xmlPayload = this.buildPolicyXml(merged);
+            updatedPolicy = await this.updatePolicyXml(policyId, xmlPayload, { skipPolicyWriteLock: true });
+          } catch (classicError) {
+            logger.info('Classic API policy update failed:', {
+              status: getAxiosErrorStatus(classicError),
+              data: getAxiosErrorData(classicError),
+            });
+            throw classicError;
           }
         }
-      );
+
+        return await this.verifyPolicyUpdatePersisted(policyId, policyData, updatedPolicy);
+      }
       
-      // Fetch and return the updated policy details
-      return await this.getPolicyDetails(policyId);
-    } catch (classicError) {
-      logger.info('Classic API also failed:', classicError);
-      throw classicError;
+      // Try Modern API first
+      try {
+        logger.info(`Updating policy ${policyId} using Modern API...`);
+        const response = await this.axiosInstance.put(`/api/v1/policies/${policyId}`, policyData);
+        return response.data;
+      } catch (error) {
+        logger.info(`Modern API failed with status ${getAxiosErrorStatus(error)}, trying Classic API...`);
+        logger.info('Error details:', getAxiosErrorData(error));
+        if (!this.shouldFallbackToClassicOnModernError(error)) {
+          throw error;
+        }
+      }
+      
+      // Fall back to Classic API with XML format
+      try {
+        logger.info(`Updating policy ${policyId} using Classic API with XML...`);
+        
+        // Build XML payload
+        const xmlPayload = this.buildPolicyXml(policyData);
+        return await this.updatePolicyXml(policyId, xmlPayload, { skipPolicyWriteLock: true });
+      } catch (classicError) {
+        logger.info('Classic API also failed:', classicError);
+        throw classicError;
+      }
+    });
+  }
+
+  private escapeXmlValue(str: string): string {
+    return String(str ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&apos;');
+  }
+
+  private getXmlArrayItemTag(parentTag: string): string {
+    const directMap: Record<string, string> = {
+      computers: 'computer',
+      computer_groups: 'computer_group',
+      buildings: 'building',
+      departments: 'department',
+      jss_users: 'jss_user',
+      jss_user_groups: 'jss_user_group',
+      packages: 'package',
+      scripts: 'script',
+      categories: 'category',
+    };
+
+    if (directMap[parentTag]) return directMap[parentTag];
+    if (parentTag.endsWith('ies')) return `${parentTag.slice(0, -3)}y`;
+    if (parentTag.endsWith('s')) return parentTag.slice(0, -1);
+    return 'item';
+  }
+
+  private serializeXmlNodeValue(value: any, parentTag?: string): string {
+    if (value === undefined || value === null) return '';
+
+    if (Array.isArray(value)) {
+      const itemTag = this.getXmlArrayItemTag(parentTag ?? 'item');
+      return value
+        .map((item) => `<${itemTag}>${this.serializeXmlNodeValue(item, itemTag)}</${itemTag}>`)
+        .join('');
     }
+
+    if (typeof value === 'object') {
+      return Object.entries(value)
+        .filter(([, v]) => v !== undefined)
+        .map(([k, v]) => `<${k}>${this.serializeXmlNodeValue(v, k)}</${k}>`)
+        .join('');
+    }
+
+    if (typeof value === 'boolean') {
+      return value ? 'true' : 'false';
+    }
+
+    return this.escapeXmlValue(String(value));
+  }
+
+  private withPolicySection(
+    xml: string,
+    sectionTag: string,
+    updater: (sectionXml: string) => string
+  ): string {
+    const sectionRegex = new RegExp(`<${sectionTag}>[\\s\\S]*?<\\/${sectionTag}>`, 'i');
+    const existingMatch = xml.match(sectionRegex);
+
+    if (existingMatch) {
+      const updatedSection = updater(existingMatch[0]);
+      return xml.replace(sectionRegex, updatedSection);
+    }
+
+    const createdSection = updater(`<${sectionTag}></${sectionTag}>`);
+    if (/<\/policy>/i.test(xml)) {
+      return xml.replace(/<\/policy>/i, `${createdSection}</policy>`);
+    }
+
+    return `${xml}\n${createdSection}\n`;
+  }
+
+  private upsertSectionChild(
+    sectionXml: string,
+    sectionTag: string,
+    childTag: string,
+    childInnerXml: string
+  ): string {
+    const childRegex = new RegExp(`<${childTag}>[\\s\\S]*?<\\/${childTag}>`, 'i');
+    const childXml = `<${childTag}>${childInnerXml}</${childTag}>`;
+
+    if (childRegex.test(sectionXml)) {
+      return sectionXml.replace(childRegex, childXml);
+    }
+
+    return sectionXml.replace(new RegExp(`</${sectionTag}>`, 'i'), `${childXml}</${sectionTag}>`);
+  }
+
+  private toSelfServiceCategoryList(input: any): Array<{ id?: unknown; name?: unknown; display_in?: unknown; feature_in?: unknown }> {
+    if (input === undefined || input === null) return [];
+    if (typeof input === 'string') {
+      const name = input.trim();
+      return name ? [{ name }] : [];
+    }
+    if (Array.isArray(input)) {
+      return input
+        .flatMap((x) => this.toSelfServiceCategoryList(x))
+        .filter((c) => c && (c.id !== undefined || (typeof c.name === 'string' && c.name.trim())));
+    }
+    if (typeof input === 'object') {
+      if ('category' in (input as any)) {
+        return this.toSelfServiceCategoryList((input as any).category);
+      }
+      return [
+        {
+          id: (input as any).id,
+          name: (input as any).name,
+          display_in: (input as any).display_in ?? (input as any).displayIn,
+          feature_in: (input as any).feature_in ?? (input as any).featureIn,
+        },
+      ];
+    }
+    return [];
+  }
+
+  private renderSelfServiceCategoriesXml(categories: Array<{ id?: unknown; name?: unknown; display_in?: unknown; feature_in?: unknown }>): string {
+    let xml = `<size>${categories.length}</size>`;
+    for (const c of categories) {
+      const id = (c as any).id;
+      const name = (c as any).name;
+      const displayIn = (c as any).display_in ?? true;
+      const featureIn = (c as any).feature_in ?? false;
+      xml += '<category>';
+      if (id !== undefined && id !== null) {
+        xml += `<id>${this.escapeXmlValue(String(id))}</id>`;
+      }
+      if (name !== undefined && name !== null && String(name).trim() !== '') {
+        xml += `<name>${this.escapeXmlValue(String(name))}</name>`;
+      }
+      xml += `<display_in>${Boolean(displayIn)}</display_in>`;
+      xml += `<feature_in>${Boolean(featureIn)}</feature_in>`;
+      xml += '</category>';
+    }
+    return xml;
+  }
+
+  private patchGeneralPolicyXml(xml: string, general: any): string {
+    return this.withPolicySection(xml, 'general', (sectionXml) => {
+      let next = sectionXml;
+      for (const [key, rawValue] of Object.entries(general ?? {})) {
+        if (rawValue === undefined) continue;
+
+        if (key === 'category') {
+          if (typeof rawValue === 'string') {
+            next = this.upsertSectionChild(next, 'general', 'category', `<name>${this.escapeXmlValue(rawValue)}</name>`);
+          } else if (rawValue && typeof rawValue === 'object') {
+            const id = (rawValue as any).id;
+            const name = (rawValue as any).name;
+            let inner = '';
+            if (id !== undefined && id !== null) inner += `<id>${this.escapeXmlValue(String(id))}</id>`;
+            if (name !== undefined && name !== null && String(name).trim() !== '') {
+              inner += `<name>${this.escapeXmlValue(String(name))}</name>`;
+            }
+            next = this.upsertSectionChild(next, 'general', 'category', inner);
+          } else {
+            next = this.upsertSectionChild(next, 'general', 'category', '');
+          }
+          continue;
+        }
+
+        if (key === 'frequency' && rawValue !== null && rawValue !== '') {
+          const normalizedFrequency = normalizePolicyFrequency(String(rawValue)) ?? String(rawValue);
+          next = this.upsertSectionChild(next, 'general', key, this.escapeXmlValue(normalizedFrequency));
+          continue;
+        }
+
+        if (key === 'network_requirements' && rawValue !== null && rawValue !== '') {
+          const normalized = normalizePolicyNetworkRequirements(String(rawValue)) ?? String(rawValue);
+          next = this.upsertSectionChild(next, 'general', key, this.escapeXmlValue(normalized));
+          continue;
+        }
+
+        if (key === 'network_limitations' && rawValue && typeof rawValue === 'object') {
+          const networkLimitations = rawValue as any;
+          const normalizedConnection = normalizePolicyMinimumNetworkConnection(
+            networkLimitations.minimum_network_connection
+          ) ?? networkLimitations.minimum_network_connection;
+          const normalizedValue = {
+            ...networkLimitations,
+            minimum_network_connection: normalizedConnection,
+          };
+          next = this.upsertSectionChild(
+            next,
+            'general',
+            key,
+            this.serializeXmlNodeValue(normalizedValue, key)
+          );
+          continue;
+        }
+
+        next = this.upsertSectionChild(next, 'general', key, this.serializeXmlNodeValue(rawValue, key));
+      }
+      return next;
+    });
+  }
+
+  private patchScopePolicyXml(xml: string, scope: any): string {
+    return this.withPolicySection(xml, 'scope', (sectionXml) => {
+      let next = sectionXml;
+      for (const [key, value] of Object.entries(scope ?? {})) {
+        if (value === undefined) continue;
+        next = this.upsertSectionChild(next, 'scope', key, this.serializeXmlNodeValue(value, key));
+      }
+      return next;
+    });
+  }
+
+  private patchSelfServicePolicyXml(xml: string, selfService: any): string {
+    return this.withPolicySection(xml, 'self_service', (sectionXml) => {
+      let next = sectionXml;
+      for (const [key, value] of Object.entries(selfService ?? {})) {
+        if (value === undefined) continue;
+        if (key === 'self_service_category' || key === 'self_service_categories') continue;
+        next = this.upsertSectionChild(next, 'self_service', key, this.serializeXmlNodeValue(value, key));
+      }
+
+      const touchedCategories =
+        Object.prototype.hasOwnProperty.call(selfService ?? {}, 'self_service_category') ||
+        Object.prototype.hasOwnProperty.call(selfService ?? {}, 'self_service_categories');
+
+      if (touchedCategories) {
+        const categories =
+          (selfService.self_service_categories !== undefined &&
+          this.toSelfServiceCategoryList(selfService.self_service_categories).length > 0)
+            ? this.toSelfServiceCategoryList(selfService.self_service_categories)
+            : this.toSelfServiceCategoryList(selfService.self_service_category);
+
+        const firstName = String((categories[0] as any)?.name ?? '').trim();
+        next = this.upsertSectionChild(
+          next,
+          'self_service',
+          'self_service_category',
+          this.escapeXmlValue(firstName)
+        );
+        next = this.upsertSectionChild(
+          next,
+          'self_service',
+          'self_service_categories',
+          this.renderSelfServiceCategoriesXml(categories)
+        );
+      }
+
+      return next;
+    });
+  }
+
+  private patchPackageConfigurationPolicyXml(xml: string, packageConfiguration: any): string {
+    return this.withPolicySection(xml, 'package_configuration', (sectionXml) => {
+      let next = sectionXml;
+      for (const [key, value] of Object.entries(packageConfiguration ?? {})) {
+        if (value === undefined) continue;
+        next = this.upsertSectionChild(next, 'package_configuration', key, this.serializeXmlNodeValue(value, key));
+      }
+      return next;
+    });
+  }
+
+  private patchScriptsPolicyXml(xml: string, scripts: any): string {
+    const normalizedScripts = (Array.isArray(scripts) ? scripts : []).map((script) => {
+      if (!script || typeof script !== 'object') return script;
+      const priority = (script as any).priority;
+      if (priority === undefined) return script;
+      return {
+        ...(script as any),
+        priority: normalizeScriptPriority(String(priority)) ?? String(priority),
+      };
+    });
+
+    return this.withPolicySection(
+      xml,
+      'scripts',
+      () => `<scripts>${this.serializeXmlNodeValue(normalizedScripts, 'scripts')}</scripts>`
+    );
+  }
+
+  private patchPolicyXml(existingXml: string, patch: any): string {
+    let xml = String(existingXml ?? '');
+    if (!xml.trim()) {
+      throw new Error('Cannot patch policy XML because existing XML is empty');
+    }
+
+    if (patch?.general !== undefined) {
+      xml = this.patchGeneralPolicyXml(xml, patch.general);
+    }
+    if (patch?.scope !== undefined) {
+      xml = this.patchScopePolicyXml(xml, patch.scope);
+    }
+    if (patch?.self_service !== undefined) {
+      xml = this.patchSelfServicePolicyXml(xml, patch.self_service);
+    }
+    if (patch?.package_configuration !== undefined) {
+      xml = this.patchPackageConfigurationPolicyXml(xml, patch.package_configuration);
+    }
+    if (patch?.scripts !== undefined) {
+      xml = this.patchScriptsPolicyXml(xml, patch.scripts);
+    }
+
+    return xml;
+  }
+
+  private collectVerifiablePolicyExpectations(
+    value: any,
+    pathPrefix: string,
+    out: Array<{ path: string; expected: any }>
+  ): void {
+    if (value === undefined) return;
+    if (value === null || typeof value !== 'object') {
+      out.push({ path: pathPrefix, expected: value });
+      return;
+    }
+    if (Array.isArray(value)) {
+      return;
+    }
+
+    for (const [key, raw] of Object.entries(value)) {
+      if (raw === undefined) continue;
+      const path = pathPrefix ? `${pathPrefix}.${key}` : key;
+
+      if (path === 'self_service.self_service_category' || path === 'self_service.self_service_categories') {
+        continue;
+      }
+
+      if (path === 'general.category' && typeof raw === 'string') {
+        out.push({ path: 'general.category.name', expected: raw });
+        continue;
+      }
+      if (path === 'general.frequency' && typeof raw === 'string') {
+        const normalizedFrequency = normalizePolicyFrequency(raw) ?? raw;
+        out.push({ path, expected: normalizedFrequency });
+        continue;
+      }
+      if (path === 'general.network_requirements' && typeof raw === 'string') {
+        const normalizedReq = normalizePolicyNetworkRequirements(raw) ?? raw;
+        out.push({ path, expected: normalizedReq });
+        continue;
+      }
+      if (path === 'general.network_limitations.minimum_network_connection' && typeof raw === 'string') {
+        const normalizedConn = normalizePolicyMinimumNetworkConnection(raw) ?? raw;
+        out.push({ path, expected: normalizedConn });
+        continue;
+      }
+
+      this.collectVerifiablePolicyExpectations(raw, path, out);
+    }
+  }
+
+  private getValueAtPath(obj: any, path: string): any {
+    return String(path)
+      .split('.')
+      .reduce((acc: any, key) => (acc === undefined || acc === null ? undefined : acc[key]), obj);
+  }
+
+  private policyValuesEqual(actual: any, expected: any): boolean {
+    if (expected === null) return actual === null;
+
+    if (typeof expected === 'boolean') {
+      if (typeof actual === 'boolean') return actual === expected;
+      const lower = String(actual ?? '').toLowerCase();
+      return lower === String(expected);
+    }
+
+    if (typeof expected === 'number') {
+      const n = typeof actual === 'number' ? actual : Number(actual);
+      return Number.isFinite(n) && n === expected;
+    }
+
+    if (typeof expected === 'string') {
+      return String(actual ?? '') === expected;
+    }
+
+    return JSON.stringify(actual) === JSON.stringify(expected);
+  }
+
+  private findPolicyExpectationMismatches(
+    policy: any,
+    expectations: Array<{ path: string; expected: any }>
+  ): string[] {
+    const mismatches: string[] = [];
+    for (const exp of expectations) {
+      const actual = this.getValueAtPath(policy, exp.path);
+      if (!this.policyValuesEqual(actual, exp.expected)) {
+        mismatches.push(
+          `${exp.path} (expected=${JSON.stringify(exp.expected)}, actual=${JSON.stringify(actual)})`
+        );
+      }
+    }
+    return mismatches;
+  }
+
+  private collectVerifiableScalarExpectations(
+    value: any,
+    pathPrefix: string,
+    out: Array<{ path: string; expected: any }>
+  ): void {
+    if (value === undefined) return;
+    if (value === null || typeof value !== 'object') {
+      if (pathPrefix) out.push({ path: pathPrefix, expected: value });
+      return;
+    }
+    if (Array.isArray(value)) return;
+
+    for (const [key, raw] of Object.entries(value)) {
+      if (raw === undefined) continue;
+      const path = pathPrefix ? `${pathPrefix}.${key}` : key;
+      this.collectVerifiableScalarExpectations(raw, path, out);
+    }
+  }
+
+  private collectScriptVerifyExpectations(scriptData: JamfScriptUpdateInput): Array<{ path: string; expected: any }> {
+    const expectations: Array<{ path: string; expected: any }> = [];
+    const patch = scriptData ?? {};
+
+    if (patch.name !== undefined) expectations.push({ path: 'name', expected: String(patch.name) });
+    if (patch.category !== undefined) expectations.push({ path: 'category', expected: String(patch.category) });
+    if (patch.info !== undefined) expectations.push({ path: 'info', expected: String(patch.info) });
+    if (patch.notes !== undefined) expectations.push({ path: 'notes', expected: String(patch.notes) });
+    if (patch.priority !== undefined) {
+      const normalizedPriority = normalizeScriptPriority(String(patch.priority)) ?? String(patch.priority);
+      expectations.push({ path: 'priority', expected: normalizedPriority });
+    }
+    if (patch.script_contents !== undefined) {
+      expectations.push({ path: 'scriptContents', expected: String(patch.script_contents) });
+    }
+    if (patch.script_contents_encoded !== undefined) {
+      expectations.push({ path: 'scriptContentsEncoded', expected: Boolean(patch.script_contents_encoded) });
+    }
+    if (patch.os_requirements !== undefined) {
+      expectations.push({ path: 'osRequirements', expected: String(patch.os_requirements) });
+    }
+
+    if (patch.parameters && typeof patch.parameters === 'object') {
+      for (const [key, raw] of Object.entries(patch.parameters)) {
+        if (raw === undefined) continue;
+        expectations.push({ path: `parameters.${key}`, expected: String(raw) });
+      }
+    }
+
+    return expectations;
+  }
+
+  private async verifyScriptUpdatePersisted(
+    scriptId: string,
+    patch: JamfScriptUpdateInput,
+    initialScript?: JamfScriptDetails
+  ): Promise<JamfScriptDetails> {
+    const strictEnabled = String(process.env.JAMF_SCRIPT_VERIFY_ENABLED ?? 'true').toLowerCase() !== 'false';
+    if (!strictEnabled) {
+      return initialScript ?? (await this.getScriptDetails(scriptId));
+    }
+
+    const expectations = this.collectScriptVerifyExpectations(patch);
+    if (expectations.length === 0) {
+      return initialScript ?? (await this.getScriptDetails(scriptId));
+    }
+
+    const attempts = Math.max(1, Number(process.env.JAMF_SCRIPT_VERIFY_ATTEMPTS ?? 8));
+    const delayMs = Math.max(0, Number(process.env.JAMF_SCRIPT_VERIFY_DELAY_MS ?? 250));
+    const requiredConsistentReads = Math.max(
+      1,
+      Number(process.env.JAMF_SCRIPT_VERIFY_REQUIRED_CONSISTENT_READS ?? 2)
+    );
+
+    let candidate: JamfScriptDetails | undefined;
+    let lastMismatches: string[] = [];
+    let matchedReads = 0;
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      candidate = await this.getScriptDetails(scriptId);
+      const mismatches = this.findPolicyExpectationMismatches(candidate, expectations);
+
+      if (mismatches.length === 0) {
+        matchedReads += 1;
+        if (matchedReads >= requiredConsistentReads) {
+          return candidate;
+        }
+      } else {
+        matchedReads = 0;
+        lastMismatches = mismatches;
+      }
+
+      if (attempt < attempts) {
+        await this.sleep(delayMs * attempt);
+      }
+    }
+
+    const sample = lastMismatches.slice(0, 6).join('; ');
+    throw new Error(
+      `Script ${scriptId} update did not persist requested fields after ${attempts} checks (required consistent reads: ${requiredConsistentReads}): ${sample}`
+    );
+  }
+
+  private extractPatchSoftwareTitleConfigurationId(payload: any): string | null {
+    const readId = (obj: any): string | null => {
+      if (!obj || typeof obj !== 'object') return null;
+      const candidateKeys = ['id', 'configId', 'configurationId', 'patchSoftwareTitleConfigurationId'];
+      for (const key of candidateKeys) {
+        const raw = (obj as any)[key];
+        if (typeof raw === 'string' && raw.trim()) return raw;
+        if (typeof raw === 'number' && Number.isFinite(raw)) return String(raw);
+      }
+      return null;
+    };
+
+    return (
+      readId(payload) ??
+      readId((payload as any)?.result) ??
+      readId((payload as any)?.configuration) ??
+      readId((payload as any)?.patchSoftwareTitleConfiguration) ??
+      null
+    );
+  }
+
+  private collectPatchVerifyExpectations(
+    patch: any,
+    options?: { topLevelOnly?: boolean }
+  ): Array<{ path: string; expected: any }> {
+    const expectations: Array<{ path: string; expected: any }> = [];
+    if (!patch || typeof patch !== 'object') return expectations;
+
+    if (options?.topLevelOnly) {
+      for (const [key, raw] of Object.entries(patch)) {
+        if (raw === undefined) continue;
+        if (raw === null || (typeof raw !== 'object' && !Array.isArray(raw))) {
+          expectations.push({ path: key, expected: raw });
+        }
+      }
+      return expectations;
+    }
+
+    this.collectVerifiableScalarExpectations(patch, '', expectations);
+    return expectations;
+  }
+
+  private async verifyPatchSoftwareTitleConfigurationPersisted(
+    configId: string,
+    patch: any,
+    initialConfig?: any,
+    options?: { topLevelOnly?: boolean }
+  ): Promise<any> {
+    const strictEnabled = String(process.env.JAMF_PATCH_VERIFY_ENABLED ?? 'true').toLowerCase() !== 'false';
+    if (!strictEnabled) {
+      return initialConfig ?? (await this.getPatchSoftwareTitleConfiguration(configId));
+    }
+
+    const expectations = this.collectPatchVerifyExpectations(patch, options);
+    if (expectations.length === 0) {
+      return initialConfig ?? (await this.getPatchSoftwareTitleConfiguration(configId));
+    }
+
+    const attempts = Math.max(1, Number(process.env.JAMF_PATCH_VERIFY_ATTEMPTS ?? 8));
+    const delayMs = Math.max(0, Number(process.env.JAMF_PATCH_VERIFY_DELAY_MS ?? 250));
+    const requiredConsistentReads = Math.max(
+      1,
+      Number(process.env.JAMF_PATCH_VERIFY_REQUIRED_CONSISTENT_READS ?? 2)
+    );
+
+    let candidate: any;
+    let lastMismatches: string[] = [];
+    let matchedReads = 0;
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      candidate = await this.getPatchSoftwareTitleConfiguration(configId);
+      const mismatches = this.findPolicyExpectationMismatches(candidate, expectations);
+
+      if (mismatches.length === 0) {
+        matchedReads += 1;
+        if (matchedReads >= requiredConsistentReads) {
+          return candidate;
+        }
+      } else {
+        matchedReads = 0;
+        lastMismatches = mismatches;
+      }
+
+      if (attempt < attempts) {
+        await this.sleep(delayMs * attempt);
+      }
+    }
+
+    const sample = lastMismatches.slice(0, 6).join('; ');
+    throw new Error(
+      `Patch software title configuration ${configId} update did not persist requested fields after ${attempts} checks (required consistent reads: ${requiredConsistentReads}): ${sample}`
+    );
+  }
+
+  private async verifyPatchSoftwareTitleConfigurationDeleted(configId: string): Promise<void> {
+    const strictEnabled = String(process.env.JAMF_PATCH_VERIFY_ENABLED ?? 'true').toLowerCase() !== 'false';
+    if (!strictEnabled) return;
+
+    const attempts = Math.max(1, Number(process.env.JAMF_PATCH_VERIFY_ATTEMPTS ?? 8));
+    const delayMs = Math.max(0, Number(process.env.JAMF_PATCH_VERIFY_DELAY_MS ?? 250));
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        await this.getPatchSoftwareTitleConfiguration(configId);
+      } catch (error) {
+        if (getAxiosErrorStatus(error) === 404) {
+          return;
+        }
+        throw error;
+      }
+
+      if (attempt < attempts) {
+        await this.sleep(delayMs * attempt);
+      }
+    }
+
+    throw new Error(
+      `Patch software title configuration ${configId} was not deleted after ${attempts} checks`
+    );
+  }
+
+  private isPolicyXmlVerifiableExpectation(path: string, expected: any): boolean {
+    if (expected === undefined || expected === null) return false;
+    if (typeof expected === 'object') return false;
+
+    // Only verify scalar fields that map 1:1 to Classic policy XML nodes.
+    return path === 'general.name' || path.startsWith('self_service.');
+  }
+
+  private getXmlValueAtPath(xml: string, path: string): any {
+    let current = String(xml ?? '');
+    if (!current || !path) return undefined;
+
+    for (const segment of String(path).split('.')) {
+      const tag = segment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const match = current.match(new RegExp(`<${tag}>\\s*([\\s\\S]*?)\\s*</${tag}>`, 'i'));
+      if (!match) return undefined;
+      current = String(match[1] ?? '');
+    }
+
+    if (/<[a-zA-Z][\w:-]*[\s>]/.test(current)) {
+      return undefined;
+    }
+    return this.decodeXmlEntities(current.trim());
+  }
+
+  private findPolicyExpectationMismatchesInXml(
+    xml: string,
+    expectations: Array<{ path: string; expected: any }>
+  ): string[] {
+    const mismatches: string[] = [];
+    for (const exp of expectations) {
+      const actual = this.getXmlValueAtPath(xml, exp.path);
+      if (!this.policyValuesEqual(actual, exp.expected)) {
+        mismatches.push(
+          `${exp.path} (expected=${JSON.stringify(exp.expected)}, actual=${JSON.stringify(actual)})`
+        );
+      }
+    }
+    return mismatches;
+  }
+
+  private async verifyPolicyUpdatePersisted(policyId: string, patch: any, initialPolicy?: any): Promise<any> {
+    const expectations: Array<{ path: string; expected: any }> = [];
+    this.collectVerifiablePolicyExpectations(patch, '', expectations);
+
+    if (expectations.length === 0) {
+      return initialPolicy ?? (await this.getPolicyDetails(policyId));
+    }
+
+    const attempts = Math.max(1, Number(process.env.JAMF_POLICY_VERIFY_ATTEMPTS ?? 8));
+    const delayMs = Math.max(0, Number(process.env.JAMF_POLICY_VERIFY_DELAY_MS ?? 250));
+    const requireXmlVerification = String(process.env.JAMF_POLICY_VERIFY_REQUIRE_XML ?? 'true').toLowerCase() !== 'false';
+    const xmlExpectations = requireXmlVerification
+      ? expectations.filter((exp) => this.isPolicyXmlVerifiableExpectation(exp.path, exp.expected))
+      : [];
+    const requiredConsistentReads = Math.max(
+      1,
+      Number(process.env.JAMF_POLICY_VERIFY_REQUIRED_CONSISTENT_READS ?? 2)
+    );
+
+    let candidate: any;
+    let lastMismatches: string[] = [];
+    let matchedReads = 0;
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      // Always use a fresh read for verification.
+      // Never trust the immediate write response as persisted ground truth.
+      candidate = await this.getPolicyDetailsFresh(policyId);
+
+      const jsonMismatches = this.findPolicyExpectationMismatches(candidate, expectations);
+
+      let xmlMismatches: string[] = [];
+      if (xmlExpectations.length > 0) {
+        const policyXml = await this.getPolicyXml(policyId);
+        xmlMismatches = this.findPolicyExpectationMismatchesInXml(policyXml, xmlExpectations);
+      }
+
+      if (jsonMismatches.length === 0 && xmlMismatches.length === 0) {
+        matchedReads += 1;
+        if (matchedReads >= requiredConsistentReads) {
+          return candidate;
+        }
+      } else {
+        matchedReads = 0;
+        lastMismatches = [
+          ...jsonMismatches.map((m) => `json:${m}`),
+          ...xmlMismatches.map((m) => `xml:${m}`),
+        ];
+      }
+
+      if (attempt < attempts) {
+        await this.sleep(delayMs * attempt);
+      }
+    }
+
+    const sample = lastMismatches.slice(0, 6).join('; ');
+    throw new Error(
+      `Policy ${policyId} update did not persist requested fields after ${attempts} fresh checks (required consistent reads: ${requiredConsistentReads}): ${sample}`
+    );
   }
 
   /**
@@ -1203,14 +2511,46 @@ export class JamfApiClientHybrid {
       if (policyData.general.trigger_network_state_changed !== undefined) xml += `    <trigger_network_state_changed>${policyData.general.trigger_network_state_changed}</trigger_network_state_changed>\n`;
       if (policyData.general.trigger_startup !== undefined) xml += `    <trigger_startup>${policyData.general.trigger_startup}</trigger_startup>\n`;
       if (policyData.general.trigger_other) xml += `    <trigger_other>${escapeXml(policyData.general.trigger_other)}</trigger_other>\n`;
-      if (policyData.general.frequency) xml += `    <frequency>${escapeXml(policyData.general.frequency)}</frequency>\n`;
+      if (policyData.general.frequency) {
+        const normalizedFrequency = normalizePolicyFrequency(policyData.general.frequency) ?? String(policyData.general.frequency);
+        xml += `    <frequency>${escapeXml(normalizedFrequency)}</frequency>\n`;
+      }
       if (policyData.general.retry_event) xml += `    <retry_event>${escapeXml(policyData.general.retry_event)}</retry_event>\n`;
       if (policyData.general.retry_attempts !== undefined) xml += `    <retry_attempts>${policyData.general.retry_attempts}</retry_attempts>\n`;
       if (policyData.general.notify_on_each_failed_retry !== undefined) xml += `    <notify_on_each_failed_retry>${policyData.general.notify_on_each_failed_retry}</notify_on_each_failed_retry>\n`;
       if (policyData.general.location_user_only !== undefined) xml += `    <location_user_only>${policyData.general.location_user_only}</location_user_only>\n`;
       if (policyData.general.target_drive) xml += `    <target_drive>${escapeXml(policyData.general.target_drive)}</target_drive>\n`;
       if (policyData.general.offline !== undefined) xml += `    <offline>${policyData.general.offline}</offline>\n`;
-      if (policyData.general.category) xml += `    <category>${escapeXml(policyData.general.category)}</category>\n`;
+      if (policyData.general.category) {
+        const category = policyData.general.category;
+        if (typeof category === 'string') {
+          xml += `    <category><name>${escapeXml(category)}</name></category>\n`;
+        } else if (category && typeof category === 'object') {
+          const id = (category as any).id;
+          const name = (category as any).name;
+          xml += '    <category>';
+          if (id !== undefined && id !== null) xml += `<id>${escapeXml(String(id))}</id>`;
+          if (name) xml += `<name>${escapeXml(String(name))}</name>`;
+          xml += '</category>\n';
+        }
+      }
+
+      // Optional Classic enums: normalize if present (not all callers include these).
+      if ((policyData.general as any).network_requirements !== undefined) {
+        const nr = normalizePolicyNetworkRequirements((policyData.general as any).network_requirements);
+        if (nr) xml += `    <network_requirements>${escapeXml(nr)}</network_requirements>\n`;
+      }
+      if ((policyData.general as any).network_limitations) {
+        const nl = (policyData.general as any).network_limitations;
+        const minConn = normalizePolicyMinimumNetworkConnection(nl.minimum_network_connection);
+        const anyIp = nl.any_ip_address;
+        if (minConn || anyIp !== undefined) {
+          xml += '    <network_limitations>\n';
+          if (minConn) xml += `      <minimum_network_connection>${escapeXml(minConn)}</minimum_network_connection>\n`;
+          if (anyIp !== undefined) xml += `      <any_ip_address>${Boolean(anyIp)}</any_ip_address>\n`;
+          xml += '    </network_limitations>\n';
+        }
+      }
       xml += '  </general>\n';
     }
     
@@ -1255,12 +2595,84 @@ export class JamfApiClientHybrid {
     if (policyData.self_service) {
       xml += '  <self_service>\n';
       if (policyData.self_service.use_for_self_service !== undefined) xml += `    <use_for_self_service>${policyData.self_service.use_for_self_service}</use_for_self_service>\n`;
-      if (policyData.self_service.self_service_display_name) xml += `    <self_service_display_name>${escapeXml(policyData.self_service.self_service_display_name)}</self_service_display_name>\n`;
-      if (policyData.self_service.install_button_text) xml += `    <install_button_text>${escapeXml(policyData.self_service.install_button_text)}</install_button_text>\n`;
-      if (policyData.self_service.reinstall_button_text) xml += `    <reinstall_button_text>${escapeXml(policyData.self_service.reinstall_button_text)}</reinstall_button_text>\n`;
-      if (policyData.self_service.self_service_description) xml += `    <self_service_description>${escapeXml(policyData.self_service.self_service_description)}</self_service_description>\n`;
+      if (policyData.self_service.self_service_display_name !== undefined) xml += `    <self_service_display_name>${escapeXml(String(policyData.self_service.self_service_display_name ?? ''))}</self_service_display_name>\n`;
+      if (policyData.self_service.install_button_text !== undefined) xml += `    <install_button_text>${escapeXml(String(policyData.self_service.install_button_text ?? ''))}</install_button_text>\n`;
+      if (policyData.self_service.reinstall_button_text !== undefined) xml += `    <reinstall_button_text>${escapeXml(String(policyData.self_service.reinstall_button_text ?? ''))}</reinstall_button_text>\n`;
+      if (policyData.self_service.self_service_description !== undefined) xml += `    <self_service_description>${escapeXml(String(policyData.self_service.self_service_description ?? ''))}</self_service_description>\n`;
       if (policyData.self_service.force_users_to_view_description !== undefined) xml += `    <force_users_to_view_description>${policyData.self_service.force_users_to_view_description}</force_users_to_view_description>\n`;
       if (policyData.self_service.feature_on_main_page !== undefined) xml += `    <feature_on_main_page>${policyData.self_service.feature_on_main_page}</feature_on_main_page>\n`;
+      if (policyData.self_service.notification !== undefined) xml += `    <notification>${policyData.self_service.notification}</notification>\n`;
+      if (policyData.self_service.notification_type !== undefined) xml += `    <notification_type>${escapeXml(String(policyData.self_service.notification_type ?? ''))}</notification_type>\n`;
+      if (policyData.self_service.notification_subject !== undefined) xml += `    <notification_subject>${escapeXml(String(policyData.self_service.notification_subject ?? ''))}</notification_subject>\n`;
+      if (policyData.self_service.notification_message !== undefined) xml += `    <notification_message>${escapeXml(String(policyData.self_service.notification_message ?? ''))}</notification_message>\n`;
+
+      // Self Service category (policy). Policies effectively support one category.
+      // Jamf Classic policy XML uses <self_service_categories> (plural) with a <size> and one or more <category> nodes.
+      // Support both self_service_category and self_service_categories (alias) as inputs.
+      const ss = policyData.self_service;
+      const toCategoryList = (input: any): Array<{ id?: unknown; name?: unknown }> => {
+        if (!input) return [];
+        if (typeof input === 'string') {
+          const name = input.trim();
+          return name ? [{ name }] : [];
+        }
+        if (Array.isArray(input)) {
+          return input
+            .flatMap((x) => toCategoryList(x))
+            .filter((c) => c && (c.id !== undefined || (typeof c.name === 'string' && c.name.trim())));
+        }
+        if (typeof input === 'object') {
+          // Common shapes:
+          // - { id, name }
+          // - { category: { id, name } } or { category: [ ... ] }
+          if ('category' in (input as any)) {
+            return toCategoryList((input as any).category);
+          }
+          return [
+            {
+              id: (input as any).id,
+              name: (input as any).name,
+              // Jamf Classic policy XML commonly includes these on categories.
+              display_in: (input as any).display_in ?? (input as any).displayIn,
+              feature_in: (input as any).feature_in ?? (input as any).featureIn,
+            } as any,
+          ];
+        }
+        return [];
+      };
+
+      const categories =
+        (ss.self_service_categories !== undefined ? toCategoryList(ss.self_service_categories) : []).length > 0
+          ? toCategoryList(ss.self_service_categories)
+          : toCategoryList(ss.self_service_category);
+
+      if (categories.length > 0) {
+        // Tenant compatibility: some Jamf Classic versions only persist the category selection
+        // if the legacy string field <self_service_category> is also present, even when
+        // <self_service_categories> is correctly provided.
+        const firstName = String((categories[0] as any).name ?? '').trim();
+        if (firstName) {
+          xml += `    <self_service_category>${escapeXml(firstName)}</self_service_category>\n`;
+        }
+
+        xml += '    <self_service_categories>\n';
+        xml += `      <size>${categories.length}</size>\n`;
+        for (const c of categories) {
+          const id = (c as any).id;
+          const name = (c as any).name;
+          // In practice, Jamf may drop the category if these flags are omitted.
+          const displayIn = (c as any).display_in ?? true;
+          const featureIn = (c as any).feature_in ?? false;
+          xml += '      <category>\n';
+          if (id !== undefined && id !== null) xml += `        <id>${escapeXml(String(id))}</id>\n`;
+          if (name) xml += `        <name>${escapeXml(String(name))}</name>\n`;
+          xml += `        <display_in>${Boolean(displayIn)}</display_in>\n`;
+          xml += `        <feature_in>${Boolean(featureIn)}</feature_in>\n`;
+          xml += '      </category>\n';
+        }
+        xml += '    </self_service_categories>\n';
+      }
+
       xml += '  </self_service>\n';
     }
     
@@ -1283,16 +2695,19 @@ export class JamfApiClientHybrid {
     }
     
     // Scripts
-    if (policyData.scripts && policyData.scripts.length > 0) {
-      xml += '  <scripts>\n';
-      policyData.scripts.forEach((script: any) => {
-        xml += '    <script>\n';
-        xml += `      <id>${script.id}</id>\n`;
-        if (script.priority) xml += `      <priority>${escapeXml(script.priority)}</priority>\n`;
-        if (script.parameter4) xml += `      <parameter4>${escapeXml(script.parameter4)}</parameter4>\n`;
-        if (script.parameter5) xml += `      <parameter5>${escapeXml(script.parameter5)}</parameter5>\n`;
-        if (script.parameter6) xml += `      <parameter6>${escapeXml(script.parameter6)}</parameter6>\n`;
-        if (script.parameter7) xml += `      <parameter7>${escapeXml(script.parameter7)}</parameter7>\n`;
+	    if (policyData.scripts && policyData.scripts.length > 0) {
+	      xml += '  <scripts>\n';
+	      policyData.scripts.forEach((script: any) => {
+	        xml += '    <script>\n';
+	        xml += `      <id>${script.id}</id>\n`;
+	        if (script.priority) {
+	          const normalizedPriority = normalizeScriptPriority(script.priority) ?? String(script.priority);
+	          xml += `      <priority>${escapeXml(normalizedPriority)}</priority>\n`;
+	        }
+	        if (script.parameter4) xml += `      <parameter4>${escapeXml(script.parameter4)}</parameter4>\n`;
+	        if (script.parameter5) xml += `      <parameter5>${escapeXml(script.parameter5)}</parameter5>\n`;
+	        if (script.parameter6) xml += `      <parameter6>${escapeXml(script.parameter6)}</parameter6>\n`;
+	        if (script.parameter7) xml += `      <parameter7>${escapeXml(script.parameter7)}</parameter7>\n`;
         if (script.parameter8) xml += `      <parameter8>${escapeXml(script.parameter8)}</parameter8>\n`;
         if (script.parameter9) xml += `      <parameter9>${escapeXml(script.parameter9)}</parameter9>\n`;
         if (script.parameter10) xml += `      <parameter10>${escapeXml(script.parameter10)}</parameter10>\n`;
@@ -1382,7 +2797,9 @@ export class JamfApiClientHybrid {
         status: getAxiosErrorStatus(error),
         data: getAxiosErrorData(error),
       });
-      // Fall back to Classic API for any error
+      if (!this.shouldFallbackToClassicOnModernError(error, { allowOn403: true })) {
+        throw error;
+      }
     }
     
     // Try Classic API
@@ -1417,7 +2834,14 @@ export class JamfApiClientHybrid {
       const response = await this.axiosInstance.get(endpoint);
       return response.data.results || [];
     } catch (error) {
-      logger.info(`Modern API failed, trying Classic API...`);
+      logger.info(`Modern API failed, trying Classic API...`, {
+        status: getAxiosErrorStatus(error),
+        data: getAxiosErrorData(error),
+      });
+
+      if (!this.shouldFallbackToClassicOnModernError(error, { allowOn403: true })) {
+        throw error;
+      }
       
       // Fall back to Classic API
       try {
@@ -1460,7 +2884,14 @@ export class JamfApiClientHybrid {
       const response = await this.axiosInstance.get(endpoint);
       return response.data;
     } catch (error) {
-      logger.info(`Modern API failed, trying Classic API...`);
+      logger.info(`Modern API failed, trying Classic API...`, {
+        status: getAxiosErrorStatus(error),
+        data: getAxiosErrorData(error),
+      });
+
+      if (!this.shouldFallbackToClassicOnModernError(error, { allowOn403: true })) {
+        throw error;
+      }
       
       // Fall back to Classic API
       try {
@@ -1544,7 +2975,14 @@ export class JamfApiClientHybrid {
       await this.axiosInstance.put(endpoint, updatePayload);
       logger.info(`Successfully deployed profile ${profileId} to ${deviceIds.length} ${type}(s)`);
     } catch (error) {
-      logger.info(`Modern API failed, trying Classic API...`);
+      logger.info(`Modern API failed, trying Classic API...`, {
+        status: getAxiosErrorStatus(error),
+        data: getAxiosErrorData(error),
+      });
+
+      if (!this.shouldFallbackToClassicOnModernError(error)) {
+        throw error;
+      }
       
       // Fall back to Classic API
       try {
@@ -1616,7 +3054,14 @@ export class JamfApiClientHybrid {
       await this.axiosInstance.put(endpoint, updatePayload);
       logger.info(`Successfully removed profile ${profileId} from ${deviceIds.length} ${type}(s)`);
     } catch (error) {
-      logger.info(`Modern API failed, trying Classic API...`);
+      logger.info(`Modern API failed, trying Classic API...`, {
+        status: getAxiosErrorStatus(error),
+        data: getAxiosErrorData(error),
+      });
+
+      if (!this.shouldFallbackToClassicOnModernError(error)) {
+        throw error;
+      }
       
       // Fall back to Classic API
       try {
@@ -1669,6 +3114,9 @@ export class JamfApiClientHybrid {
         status: getAxiosErrorStatus(error),
         data: getAxiosErrorData(error),
       });
+      if (!this.shouldFallbackToClassicOnModernError(error, { allowOn403: true })) {
+        throw error;
+      }
       try {
         logger.info('Listing packages using Classic API...');
         const response = await this.axiosInstance.get('/JSSResource/packages');
@@ -1697,6 +3145,9 @@ export class JamfApiClientHybrid {
         status: getAxiosErrorStatus(error),
         data: getAxiosErrorData(error),
       });
+      if (!this.shouldFallbackToClassicOnModernError(error, { allowOn403: true })) {
+        throw error;
+      }
       try {
         logger.info(`Getting package details for ${packageId} using Classic API...`);
         const response = await this.axiosInstance.get(`/JSSResource/packages/id/${packageId}`);
@@ -1929,14 +3380,14 @@ export class JamfApiClientHybrid {
     return groupDetails.computers || [];
   }
 
-  private normalizeSmartGroupCriteria(
+	  private normalizeSmartGroupCriteria(
     criteriaInput:
       | SmartGroupCriteriaInput[]
       | SmartGroupCriteriaContainer
       | null
       | undefined
-  ): JamfSearchCriteria[] {
-    if (!criteriaInput) return [];
+	  ): JamfSearchCriteria[] {
+	    if (!criteriaInput) return [];
 
     let criteriaList: SmartGroupCriteriaInput[] = [];
 
@@ -1950,18 +3401,33 @@ export class JamfApiClientHybrid {
       }
     }
 
-    return criteriaList
-      .map((criterion) => ({
-        name: criterion.name,
-        priority: criterion.priority,
-        and_or: criterion.and_or ?? criterion.andOr,
-        search_type: criterion.search_type ?? criterion.searchType,
-        value: criterion.value,
-        opening_paren: criterion.opening_paren,
-        closing_paren: criterion.closing_paren,
-      }))
-      .filter((criterion) => this.isValidSmartGroupCriterion(criterion));
-  }
+	    return criteriaList
+	      .map((criterion) =>
+	        normalizeSmartGroupCriterion({
+	          name: criterion.name,
+	          priority: criterion.priority,
+	          and_or: criterion.and_or ?? criterion.andOr,
+	          search_type: criterion.search_type ?? criterion.searchType,
+	          value: criterion.value,
+	          opening_paren: criterion.opening_paren,
+	          closing_paren: criterion.closing_paren,
+	        })
+	      )
+	      .map((criterion) => {
+	        const andOrRaw = String(criterion.and_or ?? '').trim();
+	        const andOr = andOrRaw === 'and' || andOrRaw === 'or' ? andOrRaw : undefined;
+	        return {
+	          name: String(criterion.name ?? ''),
+	          priority: Number(criterion.priority ?? 0),
+	          and_or: andOr,
+	          search_type: String(criterion.search_type ?? ''),
+	          value: String(criterion.value ?? ''),
+	          opening_paren: criterion.opening_paren as any,
+	          closing_paren: criterion.closing_paren as any,
+	        } as JamfSearchCriteria;
+	      })
+	      .filter((criterion) => this.isValidSmartGroupCriterion(criterion));
+	  }
 
   private isValidSmartGroupCriterion(criterion: JamfSearchCriteria): boolean {
     const name = typeof criterion.name === 'string' ? criterion.name.trim() : '';
@@ -1975,6 +3441,36 @@ export class JamfApiClientHybrid {
   /**
    * Build Modern API payload for smart computer groups
    */
+  private normalizeModernSmartGroupSearchType(
+    criterionName: string | undefined,
+    searchType: string | undefined,
+    value: string | undefined
+  ): string | undefined {
+    if (!criterionName || !searchType) return searchType;
+
+    const name = criterionName.trim().toLowerCase();
+    const st = searchType.trim().toLowerCase();
+    const v = (value ?? '').trim().toLowerCase();
+
+    // Jamf's Modern smart-groups endpoint validates operators per criterion. The Classic API accepts
+    // some operators (like "like") that are rejected for specific criteria in Modern.
+    // Example: "Application Title" rejects operator "like" (HTTP 400 INVALID_FIELD).
+    if (name === 'application title') {
+      if (st === 'like') {
+        // Most user intents here are exact app bundle-name matches (e.g. "timeBuzzer.app").
+        // Use the stricter operator that Modern accepts.
+        return 'is';
+      }
+      if (st === 'contains') {
+        // Some callers use "contains" interchangeably with Classic "like".
+        // Prefer an operator that Modern accepts for this criterion.
+        return v.endsWith('.app') ? 'is' : 'is';
+      }
+    }
+
+    return searchType;
+  }
+
   private buildModernSmartGroupPayload(
     name: string,
     criteria: JamfSearchCriteria[],
@@ -1984,7 +3480,11 @@ export class JamfApiClientHybrid {
       name: criterion.name,
       priority: criterion.priority,
       andOr: criterion.and_or,
-      searchType: criterion.search_type,
+      searchType: this.normalizeModernSmartGroupSearchType(
+        criterion.name,
+        criterion.search_type,
+        criterion.value
+      ),
       value: criterion.value,
     }));
 
@@ -2024,15 +3524,16 @@ export class JamfApiClientHybrid {
     const normalizedCriteria = this.normalizeSmartGroupCriteria(criteria);
     const mappedCriteria = normalizedCriteria
       .map((criterion) => {
-        const andOrValue = criterion.and_or ?? '';
-        const searchTypeValue = criterion.search_type ?? '';
-        const priorityValue = criterion.priority ?? '';
-        const valueValue = criterion.value ?? '';
-        const nameValue = criterion.name ?? '';
+        const normalized = normalizeSmartGroupCriterion(criterion);
+        const andOrValue = normalized.and_or ?? '';
+        const searchTypeValue = normalized.search_type ?? '';
+        const priorityValue = normalized.priority ?? '';
+        const valueValue = normalized.value ?? '';
+        const nameValue = normalized.name ?? '';
 
         return `
-    <criterion>
-      <name>${this.escapeXml(String(nameValue))}</name>
+	    <criterion>
+	      <name>${this.escapeXml(String(nameValue))}</name>
       <priority>${this.escapeXml(String(priorityValue))}</priority>
       <and_or>${this.escapeXml(String(andOrValue))}</and_or>
       <search_type>${this.escapeXml(String(searchTypeValue))}</search_type>
@@ -2086,7 +3587,16 @@ export class JamfApiClientHybrid {
       const createdId = response.data?.id ? String(response.data.id) : null;
 
       if (createdId) {
-        return await this.getComputerGroupDetails(createdId);
+        // Prefer Classic details (includes criteria + members), but don't fail the create if Classic auth isn't available.
+        try {
+          return await this.getComputerGroupDetails(createdId);
+        } catch (detailsError) {
+          logger.info('Created smart group via Modern API, but failed to fetch Classic details; returning Modern response', {
+            status: getAxiosErrorStatus(detailsError),
+            data: getAxiosErrorData(detailsError),
+          });
+          return response.data ?? { id: createdId, name };
+        }
       }
 
       return response.data;
@@ -2094,6 +3604,16 @@ export class JamfApiClientHybrid {
       logger.info('Modern API failed, trying Classic API...', {
         status: getAxiosErrorStatus(error),
         data: getAxiosErrorData(error),
+      });
+
+      if (!this.shouldFallbackToClassicOnModernError(error)) {
+        // Surface Modern errors directly to avoid masking validation errors with Classic 401s.
+        throw error;
+      }
+
+      logger.info('Falling back to Classic API for smart group create', {
+        canCallClassicApi: this.canCallClassicApi(),
+        status: getAxiosErrorStatus(error),
       });
 
       // Fall back to Classic API
@@ -2161,6 +3681,15 @@ export class JamfApiClientHybrid {
         data: getAxiosErrorData(error),
       });
 
+      if (!this.shouldFallbackToClassicOnModernError(error)) {
+        throw error;
+      }
+
+      logger.info('Falling back to Classic API for smart group update', {
+        canCallClassicApi: this.canCallClassicApi(),
+        status: getAxiosErrorStatus(error),
+      });
+
       // Fall back to Classic API
       try {
         const xmlPayload = this.buildClassicSmartGroupXml(newName, newCriteria, resolvedSiteId);
@@ -2212,7 +3741,14 @@ export class JamfApiClientHybrid {
 
       return response.data;
     } catch (error) {
-      logger.info('Modern API failed, trying Classic API...');
+      logger.info('Modern API failed, trying Classic API...', {
+        status: getAxiosErrorStatus(error),
+        data: getAxiosErrorData(error),
+      });
+
+      if (!this.shouldFallbackToClassicOnModernError(error)) {
+        throw error;
+      }
       
       // Fall back to Classic API
       try {
@@ -2276,7 +3812,14 @@ export class JamfApiClientHybrid {
 
       return response.data;
     } catch (error) {
-      logger.info('Modern API failed, trying Classic API...');
+      logger.info('Modern API failed, trying Classic API...', {
+        status: getAxiosErrorStatus(error),
+        data: getAxiosErrorData(error),
+      });
+
+      if (!this.shouldFallbackToClassicOnModernError(error)) {
+        throw error;
+      }
       
       // Classic API requires XML format for updates
       try {
@@ -2339,7 +3882,14 @@ export class JamfApiClientHybrid {
       await this.axiosInstance.delete(`/api/v1/computer-groups/${groupId}`);
       logger.info(`Successfully deleted computer group ${groupId}`);
     } catch (error) {
-      logger.info('Modern API failed, trying Classic API...');
+      logger.info('Modern API failed, trying Classic API...', {
+        status: getAxiosErrorStatus(error),
+        data: getAxiosErrorData(error),
+      });
+
+      if (!this.shouldFallbackToClassicOnModernError(error)) {
+        throw error;
+      }
       
       // Fall back to Classic API
       try {
@@ -2370,7 +3920,13 @@ export class JamfApiClientHybrid {
       
       return response.data.results || [];
     } catch (error) {
-      logger.info('Modern API failed, trying Classic API...');
+      logger.info('Modern API failed, trying Classic API...', {
+        status: getAxiosErrorStatus(error),
+        data: getAxiosErrorData(error),
+      });
+      if (!this.shouldFallbackToClassicOnModernError(error, { allowOn403: true })) {
+        throw error;
+      }
     }
     
     // Try Classic API
@@ -2403,7 +3959,13 @@ export class JamfApiClientHybrid {
       const response = await this.axiosInstance.get(`/api/v2/mobile-devices/${deviceId}/detail`);
       return response.data;
     } catch (error) {
-      logger.info('Modern API failed, trying Classic API...');
+      logger.info('Modern API failed, trying Classic API...', {
+        status: getAxiosErrorStatus(error),
+        data: getAxiosErrorData(error),
+      });
+      if (!this.shouldFallbackToClassicOnModernError(error, { allowOn403: true })) {
+        throw error;
+      }
     }
     
     // Try Classic API
@@ -2440,7 +4002,14 @@ export class JamfApiClientHybrid {
       await this.axiosInstance.post(`/api/v2/mobile-devices/${deviceId}/update-inventory`);
       logger.info(`Mobile device inventory update requested for device ${deviceId}`);
     } catch (error) {
-      logger.info('Modern API failed, trying Classic API...');
+      logger.info('Modern API failed, trying Classic API...', {
+        status: getAxiosErrorStatus(error),
+        data: getAxiosErrorData(error),
+      });
+
+      if (!this.shouldFallbackToClassicOnModernError(error)) {
+        throw error;
+      }
       
       // Try Classic API using MDM commands
       try {
@@ -2533,7 +4102,14 @@ export class JamfApiClientHybrid {
       
       logger.info(`Successfully sent MDM command '${command}' to device ${deviceId}`);
     } catch (error) {
-      logger.info('Modern API failed, trying Classic API...');
+      logger.info('Modern API failed, trying Classic API...', {
+        status: getAxiosErrorStatus(error),
+        data: getAxiosErrorData(error),
+      });
+
+      if (!this.shouldFallbackToClassicOnModernError(error)) {
+        throw error;
+      }
       
       // Try Classic API
       try {
@@ -2570,6 +4146,9 @@ export class JamfApiClientHybrid {
         status: getAxiosErrorStatus(error),
         data: getAxiosErrorData(error),
       });
+      if (!this.shouldFallbackToClassicOnModernError(error, { allowOn403: true })) {
+        throw error;
+      }
     }
 
     // Fall back to Classic API
@@ -2648,6 +4227,9 @@ export class JamfApiClientHybrid {
         status: getAxiosErrorStatus(error),
         data: getAxiosErrorData(error),
       });
+      if (!this.shouldFallbackToClassicOnModernError(error)) {
+        throw error;
+      }
     }
 
     // Fall back to Classic API
@@ -2714,14 +4296,19 @@ export class JamfApiClientHybrid {
       logger.info(`Updating script ${scriptId} using Modern API...`);
       const response = await this.axiosInstance.put(`/api/v1/scripts/${scriptId}`, modernPayload);
       if (response.data?.id) {
-        return await this.getScriptDetails(String(response.data.id));
+        const updatedScript = await this.getScriptDetails(String(response.data.id));
+        return await this.verifyScriptUpdatePersisted(String(response.data.id), scriptData, updatedScript);
       }
-      return this.normalizeScript(response.data);
+      const normalizedScript = this.normalizeScript(response.data);
+      return await this.verifyScriptUpdatePersisted(scriptId, scriptData, normalizedScript);
     } catch (error) {
       logger.info('Modern API failed, trying Classic API...', {
         status: getAxiosErrorStatus(error),
         data: getAxiosErrorData(error),
       });
+      if (!this.shouldFallbackToClassicOnModernError(error)) {
+        throw error;
+      }
     }
 
     // Fall back to Classic API
@@ -2743,7 +4330,8 @@ export class JamfApiClientHybrid {
       );
 
       // Fetch and return the updated script details
-      return await this.getScriptDetails(scriptId);
+      const updatedScript = await this.getScriptDetails(scriptId);
+      return await this.verifyScriptUpdatePersisted(scriptId, scriptData, updatedScript);
     } catch (error) {
       logger.info('Failed to update script:', error);
       throw error;
@@ -2771,6 +4359,9 @@ export class JamfApiClientHybrid {
         status: getAxiosErrorStatus(error),
         data: getAxiosErrorData(error),
       });
+      if (!this.shouldFallbackToClassicOnModernError(error)) {
+        throw error;
+      }
     }
 
     // Fall back to Classic API
@@ -2805,7 +4396,10 @@ export class JamfApiClientHybrid {
     if (scriptData.filename) xml += `  <filename>${escapeXml(scriptData.filename)}</filename>\n`;
     if (scriptData.info) xml += `  <info>${escapeXml(scriptData.info)}</info>\n`;
     if (scriptData.notes) xml += `  <notes>${escapeXml(scriptData.notes)}</notes>\n`;
-    if (scriptData.priority) xml += `  <priority>${escapeXml(scriptData.priority)}</priority>\n`;
+    if (scriptData.priority) {
+      const normalizedPriority = normalizeScriptPriority(scriptData.priority) ?? String(scriptData.priority);
+      xml += `  <priority>${escapeXml(normalizedPriority)}</priority>\n`;
+    }
     
     // Parameters
     if (scriptData.parameters) {
@@ -2863,7 +4457,14 @@ export class JamfApiClientHybrid {
       
       return groups;
     } catch (error) {
-      logger.info('Modern API failed, trying Classic API...');
+      logger.info('Modern API failed, trying Classic API...', {
+        status: getAxiosErrorStatus(error),
+        data: getAxiosErrorData(error),
+      });
+
+      if (!this.shouldFallbackToClassicOnModernError(error, { allowOn403: true })) {
+        throw error;
+      }
       
       // Fall back to Classic API
       try {
@@ -2907,7 +4508,14 @@ export class JamfApiClientHybrid {
       const response = await this.axiosInstance.get(`/api/v1/mobile-device-groups/${groupId}`);
       return response.data;
     } catch (error) {
-      logger.info('Modern API failed, trying Classic API...');
+      logger.info('Modern API failed, trying Classic API...', {
+        status: getAxiosErrorStatus(error),
+        data: getAxiosErrorData(error),
+      });
+
+      if (!this.shouldFallbackToClassicOnModernError(error, { allowOn403: true })) {
+        throw error;
+      }
       
       // Fall back to Classic API
       try {
@@ -3071,10 +4679,19 @@ export class JamfApiClientHybrid {
       const scripts = policy.scripts || [];
       
       // Self Service information
+      const selfServiceCategories =
+        policy.self_service?.self_service_category ??
+        policy.self_service?.self_service_categories?.category ??
+        policy.self_service?.self_service_categories ??
+        null;
+
+      const firstSelfServiceCategory =
+        Array.isArray(selfServiceCategories) ? selfServiceCategories[0] : selfServiceCategories;
+
       const selfService = {
         enabled: policy.self_service?.use_for_self_service || false,
         displayName: policy.self_service?.self_service_display_name,
-        category: policy.self_service?.self_service_category?.name,
+        category: firstSelfServiceCategory?.name ?? (typeof firstSelfServiceCategory === 'string' ? firstSelfServiceCategory : undefined),
       };
       
       // Build compliance report
@@ -3232,6 +4849,372 @@ export class JamfApiClientHybrid {
       logger.info('Failed to generate package deployment statistics:', error);
       throw error;
     }
+  }
+
+  /**
+   * List patch titles available from a specific patch source (Classic API).
+   * Source 1 is typically Jamf's built-in patch catalog.
+   */
+  private extractPatchAvailableTitleRows(payload: any): any[] {
+    const toArray = (value: any): any[] =>
+      Array.isArray(value) ? value : value && typeof value === 'object' ? [value] : [];
+
+    const candidates = [
+      payload?.patch_available_titles?.available_titles?.available_title,
+      payload?.patch_available_titles?.patch_available_title,
+      payload?.available_titles?.available_title,
+      payload?.patch_available_title,
+      payload?.available_title,
+      payload?.results,
+      payload,
+    ];
+
+    for (const candidate of candidates) {
+      const rows = toArray(candidate);
+      if (rows.length > 0) return rows;
+    }
+    return [];
+  }
+
+  private decodeXmlEntities(value: string): string {
+    return value
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&apos;/g, "'");
+  }
+
+  private parsePatchAvailableTitlesXml(xml: string): { size: string | null; rows: any[] } {
+    if (!xml) return { size: null, rows: [] };
+
+    const sizeMatch = xml.match(/<size>([^<]+)<\/size>/i);
+    const reportedSize = sizeMatch?.[1]?.trim() ?? null;
+
+    const rows: any[] = [];
+    const entryRegex = /<available_title>([\s\S]*?)<\/available_title>/gi;
+    let entryMatch: RegExpExecArray | null;
+    while ((entryMatch = entryRegex.exec(xml)) !== null) {
+      const block = entryMatch[1];
+      const getTag = (tag: string): string => {
+        const m = block.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, 'i'));
+        return m ? this.decodeXmlEntities(m[1].trim()) : '';
+      };
+
+      rows.push({
+        name_id: getTag('name_id'),
+        app_name: getTag('app_name'),
+        publisher: getTag('publisher'),
+        current_version: getTag('current_version'),
+        last_modified: getTag('last_modified'),
+      });
+    }
+
+    return { size: reportedSize, rows };
+  }
+
+  async listPatchAvailableTitles(sourceId: string = '1'): Promise<any> {
+    await this.ensureAuthenticated();
+
+    const endpoint = `/JSSResource/patchavailabletitles/sourceid/${encodeURIComponent(sourceId)}`;
+
+    const jsonResponse = await this.axiosInstance.get(endpoint, {
+      headers: { Accept: 'application/json' },
+    });
+    const jsonPayload = jsonResponse.data;
+
+    const jsonRows = this.extractPatchAvailableTitleRows(jsonPayload);
+    const reportedSize = Number(jsonPayload?.patch_available_titles?.size ?? 0);
+
+    // Some Jamf tenants return only one row in JSON even when size reports many titles.
+    // In that case, fall back to XML and parse all entries.
+    if (reportedSize > 0 && jsonRows.length <= 1) {
+      try {
+        const xmlResponse = await this.axiosInstance.get(endpoint, {
+          headers: { Accept: 'application/xml' },
+          responseType: 'text' as any,
+          transformResponse: (d: any) => d,
+        });
+        const xmlPayload = String((xmlResponse as any).data ?? '');
+        const parsed = this.parsePatchAvailableTitlesXml(xmlPayload);
+
+        if (parsed.rows.length > jsonRows.length) {
+          return {
+            patch_available_titles: {
+              size: parsed.size ?? String(reportedSize || parsed.rows.length),
+              available_titles: {
+                available_title: parsed.rows,
+              },
+            },
+          };
+        }
+      } catch (error) {
+        logger.warn('Patch available titles XML fallback failed; returning JSON payload', {
+          status: getAxiosErrorStatus(error),
+          data: getAxiosErrorData(error),
+        });
+      }
+    }
+
+    return jsonPayload;
+  }
+
+  /**
+   * List patch policies (Jamf Pro Patch Management, Modern API).
+   */
+  async listPatchPolicies(limit: number = 100): Promise<any> {
+    await this.ensureAuthenticated();
+
+    const response = await this.axiosInstance.get('/api/v2/patch-policies', {
+      params: { 'page-size': limit },
+    });
+    return response.data;
+  }
+
+  /**
+   * Get patch policy logs by policy ID (Jamf Pro Patch Management, Modern API).
+   */
+  async getPatchPolicyLogs(policyId: string, limit: number = 100): Promise<any> {
+    await this.ensureAuthenticated();
+
+    const response = await this.axiosInstance.get(`/api/v2/patch-policies/${policyId}/logs`, {
+      params: { 'page-size': limit },
+    });
+    return response.data;
+  }
+
+  /**
+   * Retry patch policy logs.
+   * - retryAll=true uses /retry-all
+   * - otherwise uses /retry with optional payload
+   */
+  async retryPatchPolicyLogs(policyId: string, retryAll: boolean = false, payload?: any): Promise<any> {
+    if (this._readOnlyMode) {
+      throw new Error('Cannot retry patch policy logs in read-only mode');
+    }
+
+    await this.ensureAuthenticated();
+
+    if (retryAll) {
+      const response = await this.axiosInstance.post(`/api/v2/patch-policies/${policyId}/logs/retry-all`);
+      return response.data;
+    }
+
+    const response =
+      payload === undefined
+        ? await this.axiosInstance.post(`/api/v2/patch-policies/${policyId}/logs/retry`)
+        : await this.axiosInstance.post(`/api/v2/patch-policies/${policyId}/logs/retry`, payload);
+    return response.data;
+  }
+
+  /**
+   * List patch software title configurations.
+   */
+  async listPatchSoftwareTitleConfigurations(limit: number = 100): Promise<any> {
+    await this.ensureAuthenticated();
+
+    const response = await this.axiosInstance.get('/api/v2/patch-software-title-configurations', {
+      params: { 'page-size': limit },
+    });
+    return response.data;
+  }
+
+  /**
+   * Get patch software title configuration by ID.
+   */
+  async getPatchSoftwareTitleConfiguration(configId: string): Promise<any> {
+    await this.ensureAuthenticated();
+
+    const response = await this.axiosInstance.get(`/api/v2/patch-software-title-configurations/${configId}`);
+    return response.data;
+  }
+
+  /**
+   * Get patch report for a patch software title configuration.
+   */
+  async getPatchSoftwareTitleConfigurationReport(configId: string): Promise<any> {
+    await this.ensureAuthenticated();
+
+    const response = await this.axiosInstance.get(`/api/v2/patch-software-title-configurations/${configId}/patch-report`);
+    return response.data;
+  }
+
+  /**
+   * Get patch summary (aggregated) for a patch software title configuration.
+   */
+  async getPatchSoftwareTitleConfigurationSummary(configId: string): Promise<any> {
+    await this.ensureAuthenticated();
+
+    const response = await this.axiosInstance.get(`/api/v2/patch-software-title-configurations/${configId}/patch-summary`);
+    return response.data;
+  }
+
+  /**
+   * Get patch summary by versions for a patch software title configuration.
+   */
+  async getPatchSoftwareTitleConfigurationVersionSummary(configId: string): Promise<any> {
+    await this.ensureAuthenticated();
+
+    const response = await this.axiosInstance.get(
+      `/api/v2/patch-software-title-configurations/${configId}/patch-summary/versions`
+    );
+    return response.data;
+  }
+
+  /**
+   * Create patch software title configuration.
+   */
+  async createPatchSoftwareTitleConfiguration(config: any): Promise<any> {
+    if (this._readOnlyMode) {
+      throw new Error('Cannot create patch software title configurations in read-only mode');
+    }
+
+    await this.ensureAuthenticated();
+
+    const response = await this.axiosInstance.post('/api/v2/patch-software-title-configurations', config);
+    const configId = this.extractPatchSoftwareTitleConfigurationId(response.data);
+    const strictEnabled = String(process.env.JAMF_PATCH_VERIFY_ENABLED ?? 'true').toLowerCase() !== 'false';
+    if (strictEnabled && !configId) {
+      throw new Error(
+        'Patch software title configuration create did not return an id; cannot verify persistence in strict mode'
+      );
+    }
+    if (!configId) return response.data;
+    return await this.verifyPatchSoftwareTitleConfigurationPersisted(
+      configId,
+      config,
+      response.data,
+      { topLevelOnly: true }
+    );
+  }
+
+  /**
+   * Update patch software title configuration.
+   */
+  async updatePatchSoftwareTitleConfiguration(configId: string, updates: any): Promise<any> {
+    if (this._readOnlyMode) {
+      throw new Error('Cannot update patch software title configurations in read-only mode');
+    }
+
+    await this.ensureAuthenticated();
+
+    const response = await this.axiosInstance.patch(
+      `/api/v2/patch-software-title-configurations/${configId}`,
+      updates,
+      {
+        headers: {
+          'Content-Type': 'application/merge-patch+json',
+        },
+      }
+    );
+    return await this.verifyPatchSoftwareTitleConfigurationPersisted(configId, updates, response.data);
+  }
+
+  /**
+   * Delete patch software title configuration.
+   */
+  async deletePatchSoftwareTitleConfiguration(configId: string): Promise<any> {
+    if (this._readOnlyMode) {
+      throw new Error('Cannot delete patch software title configurations in read-only mode');
+    }
+
+    await this.ensureAuthenticated();
+
+    const response = await this.axiosInstance.delete(`/api/v2/patch-software-title-configurations/${configId}`);
+    await this.verifyPatchSoftwareTitleConfigurationDeleted(configId);
+    return response.data;
+  }
+
+  /**
+   * Retrieve available managed software updates.
+   */
+  async getManagedSoftwareUpdatesAvailable(): Promise<any> {
+    await this.ensureAuthenticated();
+
+    const response = await this.axiosInstance.get('/api/v1/managed-software-updates/available-updates');
+    return response.data;
+  }
+
+  /**
+   * Retrieve Managed Software Update plans feature-toggle details.
+   */
+  async getManagedSoftwareUpdatePlansFeatureToggle(): Promise<any> {
+    await this.ensureAuthenticated();
+
+    const response = await this.axiosInstance.get('/api/v1/managed-software-updates/plans/feature-toggle');
+    return response.data;
+  }
+
+  /**
+   * Retrieve Managed Software Update plans feature-toggle status.
+   */
+  async getManagedSoftwareUpdatePlansFeatureToggleStatus(): Promise<any> {
+    await this.ensureAuthenticated();
+
+    const response = await this.axiosInstance.get('/api/v1/managed-software-updates/plans/feature-toggle/status');
+    return response.data;
+  }
+
+  /**
+   * Retrieve managed software update statuses.
+   */
+  async getManagedSoftwareUpdateStatuses(limit: number = 100): Promise<any> {
+    await this.ensureAuthenticated();
+
+    const response = await this.axiosInstance.get('/api/v1/managed-software-updates/update-statuses', {
+      params: { 'page-size': limit },
+    });
+    return response.data;
+  }
+
+  /**
+   * List managed software update plans.
+   */
+  async listManagedSoftwareUpdatePlans(limit: number = 100): Promise<any> {
+    await this.ensureAuthenticated();
+
+    const response = await this.axiosInstance.get('/api/v1/managed-software-updates/plans', {
+      params: { 'page-size': limit },
+    });
+    return response.data;
+  }
+
+  /**
+   * Get a managed software update plan by ID.
+   */
+  async getManagedSoftwareUpdatePlan(planId: string): Promise<any> {
+    await this.ensureAuthenticated();
+
+    const response = await this.axiosInstance.get(`/api/v1/managed-software-updates/plans/${planId}`);
+    return response.data;
+  }
+
+  /**
+   * Create a managed software update plan.
+   */
+  async createManagedSoftwareUpdatePlan(plan: any): Promise<any> {
+    if (this._readOnlyMode) {
+      throw new Error('Cannot create managed software update plans in read-only mode');
+    }
+
+    await this.ensureAuthenticated();
+
+    const response = await this.axiosInstance.post('/api/v1/managed-software-updates/plans', plan);
+    return response.data;
+  }
+
+  /**
+   * Create managed software update plans for a group.
+   */
+  async createManagedSoftwareUpdatePlanForGroup(plan: any): Promise<any> {
+    if (this._readOnlyMode) {
+      throw new Error('Cannot create managed software update plans for a group in read-only mode');
+    }
+
+    await this.ensureAuthenticated();
+
+    const response = await this.axiosInstance.post('/api/v1/managed-software-updates/plans/group', plan);
+    return response.data;
   }
 
   /**

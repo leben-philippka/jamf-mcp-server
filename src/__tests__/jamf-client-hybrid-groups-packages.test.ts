@@ -72,6 +72,10 @@ const createClient = (): SmartGroupClient => {
 describe('JamfApiClientHybrid smart group behavior', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockAxiosInstance.get.mockReset();
+    mockAxiosInstance.post.mockReset();
+    mockAxiosInstance.put.mockReset();
+    mockAxiosInstance.delete.mockReset();
     mockAxiosCreate.mockReturnValue(mockAxiosInstance);
   });
 
@@ -97,6 +101,41 @@ describe('JamfApiClientHybrid smart group behavior', () => {
     expect(mockAxiosInstance.post.mock.calls[0][0]).toBe('/api/v2/computer-groups/smart-groups');
   });
 
+  test('createSmartComputerGroup normalizes operator mistakenly appended to criterion name', async () => {
+    const client = createClient();
+    const criteria: SmartGroupCriteriaInput[] = [
+      {
+        name: 'Application Title like',
+        priority: 0,
+        and_or: 'AND',
+        search_type: 'like',
+        value: 'timeBuzzer.app',
+      },
+    ];
+
+    mockAxiosInstance.post.mockResolvedValue({ data: { id: '101' } });
+    jestGlobals
+      .spyOn(client, 'getComputerGroupDetails')
+      .mockResolvedValue({ id: '101', name: 'Smart Group', is_smart: true });
+
+    await client.createSmartComputerGroup('Smart Group', criteria);
+
+    expect(mockAxiosInstance.post.mock.calls[0][0]).toBe('/api/v2/computer-groups/smart-groups');
+    const payload = mockAxiosInstance.post.mock.calls[0][1];
+    expect(payload).toEqual(
+      expect.objectContaining({
+        criteria: [
+          expect.objectContaining({
+            name: 'Application Title',
+            andOr: 'and',
+            searchType: 'is',
+            value: 'timeBuzzer.app',
+          }),
+        ],
+      })
+    );
+  });
+
   test('createSmartComputerGroup falls back to Classic API when Modern fails', async () => {
     const client = createClient();
     const criteria: SmartGroupCriteriaInput[] = [
@@ -110,7 +149,10 @@ describe('JamfApiClientHybrid smart group behavior', () => {
     ];
 
     mockAxiosInstance.post
-      .mockRejectedValueOnce(new Error('Modern create failed'))
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 404, data: { message: 'not found' } },
+      })
       .mockResolvedValueOnce({ data: { id: '99' } });
 
     jestGlobals
@@ -141,6 +183,31 @@ describe('JamfApiClientHybrid smart group behavior', () => {
         },
       })
     );
+  });
+
+  test('createSmartComputerGroup does not fall back to Classic API on Modern validation errors (400)', async () => {
+    const client = createClient();
+    const criteria: SmartGroupCriteriaInput[] = [
+      {
+        name: 'Application Title',
+        priority: 0,
+        and_or: 'and',
+        search_type: 'like',
+        value: 'timeBuzzer.app',
+      },
+    ];
+
+    mockAxiosInstance.post.mockRejectedValueOnce({
+      isAxiosError: true,
+      response: {
+        status: 400,
+        data: { httpStatus: 400, errors: [{ code: 'INVALID_FIELD' }] },
+      },
+    });
+
+    await expect(client.createSmartComputerGroup('No Fallback', criteria)).rejects.toBeDefined();
+    expect(mockAxiosInstance.post).toHaveBeenCalledTimes(1);
+    expect(mockAxiosInstance.post.mock.calls[0][0]).toBe('/api/v2/computer-groups/smart-groups');
   });
 
   test('updateSmartComputerGroup updates via Modern API when Modern succeeds', async () => {
@@ -200,7 +267,10 @@ describe('JamfApiClientHybrid smart group behavior', () => {
       .mockResolvedValue({ id: '123', name: 'Smart Group', is_smart: true, criteria });
 
     mockAxiosInstance.put
-      .mockRejectedValueOnce(new Error('Modern update failed'))
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 404, data: { message: 'not found' } },
+      })
       .mockResolvedValueOnce({ data: { id: '123' } });
 
     await client.updateSmartComputerGroup('123', { name: 'Updated Group', criteria });
@@ -259,6 +329,38 @@ describe('JamfApiClientHybrid smart group behavior', () => {
             andOr: 'and',
             searchType: 'like',
             value: 'C02',
+          }),
+        ],
+      })
+    );
+  });
+
+  test('createSmartComputerGroup normalizes Application Title operator for Modern API', async () => {
+    const client = createClient();
+    const criteria: SmartGroupCriteriaInput[] = [
+      {
+        name: 'Application Title',
+        priority: 0,
+        and_or: 'and',
+        search_type: 'like',
+        value: 'timeBuzzer.app',
+      },
+    ];
+
+    mockAxiosInstance.post.mockResolvedValue({ data: { id: '556' } });
+    jestGlobals
+      .spyOn(client, 'getComputerGroupDetails')
+      .mockResolvedValue({ id: '556', name: 'App Group', is_smart: true });
+
+    await client.createSmartComputerGroup('App Group', criteria);
+
+    expect(mockAxiosInstance.post.mock.calls[0][1]).toEqual(
+      expect.objectContaining({
+        criteria: [
+          expect.objectContaining({
+            name: 'Application Title',
+            searchType: 'is',
+            value: 'timeBuzzer.app',
           }),
         ],
       })
@@ -336,7 +438,10 @@ describe('JamfApiClientHybrid smart group behavior', () => {
     const client = createClient();
 
     mockAxiosInstance.post
-      .mockRejectedValueOnce(new Error('Modern create failed'))
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 404, data: { message: 'not found' } },
+      })
       .mockResolvedValueOnce({ data: { computer_group: { id: '201', name: 'Static Group' } } });
 
     await client.createStaticComputerGroup('Static Group', ['10', '20']);
@@ -404,7 +509,10 @@ describe('JamfApiClientHybrid smart group behavior', () => {
       .mockResolvedValue({ id: '200', name: 'Static & Group', is_smart: false, computers: [] });
 
     mockAxiosInstance.put
-      .mockRejectedValueOnce(new Error('Modern update failed'))
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 404, data: { message: 'not found' } },
+      })
       .mockResolvedValueOnce({ data: { success: true } });
 
     await client.updateStaticComputerGroup('200', ['10', '20']);
@@ -446,7 +554,10 @@ describe('JamfApiClientHybrid smart group behavior', () => {
   test('listPackages falls back to Classic API when Modern fails', async () => {
     const client = createClient();
     mockAxiosInstance.get
-      .mockRejectedValueOnce(new Error('Modern list failed'))
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 404, data: { message: 'not found' } },
+      })
       .mockResolvedValueOnce({ data: { packages: [{ id: '2', name: 'Classic Pkg' }] } });
 
     const packages = await client.listPackages(10);
@@ -492,7 +603,10 @@ describe('JamfApiClientHybrid smart group behavior', () => {
   test('listPackages normalizes Classic response', async () => {
     const client = createClient();
     mockAxiosInstance.get
-      .mockRejectedValueOnce(new Error('Modern list failed'))
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 404, data: { message: 'not found' } },
+      })
       .mockResolvedValueOnce({
         data: {
           packages: [
@@ -536,7 +650,10 @@ describe('JamfApiClientHybrid smart group behavior', () => {
   test('getPackageDetails falls back to Classic API when Modern fails', async () => {
     const client = createClient();
     mockAxiosInstance.get
-      .mockRejectedValueOnce(new Error('Modern details failed'))
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 404, data: { message: 'not found' } },
+      })
       .mockResolvedValueOnce({ data: { package: { id: '2', name: 'Classic Pkg' } } });
 
     await client.getPackageDetails('2');
@@ -575,7 +692,10 @@ describe('JamfApiClientHybrid smart group behavior', () => {
   test('getPackageDetails normalizes Classic response', async () => {
     const client = createClient();
     mockAxiosInstance.get
-      .mockRejectedValueOnce(new Error('Modern details failed'))
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 404, data: { message: 'not found' } },
+      })
       .mockResolvedValueOnce({
         data: {
           package: {
@@ -601,5 +721,48 @@ describe('JamfApiClientHybrid smart group behavior', () => {
       priority: 4,
       fill_user_template: false,
     });
+  });
+});
+
+describe('JamfApiClientHybrid policy frequency normalization', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockAxiosInstance.get.mockReset();
+    mockAxiosInstance.post.mockReset();
+    mockAxiosInstance.put.mockReset();
+    mockAxiosInstance.delete.mockReset();
+    mockAxiosCreate.mockReturnValue(mockAxiosInstance);
+  });
+
+  test('buildPolicyXml preserves "Once per day" (tenant-dependent) while normalizing casing', async () => {
+    const client = createClient();
+    const xml = (client as any).buildPolicyXml({
+      general: {
+        name: 'Test Policy',
+        frequency: 'Once per day',
+      },
+    });
+
+    expect(xml).toContain('<frequency>Once per day</frequency>');
+  });
+
+  test('buildPolicyXml writes self_service_categories with size and category id/name', async () => {
+    const client = createClient();
+    const xml = (client as any).buildPolicyXml({
+      self_service: {
+        use_for_self_service: true,
+        self_service_categories: {
+          category: { id: 17, name: 'Apps löschen' },
+        },
+      },
+    });
+
+    expect(xml).toContain('<self_service_category>Apps löschen</self_service_category>');
+    expect(xml).toContain('<self_service_categories>');
+    expect(xml).toContain('<size>1</size>');
+    expect(xml).toContain('<id>17</id>');
+    expect(xml).toContain('<name>Apps löschen</name>');
+    expect(xml).toContain('<display_in>true</display_in>');
+    expect(xml).toContain('<feature_in>false</feature_in>');
   });
 });

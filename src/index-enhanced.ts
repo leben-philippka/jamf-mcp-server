@@ -14,11 +14,10 @@ import { loadDotenv } from './utils/dotenv-loader.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { JamfApiClientHybrid } from './jamf-client-hybrid.js';
-import { registerTools } from './tools/index-compat.js';
+import { registerAllTools } from './tools/register-all-tools.js';
 import { registerResources } from './resources/index-compat.js';
 import { registerPrompts } from './prompts/index.js';
 import { SkillsManager } from './skills/manager.js';
-import { registerSkillsAsMCPTools } from './tools/skills-mcp-integration.js';
 import { createLogger } from './server/logger.js';
 import { validateJamfConfig, validateEnhancedModeConfig } from './utils/env-validation.js';
 
@@ -115,12 +114,9 @@ async function run() {
     } as any);
 
     // Register handlers
-    registerTools(server, jamfClient);
+    registerAllTools(server, skillsManager, jamfClient);
     registerResources(server, jamfClient);
     registerPrompts(server);
-    
-    // Register skills as MCP tools
-    registerSkillsAsMCPTools(server, skillsManager, jamfClient);
 
     // Start the server
     const transport = new StdioServerTransport();

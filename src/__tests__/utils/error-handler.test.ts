@@ -4,7 +4,8 @@ import {
   asyncHandler, 
   withTimeout,
   safeJsonParse,
-  executeWithFallback
+  executeWithFallback,
+  buildErrorContext
 } from '../../utils/error-handler.js';
 import { 
   JamfAPIError, 
@@ -38,6 +39,42 @@ describe('Error Handler Utilities', () => {
       const result = normalizeError('String error');
       expect(result).toBeInstanceOf(JamfAPIError);
       expect(result.message).toBe('String error');
+    });
+  });
+
+  describe('buildErrorContext', () => {
+    test('adds actionable suggestions for patch policy log 404 responses', () => {
+      const error: any = new Error('Request failed with status code 404');
+      error.response = {
+        status: 404,
+        data: {
+          errors: [{ description: 'Patch Policy Id 999999999 does not exist' }],
+        },
+      };
+      error.config = { method: 'get', url: '/api/v2/patch-policies/999999999/logs' };
+
+      const result = buildErrorContext(error, 'Execute tool: getPatchPolicyLogs', 'index-compat');
+
+      expect(result.code).toBe('HTTP_404');
+      expect(result.message).toContain('Patch Policy Id 999999999 does not exist');
+      expect(result.suggestions?.[0]).toContain('listPatchPolicies');
+    });
+
+    test('adds toggle guidance for managed software update 503 responses', () => {
+      const error: any = new Error('Request failed with status code 503');
+      error.response = {
+        status: 503,
+        data: {
+          errors: [{ description: 'This endpoint cannot be used if the Managed Software Update Plans toggle is off.' }],
+        },
+      };
+      error.config = { method: 'get', url: '/api/v1/managed-software-updates/available-updates' };
+
+      const result = buildErrorContext(error, 'Execute tool: getManagedSoftwareUpdatesAvailable', 'index-compat');
+
+      expect(result.code).toBe('HTTP_503');
+      expect(result.message).toContain('toggle is off');
+      expect(result.suggestions?.[0]).toContain('Managed Software Update Plans is disabled');
     });
   });
 

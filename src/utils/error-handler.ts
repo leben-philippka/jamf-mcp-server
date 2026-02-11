@@ -278,6 +278,109 @@ export interface StructuredErrorResponse {
   retryAfterMs?: number;
 }
 
+type AxiosLikeError = Error & {
+  response?: {
+    status?: number;
+    data?: unknown;
+  };
+  config?: {
+    method?: string;
+    url?: string;
+  };
+};
+
+function extractResponseDetail(data: unknown): string | undefined {
+  if (!data) return undefined;
+  if (typeof data === 'string') {
+    const text = data.trim();
+    return text.length > 0 ? text : undefined;
+  }
+  if (typeof data !== 'object') return undefined;
+
+  const obj = data as Record<string, any>;
+  const direct =
+    obj.message ??
+    obj.error ??
+    obj.detail ??
+    obj.description;
+  if (typeof direct === 'string' && direct.trim().length > 0) {
+    return direct.trim();
+  }
+
+  const firstError = Array.isArray(obj.errors) ? obj.errors[0] : undefined;
+  const firstErrorMessage =
+    firstError?.description ??
+    firstError?.message ??
+    firstError?.title ??
+    firstError?.code;
+  if (typeof firstErrorMessage === 'string' && firstErrorMessage.trim().length > 0) {
+    return firstErrorMessage.trim();
+  }
+
+  return undefined;
+}
+
+function isManagedSoftwareToggleOff(url?: string, detail?: string): boolean {
+  if (!url || !detail) return false;
+  const u = url.toLowerCase();
+  const d = detail.toLowerCase();
+  return u.includes('/api/v1/managed-software-updates/') && d.includes('toggle') && d.includes('off');
+}
+
+function getHttpSuggestions(statusCode: number, url?: string, detail?: string): string[] {
+  const lowerUrl = (url ?? '').toLowerCase();
+
+  if (statusCode === 404 && lowerUrl.includes('/api/v2/patch-policies/') && lowerUrl.includes('/logs')) {
+    return [
+      'Use listPatchPolicies first and pass a valid policyId from that result.',
+      'If listPatchPolicies reports totalCount = 0, create a Patch Management policy in Jamf Pro first.',
+    ];
+  }
+
+  if (statusCode === 503 && isManagedSoftwareToggleOff(url, detail)) {
+    return [
+      'Managed Software Update Plans is disabled in Jamf Pro for this tenant.',
+      'Run getManagedSoftwareUpdatePlansFeatureToggleStatus and enable the toggle before retrying.',
+    ];
+  }
+
+  if (statusCode === 404) {
+    return [
+      'Verify the provided ID exists in Jamf Pro.',
+      'List resources first and reuse an ID from list output before calling detail/log tools.',
+    ];
+  }
+
+  if (statusCode === 503) {
+    return [
+      'Jamf returned a temporary service error. Retry after a short delay.',
+      'Check tenant feature toggles and Jamf cloud status if this persists.',
+    ];
+  }
+
+  if (statusCode === 403) {
+    return [
+      'The current API role likely lacks permissions for this endpoint.',
+      'Grant the corresponding Jamf API privilege and retry.',
+    ];
+  }
+
+  if (statusCode === 401) {
+    return [
+      'Check OAuth credentials and token configuration.',
+      'If Classic writes fail with Bearer tokens, configure JAMF_USERNAME and JAMF_PASSWORD as fallback.',
+    ];
+  }
+
+  return [];
+}
+
+function formatHttpMessage(statusCode: number, method?: string, url?: string, detail?: string): string {
+  const requestLabel = [method?.toUpperCase(), url].filter(Boolean).join(' ');
+  const prefix = requestLabel ? `HTTP ${statusCode} ${requestLabel}` : `HTTP ${statusCode}`;
+  return detail ? `${prefix}: ${detail}` : prefix;
+}
+
 /**
  * Build structured error context from an unknown error
  * Preserves stack traces through promise chains
@@ -309,20 +412,29 @@ export function buildErrorContext(
 
   if (error instanceof Error) {
     // Check for Axios-style errors with response property
-    const axiosError = error as { response?: { status?: number; data?: unknown } };
+    const axiosError = error as AxiosLikeError;
     const statusCode = axiosError.response?.status;
+    const responseData = axiosError.response?.data;
+    const method = axiosError.config?.method;
+    const url = axiosError.config?.url;
+    const detail = extractResponseDetail(responseData);
+    const suggestions = statusCode ? getHttpSuggestions(statusCode, url, detail) : undefined;
+    const message = statusCode ? formatHttpMessage(statusCode, method, url, detail || error.message) : error.message;
 
     return {
       operation,
-      message: error.message,
+      message,
       code: statusCode ? `HTTP_${statusCode}` : 'ERROR',
       component,
       stack: error.stack,
       metadata: {
         ...(metadata || {}),
         ...(statusCode ? { statusCode } : {}),
-        ...(axiosError.response?.data ? { responseData: axiosError.response.data } : {}),
+        ...(method ? { method: method.toUpperCase() } : {}),
+        ...(url ? { url } : {}),
+        ...(responseData ? { responseData } : {}),
       },
+      suggestions,
       timestamp,
     };
   }
