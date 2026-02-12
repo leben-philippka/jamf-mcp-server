@@ -2333,8 +2333,8 @@ export class JamfApiClientHybrid {
       return initialPolicy ?? (await this.getPolicyDetails(policyId));
     }
 
-    const attempts = Math.max(1, Number(process.env.JAMF_POLICY_VERIFY_ATTEMPTS ?? 12));
-    const delayMs = Math.max(0, Number(process.env.JAMF_POLICY_VERIFY_DELAY_MS ?? 300));
+    const attempts = Math.max(1, Number(process.env.JAMF_POLICY_VERIFY_ATTEMPTS ?? 20));
+    const delayMs = Math.max(0, Number(process.env.JAMF_POLICY_VERIFY_DELAY_MS ?? 500));
     const requireXmlVerification = String(process.env.JAMF_POLICY_VERIFY_REQUIRE_XML ?? 'true').toLowerCase() !== 'false';
     const xmlExpectations = requireXmlVerification
       ? expectations.filter((exp) => this.isPolicyXmlVerifiableExpectation(exp.path, exp.expected))
