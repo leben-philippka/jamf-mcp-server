@@ -1431,6 +1431,11 @@ export class JamfApiClientHybrid {
       const response = await this.axiosInstance.get(`/JSSResource/policies/id/${policyId}`, {
         headers: {
           Accept: 'application/xml',
+          'Cache-Control': 'no-cache',
+          Pragma: 'no-cache',
+        },
+        params: {
+          _ts: Date.now(),
         },
         // axios returns a string for non-JSON content-types in Node.
         responseType: 'text' as any,
@@ -2328,8 +2333,8 @@ export class JamfApiClientHybrid {
       return initialPolicy ?? (await this.getPolicyDetails(policyId));
     }
 
-    const attempts = Math.max(1, Number(process.env.JAMF_POLICY_VERIFY_ATTEMPTS ?? 8));
-    const delayMs = Math.max(0, Number(process.env.JAMF_POLICY_VERIFY_DELAY_MS ?? 250));
+    const attempts = Math.max(1, Number(process.env.JAMF_POLICY_VERIFY_ATTEMPTS ?? 12));
+    const delayMs = Math.max(0, Number(process.env.JAMF_POLICY_VERIFY_DELAY_MS ?? 300));
     const requireXmlVerification = String(process.env.JAMF_POLICY_VERIFY_REQUIRE_XML ?? 'true').toLowerCase() !== 'false';
     const xmlExpectations = requireXmlVerification
       ? expectations.filter((exp) => this.isPolicyXmlVerifiableExpectation(exp.path, exp.expected))

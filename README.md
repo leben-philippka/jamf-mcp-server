@@ -437,7 +437,11 @@ Add these optional environment variables:
     "JAMF_ENABLE_CIRCUIT_BREAKER": "false", // Enable circuit breaker (default: false)
     "MCP_STDIO_GUARD_ENABLED": "true",      // Auto-clean stdio ghost processes
     "MCP_STDIO_IDLE_TIMEOUT_MS": "1800000", // 30m idle timeout; set 0 to disable
-    "MCP_STDIO_PARENT_CHECK_INTERVAL_MS": "30000" // 30s parent watchdog; set 0 to disable
+    "MCP_STDIO_PARENT_CHECK_INTERVAL_MS": "30000", // 30s parent watchdog; set 0 to disable
+    "JAMF_POLICY_VERIFY_ATTEMPTS": "12",                // Strict policy verification attempts
+    "JAMF_POLICY_VERIFY_DELAY_MS": "300",                // Base delay between verification reads
+    "JAMF_POLICY_VERIFY_REQUIRED_CONSISTENT_READS": "2", // Consecutive matching reads required
+    "JAMF_POLICY_VERIFY_REQUIRE_XML": "true"             // Require XML + JSON convergence
   }
 }
 ```
