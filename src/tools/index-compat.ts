@@ -421,6 +421,18 @@ const CreatePolicyDataSchema = z.object({
           'Self Service categories for this policy. The server writes Classic policy XML <self_service_categories><size>... and includes display_in/feature_in defaults.'
         ),
     }).optional().describe('Self Service settings'),
+    maintenance: z.object({
+      recon: z.boolean().optional().describe('Update inventory (recon) after policy'),
+      reset_name: z.boolean().optional().describe('Reset computer name'),
+      install_all_cached_packages: z.boolean().optional().describe('Install all cached packages'),
+      heal: z.boolean().optional().describe('Run heal'),
+      prebindings: z.boolean().optional().describe('Update prebindings'),
+      permissions: z.boolean().optional().describe('Repair permissions'),
+      byhost: z.boolean().optional().describe('Fix ByHost files'),
+      system_cache: z.boolean().optional().describe('Clear system cache'),
+      user_cache: z.boolean().optional().describe('Clear user cache'),
+      verify: z.boolean().optional().describe('Verify disk'),
+    }).optional().describe('Maintenance actions'),
     package_configuration: z.object({
       packages: z.array(z.object({
         id: z.number().describe('Package ID'),
@@ -525,6 +537,18 @@ const UpdatePolicyDataSchema = z.object({
           'Self Service categories for this policy. The server writes Classic policy XML <self_service_categories><size>... and includes display_in/feature_in defaults.'
         ),
     }).optional().describe('Self Service settings to update'),
+    maintenance: z.object({
+      recon: z.boolean().optional().describe('Update inventory (recon) after policy'),
+      reset_name: z.boolean().optional().describe('Reset computer name'),
+      install_all_cached_packages: z.boolean().optional().describe('Install all cached packages'),
+      heal: z.boolean().optional().describe('Run heal'),
+      prebindings: z.boolean().optional().describe('Update prebindings'),
+      permissions: z.boolean().optional().describe('Repair permissions'),
+      byhost: z.boolean().optional().describe('Fix ByHost files'),
+      system_cache: z.boolean().optional().describe('Clear system cache'),
+      user_cache: z.boolean().optional().describe('Clear user cache'),
+      verify: z.boolean().optional().describe('Verify disk'),
+    }).optional().describe('Maintenance actions to update'),
     package_configuration: z.object({
       packages: z.array(z.object({
         id: z.number().describe('Package ID'),
@@ -2235,6 +2259,22 @@ export function createBaseToolHandlers(jamfClient: any): {
 	                    },
 	                  },
 	                },
+                maintenance: {
+                  type: 'object',
+                  description: 'Maintenance actions',
+                  properties: {
+                    recon: { type: 'boolean', description: 'Update inventory (recon) after policy' },
+                    reset_name: { type: 'boolean', description: 'Reset computer name' },
+                    install_all_cached_packages: { type: 'boolean', description: 'Install all cached packages' },
+                    heal: { type: 'boolean', description: 'Run heal' },
+                    prebindings: { type: 'boolean', description: 'Update prebindings' },
+                    permissions: { type: 'boolean', description: 'Repair permissions' },
+                    byhost: { type: 'boolean', description: 'Fix ByHost files' },
+                    system_cache: { type: 'boolean', description: 'Clear system cache' },
+                    user_cache: { type: 'boolean', description: 'Clear user cache' },
+                    verify: { type: 'boolean', description: 'Verify disk' },
+                  },
+                },
                 package_configuration: {
                   type: 'object',
                   description: 'Package configuration',
@@ -2452,6 +2492,22 @@ export function createBaseToolHandlers(jamfClient: any): {
 	                    },
 	                  },
 	                },
+                maintenance: {
+                  type: 'object',
+                  description: 'Maintenance actions to update',
+                  properties: {
+                    recon: { type: 'boolean', description: 'Update inventory (recon) after policy' },
+                    reset_name: { type: 'boolean', description: 'Reset computer name' },
+                    install_all_cached_packages: { type: 'boolean', description: 'Install all cached packages' },
+                    heal: { type: 'boolean', description: 'Run heal' },
+                    prebindings: { type: 'boolean', description: 'Update prebindings' },
+                    permissions: { type: 'boolean', description: 'Repair permissions' },
+                    byhost: { type: 'boolean', description: 'Fix ByHost files' },
+                    system_cache: { type: 'boolean', description: 'Clear system cache' },
+                    user_cache: { type: 'boolean', description: 'Clear user cache' },
+                    verify: { type: 'boolean', description: 'Verify disk' },
+                  },
+                },
                 package_configuration: {
                   type: 'object',
                   description: 'Package configuration to update',

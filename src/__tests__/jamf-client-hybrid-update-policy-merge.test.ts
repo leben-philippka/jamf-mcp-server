@@ -412,4 +412,121 @@ describe('JamfApiClientHybrid updatePolicy classic merge behavior', () => {
       process.env.JAMF_POLICY_VERIFY_REQUIRE_XML = prevRequireXml;
     }
   });
+
+  test('updatePolicy writes maintenance fields into Classic policy XML patch', async () => {
+    const client = createClient();
+    const prevAttempts = process.env.JAMF_POLICY_VERIFY_ATTEMPTS;
+    const prevDelay = process.env.JAMF_POLICY_VERIFY_DELAY_MS;
+    const prevConsistentReads = process.env.JAMF_POLICY_VERIFY_REQUIRED_CONSISTENT_READS;
+    const prevRequireXml = process.env.JAMF_POLICY_VERIFY_REQUIRE_XML;
+    process.env.JAMF_POLICY_VERIFY_ATTEMPTS = '1';
+    process.env.JAMF_POLICY_VERIFY_DELAY_MS = '0';
+    process.env.JAMF_POLICY_VERIFY_REQUIRED_CONSISTENT_READS = '1';
+    process.env.JAMF_POLICY_VERIFY_REQUIRE_XML = 'false';
+
+    try {
+      mockAxiosInstance.get.mockResolvedValueOnce({
+        data:
+          '<?xml version="1.0" encoding="UTF-8"?>' +
+          '<policy>' +
+          '<general><name>Auto Update - Google Chrome</name></general>' +
+          '<maintenance><recon>false</recon></maintenance>' +
+          '</policy>',
+      });
+
+      mockAxiosInstance.put.mockResolvedValueOnce({ data: {} });
+
+      mockAxiosInstance.get.mockResolvedValueOnce({
+        data: {
+          policy: {
+            id: 134,
+            general: { name: 'Auto Update - Google Chrome' },
+            maintenance: { recon: true, permissions: true },
+          },
+        },
+      });
+
+      mockAxiosInstance.get.mockResolvedValueOnce({
+        data: {
+          policy: {
+            id: 134,
+            general: { name: 'Auto Update - Google Chrome' },
+            maintenance: { recon: true, permissions: true },
+          },
+        },
+      });
+
+      await client.updatePolicy('134', {
+        maintenance: {
+          recon: true,
+          permissions: true,
+        },
+      });
+
+      expect(mockAxiosInstance.put).toHaveBeenCalled();
+      const putArgs = mockAxiosInstance.put.mock.calls[0];
+      expect(putArgs[0]).toBe('/JSSResource/policies/id/134');
+      const xml = String(putArgs[1] ?? '');
+      expect(xml).toContain('<maintenance>');
+      expect(xml).toContain('<recon>true</recon>');
+      expect(xml).toContain('<permissions>true</permissions>');
+      expect(xml).toContain('<name>Auto Update - Google Chrome</name>');
+    } finally {
+      process.env.JAMF_POLICY_VERIFY_ATTEMPTS = prevAttempts;
+      process.env.JAMF_POLICY_VERIFY_DELAY_MS = prevDelay;
+      process.env.JAMF_POLICY_VERIFY_REQUIRED_CONSISTENT_READS = prevConsistentReads;
+      process.env.JAMF_POLICY_VERIFY_REQUIRE_XML = prevRequireXml;
+    }
+  });
+
+  test('updatePolicy strict mode verifies maintenance fields against XML source', async () => {
+    const client = createClient();
+
+    const prevAttempts = process.env.JAMF_POLICY_VERIFY_ATTEMPTS;
+    const prevDelay = process.env.JAMF_POLICY_VERIFY_DELAY_MS;
+    const prevConsistentReads = process.env.JAMF_POLICY_VERIFY_REQUIRED_CONSISTENT_READS;
+    const prevRequireXml = process.env.JAMF_POLICY_VERIFY_REQUIRE_XML;
+    process.env.JAMF_POLICY_VERIFY_ATTEMPTS = '1';
+    process.env.JAMF_POLICY_VERIFY_DELAY_MS = '0';
+    process.env.JAMF_POLICY_VERIFY_REQUIRED_CONSISTENT_READS = '1';
+    process.env.JAMF_POLICY_VERIFY_REQUIRE_XML = 'true';
+
+    try {
+      mockAxiosInstance.get.mockResolvedValueOnce({
+        data:
+          '<?xml version="1.0" encoding="UTF-8"?>' +
+          '<policy><maintenance><recon>false</recon></maintenance></policy>',
+      });
+
+      mockAxiosInstance.put.mockResolvedValueOnce({ data: {} });
+
+      mockAxiosInstance.get.mockResolvedValueOnce({
+        data: { policy: { id: 133, maintenance: { recon: true } } },
+      });
+
+      mockAxiosInstance.get.mockResolvedValueOnce({
+        data: { policy: { id: 133, maintenance: { recon: true } } },
+      });
+
+      // XML still stale although JSON looks updated.
+      mockAxiosInstance.get.mockResolvedValueOnce({
+        data:
+          '<?xml version="1.0" encoding="UTF-8"?>' +
+          '<policy><maintenance><recon>false</recon></maintenance></policy>',
+      });
+
+      await expect(
+        client.updatePolicy('133', {
+          maintenance: {
+            recon: true,
+          },
+        })
+      ).rejects.toThrow('did not persist requested fields');
+    } finally {
+      process.env.JAMF_POLICY_VERIFY_ATTEMPTS = prevAttempts;
+      process.env.JAMF_POLICY_VERIFY_DELAY_MS = prevDelay;
+      process.env.JAMF_POLICY_VERIFY_REQUIRED_CONSISTENT_READS = prevConsistentReads;
+      process.env.JAMF_POLICY_VERIFY_REQUIRE_XML = prevRequireXml;
+    }
+  });
 });

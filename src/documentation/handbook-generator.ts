@@ -423,6 +423,7 @@ export class HandbookGenerator {
       if (policy.maintenance.reset_name) actions.push('Reset Computer Name');
       if (policy.maintenance.install_all_cached_packages) actions.push('Install Cached Packages');
       if (policy.maintenance.heal) actions.push('Heal');
+      if (policy.maintenance.prebindings) actions.push('Update Prebindings');
       if (policy.maintenance.permissions) actions.push('Repair Permissions');
       if (policy.maintenance.byhost) actions.push('Fix ByHost Files');
       if (policy.maintenance.system_cache) actions.push('Clear System Cache');

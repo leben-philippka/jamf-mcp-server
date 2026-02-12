@@ -74,6 +74,18 @@ export interface JamfAuthToken {
 
 /** Buffer time in milliseconds to refresh token before actual expiration */
 const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000; // 5 minutes before expiration
+const POLICY_MAINTENANCE_FIELDS = [
+  'recon',
+  'reset_name',
+  'install_all_cached_packages',
+  'heal',
+  'prebindings',
+  'permissions',
+  'byhost',
+  'system_cache',
+  'user_cache',
+  'verify',
+] as const;
 
 // Computer schemas (same as unified client)
 const ComputerSchema = z.object({
@@ -518,6 +530,7 @@ export class JamfApiClientHybrid {
       policyData.general ||
         policyData.scope ||
         policyData.self_service ||
+        policyData.maintenance ||
         policyData.package_configuration ||
         policyData.scripts
     );
@@ -1582,6 +1595,9 @@ export class JamfApiClientHybrid {
             if (policyData.self_service !== undefined) {
               merged.self_service = deepMergeDefined(existing?.self_service ?? {}, policyData.self_service);
             }
+            if (policyData.maintenance !== undefined) {
+              merged.maintenance = deepMergeDefined(existing?.maintenance ?? {}, policyData.maintenance);
+            }
             if (policyData.scope !== undefined) {
               merged.scope = deepMergeDefined(existing?.scope ?? {}, policyData.scope);
             }
@@ -1894,6 +1910,17 @@ export class JamfApiClientHybrid {
     });
   }
 
+  private patchMaintenancePolicyXml(xml: string, maintenance: any): string {
+    return this.withPolicySection(xml, 'maintenance', (sectionXml) => {
+      let next = sectionXml;
+      for (const [key, value] of Object.entries(maintenance ?? {})) {
+        if (value === undefined) continue;
+        next = this.upsertSectionChild(next, 'maintenance', key, this.serializeXmlNodeValue(value, key));
+      }
+      return next;
+    });
+  }
+
   private patchScriptsPolicyXml(xml: string, scripts: any): string {
     const normalizedScripts = (Array.isArray(scripts) ? scripts : []).map((script) => {
       if (!script || typeof script !== 'object') return script;
@@ -1926,6 +1953,9 @@ export class JamfApiClientHybrid {
     }
     if (patch?.self_service !== undefined) {
       xml = this.patchSelfServicePolicyXml(xml, patch.self_service);
+    }
+    if (patch?.maintenance !== undefined) {
+      xml = this.patchMaintenancePolicyXml(xml, patch.maintenance);
     }
     if (patch?.package_configuration !== undefined) {
       xml = this.patchPackageConfigurationPolicyXml(xml, patch.package_configuration);
@@ -2254,7 +2284,7 @@ export class JamfApiClientHybrid {
     if (typeof expected === 'object') return false;
 
     // Only verify scalar fields that map 1:1 to Classic policy XML nodes.
-    return path === 'general.name' || path.startsWith('self_service.');
+    return path === 'general.name' || path.startsWith('self_service.') || path.startsWith('maintenance.');
   }
 
   private getXmlValueAtPath(xml: string, path: string): any {
@@ -2674,6 +2704,18 @@ export class JamfApiClientHybrid {
       }
 
       xml += '  </self_service>\n';
+    }
+
+    // Maintenance
+    if (policyData.maintenance) {
+      xml += '  <maintenance>\n';
+      for (const field of POLICY_MAINTENANCE_FIELDS) {
+        const value = (policyData.maintenance as any)[field];
+        if (value !== undefined) {
+          xml += `    <${field}>${Boolean(value)}</${field}>\n`;
+        }
+      }
+      xml += '  </maintenance>\n';
     }
     
     // Package Configuration

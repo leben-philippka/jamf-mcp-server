@@ -42,4 +42,49 @@ describe('policy tool schemas', () => {
     expect(createPolicy?.inputSchema?.properties?.policyXml).toBeDefined();
     expect(updatePolicy?.inputSchema?.properties?.policyXml).toBeDefined();
   });
+
+  test('createPolicy and updatePolicy advertise maintenance fields', async () => {
+    const handlers = new Map<any, any>();
+    const server = {
+      setRequestHandler: jest.fn((schema: any, handler: any) => {
+        handlers.set(schema, handler);
+      }),
+    } as any;
+
+    const skillsManager = new SkillsManager();
+    const jamfClient = {} as any;
+
+    registerAllTools(server, skillsManager, jamfClient);
+
+    const listHandler = handlers.get(ListToolsRequestSchema);
+    expect(listHandler).toBeDefined();
+
+    const { tools } = await listHandler({} as any);
+    const createPolicy = tools.find((t: any) => t.name === 'createPolicy');
+    const updatePolicy = tools.find((t: any) => t.name === 'updatePolicy');
+
+    const createMaintenance =
+      createPolicy?.inputSchema?.properties?.policyData?.properties?.maintenance?.properties;
+    const updateMaintenance =
+      updatePolicy?.inputSchema?.properties?.policyData?.properties?.maintenance?.properties;
+
+    expect(createMaintenance).toBeDefined();
+    expect(updateMaintenance).toBeDefined();
+
+    for (const field of [
+      'recon',
+      'reset_name',
+      'install_all_cached_packages',
+      'heal',
+      'prebindings',
+      'permissions',
+      'byhost',
+      'system_cache',
+      'user_cache',
+      'verify',
+    ]) {
+      expect(createMaintenance?.[field]).toBeDefined();
+      expect(updateMaintenance?.[field]).toBeDefined();
+    }
+  });
 });
