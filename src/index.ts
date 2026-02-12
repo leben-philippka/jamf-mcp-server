@@ -9,10 +9,11 @@ import { registerPrompts } from './prompts/index.js';
 import { SkillsManager } from './skills/manager.js';
 import { setupGlobalErrorHandlers } from './utils/error-handler.js';
 import { createLogger } from './server/logger.js';
-import { registerShutdownHandler, registerCommonHandlers } from './utils/shutdown-manager.js';
+import { gracefulShutdown, registerShutdownHandler, registerCommonHandlers } from './utils/shutdown-manager.js';
 import { cleanupAuthMiddleware } from './server/auth-middleware.js';
 import { cleanupAgentPool } from './utils/http-agent-pool.js';
 import { validateJamfConfig } from './utils/env-validation.js';
+import { getStdioLifecycleConfig, startStdioLifecycleGuard } from './utils/stdio-lifecycle.js';
 
 const logger = createLogger('main');
 
@@ -55,6 +56,7 @@ const server = new Server(
 
 // Initialize Skills Manager
 const skillsManager = new SkillsManager();
+let stopStdioLifecycleGuard: (() => void) | null = null;
 
 async function run() {
   try {
@@ -87,6 +89,15 @@ async function run() {
     registerResources(server, jamfClient);
     registerPrompts(server);
 
+    const stdioLifecycleConfig = getStdioLifecycleConfig();
+    stopStdioLifecycleGuard = startStdioLifecycleGuard({
+      config: stdioLifecycleConfig,
+      onShutdown: async (reason) => {
+        logger.info('stdio lifecycle shutdown requested', { reason });
+        await gracefulShutdown(reason, 0);
+      },
+    });
+
     // Start the server
     const transport = new StdioServerTransport();
     await server.connect(transport);
@@ -105,6 +116,10 @@ setupGlobalErrorHandlers();
 registerCommonHandlers();
 
 // Register cleanup handlers
+registerShutdownHandler('stdio-lifecycle-stop', () => {
+  stopStdioLifecycleGuard?.();
+  stopStdioLifecycleGuard = null;
+}, 10);
 registerShutdownHandler('auth-cleanup', cleanupAuthMiddleware, 20);
 registerShutdownHandler('agent-pool-cleanup', cleanupAgentPool, 20);
 registerShutdownHandler('server-transport-close', async () => {

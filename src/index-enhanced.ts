@@ -20,6 +20,10 @@ import { registerPrompts } from './prompts/index.js';
 import { SkillsManager } from './skills/manager.js';
 import { createLogger } from './server/logger.js';
 import { validateJamfConfig, validateEnhancedModeConfig } from './utils/env-validation.js';
+import { gracefulShutdown, registerCommonHandlers, registerShutdownHandler } from './utils/shutdown-manager.js';
+import { cleanupAuthMiddleware } from './server/auth-middleware.js';
+import { cleanupAgentPool } from './utils/http-agent-pool.js';
+import { getStdioLifecycleConfig, startStdioLifecycleGuard } from './utils/stdio-lifecycle.js';
 
 const logger = createLogger('JamfMCPServerEnhanced');
 
@@ -78,6 +82,7 @@ const server = new Server(
 
 // Initialize Skills Manager
 const skillsManager = new SkillsManager();
+let stopStdioLifecycleGuard: (() => void) | null = null;
 
 async function run() {
   try {
@@ -118,6 +123,15 @@ async function run() {
     registerResources(server, jamfClient);
     registerPrompts(server);
 
+    const stdioLifecycleConfig = getStdioLifecycleConfig();
+    stopStdioLifecycleGuard = startStdioLifecycleGuard({
+      config: stdioLifecycleConfig,
+      onShutdown: async (reason) => {
+        logger.info('stdio lifecycle shutdown requested', { reason });
+        await gracefulShutdown(reason, 0);
+      },
+    });
+
     // Start the server
     const transport = new StdioServerTransport();
     await server.connect(transport);
@@ -128,6 +142,14 @@ async function run() {
     process.exit(1);
   }
 }
+
+registerCommonHandlers();
+registerShutdownHandler('stdio-lifecycle-stop', () => {
+  stopStdioLifecycleGuard?.();
+  stopStdioLifecycleGuard = null;
+}, 10);
+registerShutdownHandler('auth-cleanup', cleanupAuthMiddleware, 20);
+registerShutdownHandler('agent-pool-cleanup', cleanupAgentPool, 20);
 
 run().catch((error) => {
   logger.error('Fatal error', { error });
