@@ -176,6 +176,83 @@ describe('JamfApiClientHybrid patch management', () => {
     expect(result).toMatchObject({ id: '321', displayName: 'Google Chrome' });
   });
 
+  test('createPatchSoftwareTitleConfiguration falls back to Classic onboarding when softwareTitleId is a name_id', async () => {
+    const client = createClient();
+    const payload = { displayName: 'RustDesk', softwareTitleId: '666' };
+
+    mockAxiosInstance.post
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: {
+          status: 400,
+          data: { errors: [{ description: "This software title id doesn't exist." }] },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: '<?xml version="1.0" encoding="UTF-8"?><patch_software_title><id>10</id></patch_software_title>',
+      })
+      .mockResolvedValueOnce({
+        data: { id: '910', displayName: 'RustDesk', softwareTitleId: '10' },
+      });
+    mockAxiosInstance.get.mockResolvedValue({ data: { id: '910', displayName: 'RustDesk', softwareTitleId: '10' } });
+
+    const result = await client.createPatchSoftwareTitleConfiguration(payload);
+
+    expect(mockAxiosInstance.post).toHaveBeenNthCalledWith(1, '/api/v2/patch-software-title-configurations', payload);
+    expect(mockAxiosInstance.post).toHaveBeenNthCalledWith(
+      2,
+      '/JSSResource/patchsoftwaretitles/id/0',
+      expect.stringContaining('<name_id>666</name_id>'),
+      {
+        headers: {
+          'Content-Type': 'application/xml',
+          Accept: 'application/xml',
+        },
+      }
+    );
+    expect(mockAxiosInstance.post).toHaveBeenNthCalledWith(3, '/api/v2/patch-software-title-configurations', {
+      displayName: 'RustDesk',
+      softwareTitleId: '10',
+    });
+    expect(result).toMatchObject({ id: '910', displayName: 'RustDesk', softwareTitleId: '10' });
+  });
+
+  test('createPatchSoftwareTitleConfiguration returns existing config when retry reports already exists', async () => {
+    const client = createClient();
+    const payload = { displayName: 'RustDesk', softwareTitleId: '666' };
+
+    mockAxiosInstance.post
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: {
+          status: 400,
+          data: { errors: [{ description: "This software title id doesn't exist." }] },
+        },
+      })
+      .mockResolvedValueOnce({
+        data: '<?xml version="1.0" encoding="UTF-8"?><patch_software_title><id>10</id></patch_software_title>',
+      })
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: {
+          status: 400,
+          data: { errors: [{ description: 'This software title configuration already exists for this site.' }] },
+        },
+      });
+    mockAxiosInstance.get.mockResolvedValue({
+      data: [
+        { id: '10', displayName: 'RustDesk', softwareTitleId: '10', uiNotifications: true, emailNotifications: true },
+      ],
+    });
+
+    const result = await client.createPatchSoftwareTitleConfiguration(payload);
+
+    expect(mockAxiosInstance.get).toHaveBeenCalledWith('/api/v2/patch-software-title-configurations', {
+      params: { 'page-size': 200 },
+    });
+    expect(result).toMatchObject({ id: '10', displayName: 'RustDesk', softwareTitleId: '10' });
+  });
+
   test('updatePatchSoftwareTitleConfiguration verifies persisted fields', async () => {
     const client = createClient();
     const updates = { displayName: 'Updated Chrome' };

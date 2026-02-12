@@ -1723,7 +1723,7 @@ export function createBaseToolHandlers(jamfClient: any): {
       {
         name: 'listPatchAvailableTitles',
         description:
-          'List patch titles available from a patch source (Classic API). Use this before creating Patch Management configurations to discover what can be onboarded.',
+          'List patch titles available from a patch source (Classic API). `id`/`nameId` in this output typically represent Jamf title `name_id` values. Use this before creating Patch Management configurations to discover what can be onboarded.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -1915,7 +1915,7 @@ export function createBaseToolHandlers(jamfClient: any): {
       {
         name: 'createPatchSoftwareTitleConfiguration',
         description:
-          'Create a new Patch Software Title Configuration (v2) using raw configuration payload (requires confirmation). Uses strict post-write persistence verification by default.',
+          'Create a new Patch Software Title Configuration (v2) using raw configuration payload (requires confirmation). Uses strict post-write persistence verification by default. If `config.softwareTitleId` is passed as a Classic catalog `name_id` (from `listPatchAvailableTitles`), the server attempts Classic onboarding and then retries with the resolved numeric softwareTitleId.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -4337,6 +4337,7 @@ export function createBaseToolHandlers(jamfClient: any): {
 
           const normalized = titleRows.map((row: any) => ({
             id: row?.id ?? row?.name_id ?? row?.softwareTitleId ?? row?.titleId ?? null,
+            nameId: row?.name_id ?? row?.nameId ?? null,
             name: row?.app_name ?? row?.name ?? row?.displayName ?? row?.softwareTitle ?? row?.title ?? '',
             publisher: row?.publisher ?? row?.softwareTitlePublisher ?? '',
             currentVersion: row?.current_version ?? row?.currentVersion ?? row?.latestVersion ?? '',
@@ -4354,6 +4355,7 @@ export function createBaseToolHandlers(jamfClient: any): {
 
           const out = filtered.slice(0, limit).map((t: any) => ({
             id: t.id,
+            nameId: t.nameId,
             name: t.name,
             publisher: t.publisher,
             currentVersion: t.currentVersion,

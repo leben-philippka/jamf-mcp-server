@@ -4913,6 +4913,148 @@ export class JamfApiClientHybrid {
     return { size: reportedSize, rows };
   }
 
+  private extractPatchSoftwareTitleConfigurationRows(payload: any): any[] {
+    const toArray = (value: any): any[] =>
+      Array.isArray(value) ? value : value && typeof value === 'object' ? [value] : [];
+
+    const candidates = [payload?.results, payload?.items, payload?.configurations, payload];
+
+    for (const candidate of candidates) {
+      const rows = toArray(candidate);
+      if (rows.length > 0) return rows;
+    }
+    return [];
+  }
+
+  private flattenErrorText(value: unknown, out: string[]): void {
+    if (value === null || value === undefined) return;
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+      out.push(String(value));
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) this.flattenErrorText(item, out);
+      return;
+    }
+    if (typeof value === 'object') {
+      for (const entry of Object.values(value as Record<string, unknown>)) {
+        this.flattenErrorText(entry, out);
+      }
+    }
+  }
+
+  private getPatchCreateErrorText(error: unknown): string {
+    const parts: string[] = [];
+    this.flattenErrorText(getErrorMessage(error), parts);
+    this.flattenErrorText(getAxiosErrorData(error), parts);
+    return parts.join(' | ').toLowerCase();
+  }
+
+  private isPatchCreateMissingSoftwareTitleIdError(error: unknown): boolean {
+    if (getAxiosErrorStatus(error) !== 400) return false;
+    const text = this.getPatchCreateErrorText(error);
+    return (
+      text.includes("software title id doesn't exist") ||
+      text.includes('id field must be string of positive numeric value')
+    );
+  }
+
+  private isPatchCreateAlreadyExistsError(error: unknown): boolean {
+    if (getAxiosErrorStatus(error) !== 400 && getAxiosErrorStatus(error) !== 409) return false;
+    const text = this.getPatchCreateErrorText(error);
+    return text.includes('already exists');
+  }
+
+  private parseXmlTagValue(xmlPayload: unknown, tag: string): string | null {
+    const xml = String(xmlPayload ?? '');
+    if (!xml) return null;
+    const escapedTag = String(tag).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const match = xml.match(new RegExp(`<${escapedTag}>\\s*([^<]+?)\\s*<\\/${escapedTag}>`, 'i'));
+    return match?.[1]?.trim() ?? null;
+  }
+
+  private buildPatchSoftwareTitleCreateXml(input: {
+    nameId: string;
+    displayName?: string;
+    sourceId?: string;
+  }): string {
+    const nameId = this.escapeXmlValue(String(input.nameId ?? '').trim());
+    const sourceId = this.escapeXmlValue(String(input.sourceId ?? '1').trim() || '1');
+    const displayName = String(input.displayName ?? '').trim();
+
+    return `<patch_software_title><name_id>${nameId}</name_id><source_id>${sourceId}</source_id>${
+      displayName ? `<name>${this.escapeXmlValue(displayName)}</name>` : ''
+    }</patch_software_title>`;
+  }
+
+  private async resolveClassicPatchSoftwareTitleIdByNameId(nameId: string): Promise<string | null> {
+    const response = await this.axiosInstance.get('/JSSResource/patchsoftwaretitles', {
+      headers: { Accept: 'application/json' },
+    });
+    const rows = Array.isArray(response.data?.patch_software_titles) ? response.data.patch_software_titles : [];
+    const found = rows.find((row: any) => String(row?.name_id ?? '') === String(nameId));
+    const resolvedId = found?.id;
+    if (resolvedId === null || resolvedId === undefined) return null;
+    const normalized = String(resolvedId).trim();
+    if (!normalized || normalized === '-1') return null;
+    return normalized;
+  }
+
+  private async ensureClassicPatchSoftwareTitleOnboarded(
+    nameId: string,
+    displayName?: string,
+    sourceId: string = '1'
+  ): Promise<string> {
+    const normalizedNameId = String(nameId ?? '').trim();
+    if (!normalizedNameId) {
+      throw new Error('Missing patch software title name_id for Classic onboarding');
+    }
+
+    const existingId = await this.resolveClassicPatchSoftwareTitleIdByNameId(normalizedNameId);
+    if (existingId) return existingId;
+
+    const xmlPayload = this.buildPatchSoftwareTitleCreateXml({
+      nameId: normalizedNameId,
+      displayName,
+      sourceId,
+    });
+
+    try {
+      const response = await this.axiosInstance.post('/JSSResource/patchsoftwaretitles/id/0', xmlPayload, {
+        headers: {
+          'Content-Type': 'application/xml',
+          Accept: 'application/xml',
+        },
+      });
+      const createdId = this.parseXmlTagValue(response.data, 'id');
+      if (createdId) return createdId;
+    } catch (error) {
+      if (!this.isPatchCreateAlreadyExistsError(error)) {
+        throw error;
+      }
+    }
+
+    const resolvedId = await this.resolveClassicPatchSoftwareTitleIdByNameId(normalizedNameId);
+    if (resolvedId) return resolvedId;
+
+    throw new Error(
+      `Classic patch software title onboarding for name_id "${normalizedNameId}" did not yield a numeric softwareTitleId`
+    );
+  }
+
+  private async findPatchSoftwareTitleConfigurationBySoftwareTitleId(
+    softwareTitleId: string,
+    limit: number = 200
+  ): Promise<any | null> {
+    const response = await this.axiosInstance.get('/api/v2/patch-software-title-configurations', {
+      params: { 'page-size': limit },
+    });
+    const rows = this.extractPatchSoftwareTitleConfigurationRows(response.data);
+    return (
+      rows.find((row: any) => String(row?.softwareTitleId ?? '').trim() === String(softwareTitleId).trim()) ?? null
+    );
+  }
+
   async listPatchAvailableTitles(sourceId: string = '1'): Promise<any> {
     await this.ensureAuthenticated();
 
@@ -5070,22 +5212,58 @@ export class JamfApiClientHybrid {
     }
 
     await this.ensureAuthenticated();
-
-    const response = await this.axiosInstance.post('/api/v2/patch-software-title-configurations', config);
-    const configId = this.extractPatchSoftwareTitleConfigurationId(response.data);
-    const strictEnabled = String(process.env.JAMF_PATCH_VERIFY_ENABLED ?? 'true').toLowerCase() !== 'false';
-    if (strictEnabled && !configId) {
-      throw new Error(
-        'Patch software title configuration create did not return an id; cannot verify persistence in strict mode'
+    const createViaV2 = async (payload: any): Promise<any> => {
+      const response = await this.axiosInstance.post('/api/v2/patch-software-title-configurations', payload);
+      const configId = this.extractPatchSoftwareTitleConfigurationId(response.data);
+      const strictEnabled = String(process.env.JAMF_PATCH_VERIFY_ENABLED ?? 'true').toLowerCase() !== 'false';
+      if (strictEnabled && !configId) {
+        throw new Error(
+          'Patch software title configuration create did not return an id; cannot verify persistence in strict mode'
+        );
+      }
+      if (!configId) return response.data;
+      return await this.verifyPatchSoftwareTitleConfigurationPersisted(
+        configId,
+        payload,
+        response.data,
+        { topLevelOnly: true }
       );
+    };
+
+    try {
+      return await createViaV2(config);
+    } catch (error) {
+      if (!this.isPatchCreateMissingSoftwareTitleIdError(error)) {
+        throw error;
+      }
+
+      const requestedSoftwareTitleId = String(config?.softwareTitleId ?? '').trim();
+      if (!requestedSoftwareTitleId || requestedSoftwareTitleId === '-1') {
+        throw error;
+      }
+
+      const sourceId = String(config?.sourceId ?? '1').trim() || '1';
+      const onboardedSoftwareTitleId = await this.ensureClassicPatchSoftwareTitleOnboarded(
+        requestedSoftwareTitleId,
+        String(config?.displayName ?? '').trim() || undefined,
+        sourceId
+      );
+
+      const retryPayload = { ...config, softwareTitleId: onboardedSoftwareTitleId };
+      try {
+        return await createViaV2(retryPayload);
+      } catch (retryError) {
+        if (!this.isPatchCreateAlreadyExistsError(retryError)) {
+          throw retryError;
+        }
+
+        const existing = await this.findPatchSoftwareTitleConfigurationBySoftwareTitleId(onboardedSoftwareTitleId);
+        if (!existing) {
+          throw retryError;
+        }
+        return existing;
+      }
     }
-    if (!configId) return response.data;
-    return await this.verifyPatchSoftwareTitleConfigurationPersisted(
-      configId,
-      config,
-      response.data,
-      { topLevelOnly: true }
-    );
   }
 
   /**
