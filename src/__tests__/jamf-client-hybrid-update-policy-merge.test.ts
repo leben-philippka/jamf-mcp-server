@@ -530,3 +530,165 @@ describe('JamfApiClientHybrid updatePolicy classic merge behavior', () => {
     }
   });
 });
+
+describe('JamfApiClientHybrid updatePolicy date_time_limitations behavior', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockAxiosInstance.get.mockReset();
+    mockAxiosInstance.post.mockReset();
+    mockAxiosInstance.put.mockReset();
+    mockAxiosInstance.delete.mockReset();
+    mockAxiosCreate.mockReturnValue(mockAxiosInstance);
+  });
+
+  test('updatePolicy writes general.date_time_limitations into Classic policy XML patch', async () => {
+    const client = createClient();
+    const prevAttempts = process.env.JAMF_POLICY_VERIFY_ATTEMPTS;
+    const prevDelay = process.env.JAMF_POLICY_VERIFY_DELAY_MS;
+    const prevConsistentReads = process.env.JAMF_POLICY_VERIFY_REQUIRED_CONSISTENT_READS;
+    const prevRequireXml = process.env.JAMF_POLICY_VERIFY_REQUIRE_XML;
+    process.env.JAMF_POLICY_VERIFY_ATTEMPTS = '1';
+    process.env.JAMF_POLICY_VERIFY_DELAY_MS = '0';
+    process.env.JAMF_POLICY_VERIFY_REQUIRED_CONSISTENT_READS = '1';
+    process.env.JAMF_POLICY_VERIFY_REQUIRE_XML = 'false';
+
+    try {
+      mockAxiosInstance.get.mockResolvedValueOnce({
+        data:
+          '<?xml version="1.0" encoding="UTF-8"?>' +
+          '<policy>' +
+          '<general><name>Auto Update - Notion</name></general>' +
+          '</policy>',
+      });
+
+      mockAxiosInstance.put.mockResolvedValueOnce({ data: {} });
+
+      mockAxiosInstance.get.mockResolvedValueOnce({
+        data: {
+          policy: {
+            id: 74,
+            general: {
+              name: 'Auto Update - Notion',
+              date_time_limitations: {
+                no_execute_start: '09:00',
+                no_execute_end: '17:00',
+                no_execute_on: 'Monday',
+              },
+            },
+          },
+        },
+      });
+
+      mockAxiosInstance.get.mockResolvedValueOnce({
+        data: {
+          policy: {
+            id: 74,
+            general: {
+              name: 'Auto Update - Notion',
+              date_time_limitations: {
+                no_execute_start: '09:00',
+                no_execute_end: '17:00',
+                no_execute_on: 'Monday',
+              },
+            },
+          },
+        },
+      });
+
+      await client.updatePolicy('74', {
+        general: {
+          date_time_limitations: {
+            no_execute_start: '09:00',
+            no_execute_end: '17:00',
+            no_execute_on: 'Monday',
+          },
+        },
+      });
+
+      expect(mockAxiosInstance.put).toHaveBeenCalled();
+      const putArgs = mockAxiosInstance.put.mock.calls[0];
+      expect(putArgs[0]).toBe('/JSSResource/policies/id/74');
+      const xml = String(putArgs[1] ?? '');
+      expect(xml).toContain('<general>');
+      expect(xml).toContain('<date_time_limitations>');
+      expect(xml).toContain('<no_execute_start>09:00</no_execute_start>');
+      expect(xml).toContain('<no_execute_end>17:00</no_execute_end>');
+      expect(xml).toContain('<no_execute_on>Monday</no_execute_on>');
+    } finally {
+      process.env.JAMF_POLICY_VERIFY_ATTEMPTS = prevAttempts;
+      process.env.JAMF_POLICY_VERIFY_DELAY_MS = prevDelay;
+      process.env.JAMF_POLICY_VERIFY_REQUIRED_CONSISTENT_READS = prevConsistentReads;
+      process.env.JAMF_POLICY_VERIFY_REQUIRE_XML = prevRequireXml;
+    }
+  });
+
+  test('updatePolicy strict mode verifies date_time_limitations fields against XML source', async () => {
+    const client = createClient();
+
+    const prevAttempts = process.env.JAMF_POLICY_VERIFY_ATTEMPTS;
+    const prevDelay = process.env.JAMF_POLICY_VERIFY_DELAY_MS;
+    const prevConsistentReads = process.env.JAMF_POLICY_VERIFY_REQUIRED_CONSISTENT_READS;
+    const prevRequireXml = process.env.JAMF_POLICY_VERIFY_REQUIRE_XML;
+    process.env.JAMF_POLICY_VERIFY_ATTEMPTS = '1';
+    process.env.JAMF_POLICY_VERIFY_DELAY_MS = '0';
+    process.env.JAMF_POLICY_VERIFY_REQUIRED_CONSISTENT_READS = '1';
+    process.env.JAMF_POLICY_VERIFY_REQUIRE_XML = 'true';
+
+    try {
+      mockAxiosInstance.get.mockResolvedValueOnce({
+        data:
+          '<?xml version="1.0" encoding="UTF-8"?>' +
+          '<policy><general><date_time_limitations><no_execute_start>08:00</no_execute_start></date_time_limitations></general></policy>',
+      });
+
+      mockAxiosInstance.put.mockResolvedValueOnce({ data: {} });
+
+      mockAxiosInstance.get.mockResolvedValueOnce({
+        data: {
+          policy: {
+            id: 74,
+            general: {
+              date_time_limitations: {
+                no_execute_start: '09:00',
+              },
+            },
+          },
+        },
+      });
+
+      mockAxiosInstance.get.mockResolvedValueOnce({
+        data: {
+          policy: {
+            id: 74,
+            general: {
+              date_time_limitations: {
+                no_execute_start: '09:00',
+              },
+            },
+          },
+        },
+      });
+
+      mockAxiosInstance.get.mockResolvedValueOnce({
+        data:
+          '<?xml version="1.0" encoding="UTF-8"?>' +
+          '<policy><general><date_time_limitations><no_execute_start>08:00</no_execute_start></date_time_limitations></general></policy>',
+      });
+
+      await expect(
+        client.updatePolicy('74', {
+          general: {
+            date_time_limitations: {
+              no_execute_start: '09:00',
+            },
+          },
+        })
+      ).rejects.toThrow('did not persist requested fields');
+    } finally {
+      process.env.JAMF_POLICY_VERIFY_ATTEMPTS = prevAttempts;
+      process.env.JAMF_POLICY_VERIFY_DELAY_MS = prevDelay;
+      process.env.JAMF_POLICY_VERIFY_REQUIRED_CONSISTENT_READS = prevConsistentReads;
+      process.env.JAMF_POLICY_VERIFY_REQUIRE_XML = prevRequireXml;
+    }
+  });
+});

@@ -369,6 +369,11 @@ const CreatePolicyDataSchema = z.object({
       location_user_only: z.boolean().optional().describe('Location information collected from user only'),
       target_drive: z.string().optional().describe('Target drive for installations'),
       offline: z.boolean().optional().describe('Make available offline'),
+      date_time_limitations: z.object({
+        no_execute_start: z.string().optional().describe('Do not execute between start time (HH:MM)'),
+        no_execute_end: z.string().optional().describe('Do not execute between end time (HH:MM)'),
+        no_execute_on: z.string().optional().describe('Do not execute on specified days (Jamf Classic string)'),
+      }).optional().describe('Date and time execution limitations'),
       category: z.string().optional().describe('Policy category'),
     }).describe('General policy settings'),
     scope: z.object({
@@ -485,6 +490,11 @@ const UpdatePolicyDataSchema = z.object({
       location_user_only: z.boolean().optional().describe('Location information collected from user only'),
       target_drive: z.string().optional().describe('Target drive for installations'),
       offline: z.boolean().optional().describe('Make available offline'),
+      date_time_limitations: z.object({
+        no_execute_start: z.string().optional().describe('Do not execute between start time (HH:MM)'),
+        no_execute_end: z.string().optional().describe('Do not execute between end time (HH:MM)'),
+        no_execute_on: z.string().optional().describe('Do not execute on specified days (Jamf Classic string)'),
+      }).optional().describe('Date and time execution limitations'),
       category: z.string().optional().describe('Policy category'),
     }).optional().describe('General policy settings to update'),
     scope: z.object({
@@ -2155,7 +2165,16 @@ export function createBaseToolHandlers(jamfClient: any): {
 	                        'Ongoing',
 	                      ],
 	                    },
-	                    category: { type: 'string', description: 'Policy category' },
+	                    date_time_limitations: {
+                      type: 'object',
+                      description: 'Date and time execution limitations',
+                      properties: {
+                        no_execute_start: { type: 'string', description: 'Do not execute between start time (HH:MM)' },
+                        no_execute_end: { type: 'string', description: 'Do not execute between end time (HH:MM)' },
+                        no_execute_on: { type: 'string', description: 'Do not execute on specified days (Jamf Classic string)' },
+                      },
+                    },
+                    category: { type: 'string', description: 'Policy category' },
 	                  },
                   required: ['name'],
                 },
@@ -2389,7 +2408,16 @@ export function createBaseToolHandlers(jamfClient: any): {
 	                        'Ongoing',
 	                      ],
 	                    },
-	                    category: { type: 'string', description: 'Policy category' },
+	                    date_time_limitations: {
+                      type: 'object',
+                      description: 'Date and time execution limitations',
+                      properties: {
+                        no_execute_start: { type: 'string', description: 'Do not execute between start time (HH:MM)' },
+                        no_execute_end: { type: 'string', description: 'Do not execute between end time (HH:MM)' },
+                        no_execute_on: { type: 'string', description: 'Do not execute on specified days (Jamf Classic string)' },
+                      },
+                    },
+                    category: { type: 'string', description: 'Policy category' },
 	                  },
                 },
                 scope: {

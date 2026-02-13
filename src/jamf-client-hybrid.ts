@@ -589,8 +589,16 @@ export class JamfApiClientHybrid {
           ),
         { operation: 'updatePolicyXml', resourceType: 'policy', resourceId: String(policyId) }
       );
+      const updatedPolicy = await this.getPolicyDetails(policyId);
+      const shouldStrictVerifyXmlPayload = !options?.skipPolicyWriteLock;
+      const xmlVerifyPatch = shouldStrictVerifyXmlPayload
+        ? this.extractDateTimeLimitationsPatchFromPolicyXml(xmlPayload)
+        : null;
+      if (xmlVerifyPatch) {
+        return await this.verifyPolicyUpdatePersisted(policyId, xmlVerifyPatch, updatedPolicy);
+      }
 
-      return await this.getPolicyDetails(policyId);
+      return updatedPolicy;
     };
 
     if (options?.skipPolicyWriteLock) {
@@ -2285,12 +2293,34 @@ export class JamfApiClientHybrid {
     );
   }
 
+  private extractDateTimeLimitationsPatchFromPolicyXml(policyXml: string): any | null {
+    const dateTimeFields = ['no_execute_start', 'no_execute_end', 'no_execute_on'] as const;
+    const dateTimePatch: Record<string, string> = {};
+
+    for (const field of dateTimeFields) {
+      const value = this.getXmlValueAtPath(policyXml, "general.date_time_limitations." + field);
+      if (value !== undefined) {
+        dateTimePatch[field] = String(value);
+      }
+    }
+
+    if (Object.keys(dateTimePatch).length === 0) {
+      return null;
+    }
+
+    return {
+      general: {
+        date_time_limitations: dateTimePatch,
+      },
+    };
+  }
+
   private isPolicyXmlVerifiableExpectation(path: string, expected: any): boolean {
     if (expected === undefined || expected === null) return false;
     if (typeof expected === 'object') return false;
 
     // Only verify scalar fields that map 1:1 to Classic policy XML nodes.
-    return path === 'general.name' || path.startsWith('self_service.') || path.startsWith('maintenance.');
+    return path === 'general.name' || path.startsWith('self_service.') || path.startsWith('maintenance.') || path.startsWith('general.date_time_limitations.');
   }
 
   private getXmlValueAtPath(xml: string, path: string): any {
@@ -2571,6 +2601,24 @@ export class JamfApiClientHybrid {
         }
       }
 
+      if ((policyData.general as any).date_time_limitations) {
+        const dt = (policyData.general as any).date_time_limitations;
+        const hasDateTimeValues =
+          dt.no_execute_start !== undefined || dt.no_execute_end !== undefined || dt.no_execute_on !== undefined;
+        if (hasDateTimeValues) {
+          xml += '    <date_time_limitations>\n';
+          if (dt.no_execute_start !== undefined) {
+            xml += '      <no_execute_start>' + escapeXml(String(dt.no_execute_start ?? '')) + '</no_execute_start>\n';
+          }
+          if (dt.no_execute_end !== undefined) {
+            xml += '      <no_execute_end>' + escapeXml(String(dt.no_execute_end ?? '')) + '</no_execute_end>\n';
+          }
+          if (dt.no_execute_on !== undefined) {
+            xml += '      <no_execute_on>' + escapeXml(String(dt.no_execute_on ?? '')) + '</no_execute_on>\n';
+          }
+          xml += '    </date_time_limitations>\n';
+        }
+      }
       // Optional Classic enums: normalize if present (not all callers include these).
       if ((policyData.general as any).network_requirements !== undefined) {
         const nr = normalizePolicyNetworkRequirements((policyData.general as any).network_requirements);
