@@ -210,6 +210,39 @@ describe('JamfApiClientHybrid smart group behavior', () => {
     expect(mockAxiosInstance.post.mock.calls[0][0]).toBe('/api/v2/computer-groups/smart-groups');
   });
 
+  test('createSmartComputerGroup falls back to Classic API on Modern 400 for Patch Reporting criteria', async () => {
+    const client = createClient();
+    const criteria: SmartGroupCriteriaInput[] = [
+      {
+        name: 'Patch Reporting: Google Chrome',
+        priority: 0,
+        and_or: 'and',
+        search_type: 'less than',
+        value: 'Latest Version',
+      },
+    ];
+
+    mockAxiosInstance.post
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: {
+          status: 400,
+          data: { message: 'The criterion Patch Reporting: Google Chrome is not valid (undefined)' },
+        },
+      })
+      .mockResolvedValueOnce({ data: { id: '104' } });
+
+    jestGlobals
+      .spyOn(client, 'getComputerGroupDetails')
+      .mockResolvedValue({ id: '104', name: 'Patch Reporting Group', is_smart: true });
+
+    await client.createSmartComputerGroup('Patch Reporting Group', criteria);
+
+    expect(mockAxiosInstance.post).toHaveBeenCalledTimes(2);
+    expect(mockAxiosInstance.post.mock.calls[0][0]).toBe('/api/v2/computer-groups/smart-groups');
+    expect(mockAxiosInstance.post.mock.calls[1][0]).toBe('/JSSResource/computergroups/id/0');
+  });
+
   test('updateSmartComputerGroup updates via Modern API when Modern succeeds', async () => {
     const client = createClient();
     const criteria: SmartGroupCriteriaContainer = {
@@ -297,6 +330,70 @@ describe('JamfApiClientHybrid smart group behavior', () => {
         },
       })
     );
+  });
+
+  test('updateSmartComputerGroup falls back to Classic API on Modern 400 for Patch Reporting criteria', async () => {
+    const client = createClient();
+    const criteria: SmartGroupCriteriaInput[] = [
+      {
+        name: 'Patch Reporting: Google Chrome',
+        priority: 0,
+        and_or: 'and',
+        search_type: 'less than',
+        value: 'Latest Version',
+      },
+    ];
+
+    jestGlobals
+      .spyOn(client, 'getComputerGroupDetails')
+      .mockResolvedValue({ id: '123', name: 'Patch Reporting Group', is_smart: true, criteria });
+
+    mockAxiosInstance.put
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: {
+          status: 400,
+          data: { message: 'The criterion Patch Reporting: Google Chrome is not valid (undefined)' },
+        },
+      })
+      .mockResolvedValueOnce({ data: { id: '123' } });
+
+    await client.updateSmartComputerGroup('123', { name: 'Updated Patch Reporting Group', criteria });
+
+    expect(mockAxiosInstance.put).toHaveBeenCalledTimes(2);
+    expect(mockAxiosInstance.put.mock.calls[0][0]).toBe('/api/v2/computer-groups/smart-groups/123');
+    expect(mockAxiosInstance.put.mock.calls[1][0]).toBe('/JSSResource/computergroups/id/123');
+  });
+
+  test('updateSmartComputerGroup does not fall back to Classic API on Modern 400 for non-patch criteria', async () => {
+    const client = createClient();
+    const criteria: SmartGroupCriteriaInput[] = [
+      {
+        name: 'Application Title',
+        priority: 0,
+        and_or: 'and',
+        search_type: 'like',
+        value: 'timeBuzzer.app',
+      },
+    ];
+
+    jestGlobals
+      .spyOn(client, 'getComputerGroupDetails')
+      .mockResolvedValue({ id: '123', name: 'Smart Group', is_smart: true, criteria });
+
+    mockAxiosInstance.put.mockRejectedValueOnce({
+      isAxiosError: true,
+      response: {
+        status: 400,
+        data: { httpStatus: 400, errors: [{ code: 'INVALID_FIELD' }] },
+      },
+    });
+
+    await expect(
+      client.updateSmartComputerGroup('123', { name: 'Updated Group', criteria })
+    ).rejects.toBeDefined();
+    expect(mockAxiosInstance.put).toHaveBeenCalledTimes(1);
+    expect(mockAxiosInstance.put.mock.calls[0][0]).toBe('/api/v2/computer-groups/smart-groups/123');
   });
 
   test('createSmartComputerGroup maps normalized criteria to Modern payload', async () => {

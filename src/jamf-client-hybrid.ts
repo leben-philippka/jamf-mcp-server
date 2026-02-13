@@ -3485,6 +3485,44 @@ export class JamfApiClientHybrid {
     return name !== '' && andOr !== '' && searchType !== '' && value !== '';
   }
 
+  private hasPatchReportingCriterion(criteria: JamfSearchCriteria[]): boolean {
+    return criteria.some((criterion) => {
+      const name = typeof criterion.name === 'string' ? criterion.name.trim().toLowerCase() : '';
+      return name.startsWith('patch reporting:');
+    });
+  }
+
+  private shouldFallbackToClassicForPatchReportingCriteria(
+    error: unknown,
+    criteria: JamfSearchCriteria[]
+  ): boolean {
+    if (!this.canCallClassicApi()) return false;
+    if (getAxiosErrorStatus(error) !== 400) return false;
+    if (!this.hasPatchReportingCriterion(criteria)) return false;
+
+    const errorData = getAxiosErrorData(error);
+    let errorText = '';
+    if (typeof errorData === 'string') {
+      errorText = errorData.toLowerCase();
+    } else {
+      try {
+        errorText = JSON.stringify(errorData ?? '').toLowerCase();
+      } catch {
+        errorText = '';
+      }
+    }
+
+    // Jamf Modern sometimes rejects valid Patch Reporting criteria with "not valid (undefined)".
+    // In that case, Classic API frequently still accepts the same criterion.
+    if (!errorText) return true;
+    return (
+      errorText.includes('criterion') ||
+      errorText.includes('invalid_field') ||
+      errorText.includes('not valid') ||
+      errorText.includes('undefined')
+    );
+  }
+
   /**
    * Build Modern API payload for smart computer groups
    */
@@ -3653,7 +3691,11 @@ export class JamfApiClientHybrid {
         data: getAxiosErrorData(error),
       });
 
-      if (!this.shouldFallbackToClassicOnModernError(error)) {
+      const patchReportingFallback = this.shouldFallbackToClassicForPatchReportingCriteria(
+        error,
+        normalizedCriteria
+      );
+      if (!this.shouldFallbackToClassicOnModernError(error) && !patchReportingFallback) {
         // Surface Modern errors directly to avoid masking validation errors with Classic 401s.
         throw error;
       }
@@ -3661,6 +3703,7 @@ export class JamfApiClientHybrid {
       logger.info('Falling back to Classic API for smart group create', {
         canCallClassicApi: this.canCallClassicApi(),
         status: getAxiosErrorStatus(error),
+        patchReportingFallback,
       });
 
       // Fall back to Classic API
@@ -3728,13 +3771,18 @@ export class JamfApiClientHybrid {
         data: getAxiosErrorData(error),
       });
 
-      if (!this.shouldFallbackToClassicOnModernError(error)) {
+      const patchReportingFallback = this.shouldFallbackToClassicForPatchReportingCriteria(
+        error,
+        newCriteria
+      );
+      if (!this.shouldFallbackToClassicOnModernError(error) && !patchReportingFallback) {
         throw error;
       }
 
       logger.info('Falling back to Classic API for smart group update', {
         canCallClassicApi: this.canCallClassicApi(),
         status: getAxiosErrorStatus(error),
+        patchReportingFallback,
       });
 
       // Fall back to Classic API
