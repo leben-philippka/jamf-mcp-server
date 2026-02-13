@@ -131,6 +131,7 @@ export class JamfApiClientHybrid {
   private circuitBreaker: CircuitBreaker | null = null;
   private circuitBreakerEnabled: boolean = false;
   private readonly policyWriteLocks: Map<string, Promise<void>> = new Map();
+  private smartGroupCriteriaCatalogCache: { fetchedAt: number; names: string[] } | null = null;
 
   private async sleep(ms: number): Promise<void> {
     const waitMs = Number(ms);
@@ -3523,6 +3524,272 @@ export class JamfApiClientHybrid {
     );
   }
 
+  private normalizePatchReportingTitle(raw: string): string {
+    return String(raw ?? '')
+      .toLowerCase()
+      .replace(/^patch reporting:\s*/i, '')
+      .replace(/\([^)]*\)/g, '')
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim();
+  }
+
+  private extractCriterionNamesFromUnknown(node: unknown, out: Set<string>): void {
+    if (node === null || node === undefined) return;
+
+    if (Array.isArray(node)) {
+      for (const item of node) this.extractCriterionNamesFromUnknown(item, out);
+      return;
+    }
+
+    if (typeof node === 'string') {
+      const trimmed = node.trim();
+      if (trimmed) out.add(trimmed);
+      return;
+    }
+
+    if (typeof node !== 'object') return;
+
+    const obj = node as Record<string, unknown>;
+    for (const [key, value] of Object.entries(obj)) {
+      const lowerKey = key.toLowerCase();
+      if (lowerKey === 'name' && typeof value === 'string') {
+        const trimmed = value.trim();
+        if (trimmed) out.add(trimmed);
+      }
+      this.extractCriterionNamesFromUnknown(value, out);
+    }
+  }
+
+  private async listClassicSmartGroupCriteriaNames(forceRefresh: boolean = false): Promise<string[]> {
+    const cacheTtlMs = Math.max(0, Number(process.env.JAMF_SMART_GROUP_CRITERIA_CACHE_MS ?? 300000));
+
+    if (!forceRefresh && this.smartGroupCriteriaCatalogCache) {
+      const ageMs = Date.now() - this.smartGroupCriteriaCatalogCache.fetchedAt;
+      if (ageMs <= cacheTtlMs) {
+        return this.smartGroupCriteriaCatalogCache.names;
+      }
+    }
+
+    try {
+      const response = await this.axiosInstance.get('/JSSResource/computergroups/criteria', {
+        headers: {
+          Accept: 'application/json',
+        },
+      });
+
+      const names = new Set<string>();
+      this.extractCriterionNamesFromUnknown(response?.data, names);
+
+      if (typeof response?.data === 'string') {
+        const xml = response.data;
+        const matches = xml.matchAll(/<name>\s*([^<]+?)\s*<\/name>/gi);
+        for (const match of matches) {
+          const name = String(match?.[1] ?? '').trim();
+          if (name) names.add(name);
+        }
+      }
+
+      const sorted = Array.from(names).sort((a, b) => a.localeCompare(b));
+      this.smartGroupCriteriaCatalogCache = { fetchedAt: Date.now(), names: sorted };
+      return sorted;
+    } catch (error) {
+      logger.info('Unable to fetch Classic smart-group criteria catalog', {
+        status: getAxiosErrorStatus(error),
+        data: getAxiosErrorData(error),
+      });
+      return this.smartGroupCriteriaCatalogCache?.names ?? [];
+    }
+  }
+
+  private resolvePatchReportingCriterionName(requestedName: string, availableCriteria: string[]): string {
+    const requestedTrimmed = String(requestedName ?? '').trim();
+    if (!requestedTrimmed) return requestedTrimmed;
+
+    const requestedLower = requestedTrimmed.toLowerCase();
+    const patchCriteria = availableCriteria.filter((name) =>
+      String(name ?? '').trim().toLowerCase().startsWith('patch reporting:')
+    );
+    if (patchCriteria.length === 0) return requestedTrimmed;
+
+    const fullExact = patchCriteria.find((name) => name.trim().toLowerCase() === requestedLower);
+    if (fullExact) return fullExact;
+
+    const requestedTitle = this.normalizePatchReportingTitle(requestedTrimmed);
+    if (!requestedTitle) return requestedTrimmed;
+
+    const normalizedMatch = patchCriteria.find((name) =>
+      this.normalizePatchReportingTitle(name) === requestedTitle
+    );
+    if (normalizedMatch) return normalizedMatch;
+
+    const fuzzy = patchCriteria.find((name) => {
+      const normalized = this.normalizePatchReportingTitle(name);
+      return normalized.includes(requestedTitle) || requestedTitle.includes(normalized);
+    });
+    return fuzzy ?? requestedTrimmed;
+  }
+
+  private async resolvePatchReportingCriteriaForTenant(criteria: JamfSearchCriteria[]): Promise<JamfSearchCriteria[]> {
+    if (!this.hasPatchReportingCriterion(criteria)) return criteria;
+
+    const availableCriteria = await this.listClassicSmartGroupCriteriaNames();
+    if (availableCriteria.length === 0) return criteria;
+
+    return criteria.map((criterion) => {
+      const name = String(criterion.name ?? '').trim();
+      if (!name.toLowerCase().startsWith('patch reporting:')) return criterion;
+
+      const resolvedName = this.resolvePatchReportingCriterionName(name, availableCriteria);
+      if (resolvedName !== name) {
+        logger.info('Resolved Patch Reporting criterion name using tenant criteria catalog', {
+          requestedName: name,
+          resolvedName,
+        });
+      }
+
+      return {
+        ...criterion,
+        name: resolvedName,
+      };
+    });
+  }
+
+  private buildSmartGroupCriterionSignature(criterion: JamfSearchCriteria): string {
+    const normalized = normalizeSmartGroupCriterion(criterion);
+    return [
+      String(normalized.name ?? '').trim().toLowerCase(),
+      String(normalized.and_or ?? '').trim().toLowerCase(),
+      String(normalized.search_type ?? '').trim().toLowerCase(),
+      String(normalized.value ?? '').trim().toLowerCase(),
+    ].join('|');
+  }
+
+  private findSmartGroupExpectationMismatches(
+    actualGroup: any,
+    expected: { name: string; criteria: JamfSearchCriteria[]; siteId?: number }
+  ): string[] {
+    const mismatches: string[] = [];
+
+    const actualName = String(actualGroup?.name ?? '').trim();
+    const expectedName = String(expected.name ?? '').trim();
+    if (expectedName && actualName !== expectedName) {
+      mismatches.push(`name(expected=${JSON.stringify(expectedName)}, actual=${JSON.stringify(actualName)})`);
+    }
+
+    const actualCriteria = this.normalizeSmartGroupCriteria(actualGroup?.criteria ?? actualGroup?.criterion ?? []);
+    const expectedCriteria = this.normalizeSmartGroupCriteria(expected.criteria);
+
+    const actualSignatures = actualCriteria.map((criterion) => this.buildSmartGroupCriterionSignature(criterion)).sort();
+    const expectedSignatures = expectedCriteria
+      .map((criterion) => this.buildSmartGroupCriterionSignature(criterion))
+      .sort();
+
+    const criteriaMatch =
+      actualSignatures.length === expectedSignatures.length &&
+      actualSignatures.every((signature, idx) => signature === expectedSignatures[idx]);
+
+    if (!criteriaMatch) {
+      mismatches.push(
+        `criteria(expected=${JSON.stringify(expectedSignatures.slice(0, 6))}, actual=${JSON.stringify(
+          actualSignatures.slice(0, 6)
+        )})`
+      );
+    }
+
+    if (expected.siteId !== undefined && expected.siteId !== null) {
+      const expectedSiteId = Number(expected.siteId);
+      if (Number.isFinite(expectedSiteId)) {
+        const actualSiteId = Number(actualGroup?.site?.id);
+        if (!Number.isFinite(actualSiteId) || actualSiteId !== expectedSiteId) {
+          mismatches.push(`site.id(expected=${expectedSiteId}, actual=${JSON.stringify(actualGroup?.site?.id)})`);
+        }
+      }
+    }
+
+    return mismatches;
+  }
+
+  private async verifySmartComputerGroupUpdatePersisted(
+    groupId: string,
+    expected: { name: string; criteria: JamfSearchCriteria[]; siteId?: number }
+  ): Promise<any> {
+    const strictEnabled = String(process.env.JAMF_SMART_GROUP_VERIFY_ENABLED ?? 'true').toLowerCase() !== 'false';
+    if (!strictEnabled) {
+      return await this.getComputerGroupDetails(groupId);
+    }
+
+    const attempts = Math.max(1, Number(process.env.JAMF_SMART_GROUP_VERIFY_ATTEMPTS ?? 12));
+    const delayMs = Math.max(0, Number(process.env.JAMF_SMART_GROUP_VERIFY_DELAY_MS ?? 350));
+    const requiredConsistentReads = Math.max(
+      1,
+      Number(process.env.JAMF_SMART_GROUP_VERIFY_REQUIRED_CONSISTENT_READS ?? 1)
+    );
+
+    let candidate: any = null;
+    let matchedReads = 0;
+    let lastMismatches: string[] = [];
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      candidate = await this.getComputerGroupDetails(groupId);
+      const mismatches = this.findSmartGroupExpectationMismatches(candidate, expected);
+
+      if (mismatches.length === 0) {
+        matchedReads += 1;
+        if (matchedReads >= requiredConsistentReads) {
+          return candidate;
+        }
+      } else {
+        matchedReads = 0;
+        lastMismatches = mismatches;
+      }
+
+      if (attempt < attempts) {
+        await this.sleep(delayMs * attempt);
+      }
+    }
+
+    const sample = lastMismatches.slice(0, 6).join('; ');
+    throw new Error(
+      `Smart group ${groupId} update did not persist requested fields after ${attempts} fresh checks (required consistent reads: ${requiredConsistentReads}): ${sample}`
+    );
+  }
+
+  private isSmartGroupPersistVerifyError(error: unknown): boolean {
+    if (!(error instanceof Error)) return false;
+    const message = String(error.message ?? '').toLowerCase();
+    return message.includes('smart group') && message.includes('did not persist requested fields');
+  }
+
+  private async buildPatchReportingCriteriaDiagnostics(params: {
+    requestedCriteria: JamfSearchCriteria[];
+    sentCriteria: JamfSearchCriteria[];
+    patchReportingFallback: boolean;
+    modernError?: unknown;
+    classicError?: unknown;
+  }): Promise<string> {
+    const requestedPatchCriteria = params.requestedCriteria
+      .map((criterion) => String(criterion.name ?? '').trim())
+      .filter((name) => name.toLowerCase().startsWith('patch reporting:'));
+
+    const sentPatchCriteria = params.sentCriteria
+      .map((criterion) => String(criterion.name ?? '').trim())
+      .filter((name) => name.toLowerCase().startsWith('patch reporting:'));
+
+    const availablePatchCriteria = (await this.listClassicSmartGroupCriteriaNames()).filter((name) =>
+      String(name ?? '').trim().toLowerCase().startsWith('patch reporting:')
+    );
+
+    return [
+      `requestedPatchCriteria=${JSON.stringify(requestedPatchCriteria)}`,
+      `sentPatchCriteria=${JSON.stringify(sentPatchCriteria)}`,
+      `fallbackFromModern=${params.patchReportingFallback}`,
+      `modernStatus=${JSON.stringify(getAxiosErrorStatus(params.modernError))}`,
+      `classicStatus=${JSON.stringify(getAxiosErrorStatus(params.classicError))}`,
+      `availablePatchCriteriaCount=${availablePatchCriteria.length}`,
+      `availablePatchCriteriaSample=${JSON.stringify(availablePatchCriteria.slice(0, 20))}`,
+    ].join('; ');
+  }
+
   /**
    * Build Modern API payload for smart computer groups
    */
@@ -3662,12 +3929,13 @@ export class JamfApiClientHybrid {
     if (normalizedCriteria.length === 0) {
       throw new Error('Smart group criteria cannot be empty');
     }
+    const resolvedCriteria = await this.resolvePatchReportingCriteriaForTenant(normalizedCriteria);
 
     // Try Modern API first
     try {
       logger.info(`Creating smart computer group "${name}" using Modern API...`);
 
-      const modernPayload = this.buildModernSmartGroupPayload(name, normalizedCriteria, siteId);
+      const modernPayload = this.buildModernSmartGroupPayload(name, resolvedCriteria, siteId);
       const response = await this.axiosInstance.post('/api/v2/computer-groups/smart-groups', modernPayload);
       const createdId = response.data?.id ? String(response.data.id) : null;
 
@@ -3693,7 +3961,7 @@ export class JamfApiClientHybrid {
 
       const patchReportingFallback = this.shouldFallbackToClassicForPatchReportingCriteria(
         error,
-        normalizedCriteria
+        resolvedCriteria
       );
       if (!this.shouldFallbackToClassicOnModernError(error) && !patchReportingFallback) {
         // Surface Modern errors directly to avoid masking validation errors with Classic 401s.
@@ -3708,7 +3976,7 @@ export class JamfApiClientHybrid {
 
       // Fall back to Classic API
       try {
-        const xmlPayload = this.buildClassicSmartGroupXml(name, criteria, siteId);
+        const xmlPayload = this.buildClassicSmartGroupXml(name, resolvedCriteria, siteId);
         const response = await this.axiosInstance.post(
           '/JSSResource/computergroups/id/0',
           xmlPayload,
@@ -3748,33 +4016,40 @@ export class JamfApiClientHybrid {
 
     const groupDetails = await this.getComputerGroupDetails(groupId);
     const newName = updates.name ?? groupDetails.name;
-    const newCriteria = this.normalizeSmartGroupCriteria(updates.criteria ?? groupDetails.criteria);
-    if (newCriteria.length === 0) {
+    const requestedCriteria = this.normalizeSmartGroupCriteria(updates.criteria ?? groupDetails.criteria);
+    if (requestedCriteria.length === 0) {
       throw new Error('Smart group criteria cannot be empty');
     }
+    const resolvedCriteria = await this.resolvePatchReportingCriteriaForTenant(requestedCriteria);
     const resolvedSiteId = updates.siteId ?? groupDetails.site?.id;
 
     // Try Modern API first
     try {
       logger.info(`Updating smart computer group ${groupId} using Modern API...`);
 
-      const modernPayload = this.buildModernSmartGroupPayload(newName, newCriteria, resolvedSiteId);
-      const response = await this.axiosInstance.put(
+      const modernPayload = this.buildModernSmartGroupPayload(newName, resolvedCriteria, resolvedSiteId);
+      await this.axiosInstance.put(
         `/api/v2/computer-groups/smart-groups/${groupId}`,
         modernPayload
       );
 
-      return response.data;
+      return await this.verifySmartComputerGroupUpdatePersisted(groupId, {
+        name: newName,
+        criteria: resolvedCriteria,
+        siteId: resolvedSiteId,
+      });
     } catch (error) {
       logger.info('Modern API failed, trying Classic API...', {
         status: getAxiosErrorStatus(error),
         data: getAxiosErrorData(error),
       });
 
-      const patchReportingFallback = this.shouldFallbackToClassicForPatchReportingCriteria(
-        error,
-        newCriteria
-      );
+      const patchReportingFallback =
+        this.shouldFallbackToClassicForPatchReportingCriteria(error, resolvedCriteria) ||
+        (this.isSmartGroupPersistVerifyError(error) &&
+          this.hasPatchReportingCriterion(resolvedCriteria) &&
+          this.canCallClassicApi());
+
       if (!this.shouldFallbackToClassicOnModernError(error) && !patchReportingFallback) {
         throw error;
       }
@@ -3787,8 +4062,8 @@ export class JamfApiClientHybrid {
 
       // Fall back to Classic API
       try {
-        const xmlPayload = this.buildClassicSmartGroupXml(newName, newCriteria, resolvedSiteId);
-        const response = await this.axiosInstance.put(
+        const xmlPayload = this.buildClassicSmartGroupXml(newName, resolvedCriteria, resolvedSiteId);
+        await this.axiosInstance.put(
           `/JSSResource/computergroups/id/${groupId}`,
           xmlPayload,
           {
@@ -3799,13 +4074,32 @@ export class JamfApiClientHybrid {
           }
         );
 
-        return response.data;
+        return await this.verifySmartComputerGroupUpdatePersisted(groupId, {
+          name: newName,
+          criteria: resolvedCriteria,
+          siteId: resolvedSiteId,
+        });
       } catch (classicError) {
         logger.info('Classic API also failed:', classicError);
+
+        if (getAxiosErrorStatus(classicError) === 409 && this.hasPatchReportingCriterion(resolvedCriteria)) {
+          const diagnostics = await this.buildPatchReportingCriteriaDiagnostics({
+            requestedCriteria,
+            sentCriteria: resolvedCriteria,
+            patchReportingFallback,
+            modernError: error,
+            classicError,
+          });
+          throw new Error(
+            `Classic smart group update failed with 409 (Problem with criteria). ${diagnostics}`
+          );
+        }
+
         throw classicError;
       }
     }
   }
+
 
   /**
    * Create static computer group

@@ -259,7 +259,13 @@ describe('JamfApiClientHybrid smart group behavior', () => {
 
     jestGlobals
       .spyOn(client, 'getComputerGroupDetails')
-      .mockResolvedValue({ id: '123', name: 'Smart Group', is_smart: true, criteria });
+      .mockResolvedValueOnce({ id: '123', name: 'Smart Group', is_smart: true, criteria })
+      .mockResolvedValueOnce({
+        id: '123',
+        name: 'Updated Group',
+        is_smart: true,
+        criteria,
+      });
 
     mockAxiosInstance.put.mockResolvedValueOnce({ data: { id: '123' } });
 
@@ -283,6 +289,50 @@ describe('JamfApiClientHybrid smart group behavior', () => {
     );
   });
 
+  test('updateSmartComputerGroup fails strict verification when write response succeeds but readback is unchanged', async () => {
+    const client = createClient();
+    const oldEnv = {
+      attempts: process.env.JAMF_SMART_GROUP_VERIFY_ATTEMPTS,
+      delay: process.env.JAMF_SMART_GROUP_VERIFY_DELAY_MS,
+      consistent: process.env.JAMF_SMART_GROUP_VERIFY_REQUIRED_CONSISTENT_READS,
+    };
+
+    process.env.JAMF_SMART_GROUP_VERIFY_ATTEMPTS = '2';
+    process.env.JAMF_SMART_GROUP_VERIFY_DELAY_MS = '0';
+    process.env.JAMF_SMART_GROUP_VERIFY_REQUIRED_CONSISTENT_READS = '1';
+
+    const criteria: SmartGroupCriteriaInput[] = [
+      {
+        name: 'Last Check-in',
+        priority: 0,
+        and_or: 'and',
+        search_type: 'more than x days ago',
+        value: '30',
+      },
+    ];
+
+    try {
+      jestGlobals
+        .spyOn(client, 'getComputerGroupDetails')
+        .mockResolvedValueOnce({ id: '123', name: 'Smart Group', is_smart: true, criteria })
+        .mockResolvedValueOnce({ id: '123', name: 'Smart Group', is_smart: true, criteria })
+        .mockResolvedValueOnce({ id: '123', name: 'Smart Group', is_smart: true, criteria });
+
+      mockAxiosInstance.put.mockResolvedValueOnce({ data: { id: '123' } });
+
+      await expect(client.updateSmartComputerGroup('123', { name: 'Updated Group', criteria })).rejects.toThrow(
+        'did not persist requested fields'
+      );
+    } finally {
+      if (oldEnv.attempts === undefined) delete process.env.JAMF_SMART_GROUP_VERIFY_ATTEMPTS;
+      else process.env.JAMF_SMART_GROUP_VERIFY_ATTEMPTS = oldEnv.attempts;
+      if (oldEnv.delay === undefined) delete process.env.JAMF_SMART_GROUP_VERIFY_DELAY_MS;
+      else process.env.JAMF_SMART_GROUP_VERIFY_DELAY_MS = oldEnv.delay;
+      if (oldEnv.consistent === undefined) delete process.env.JAMF_SMART_GROUP_VERIFY_REQUIRED_CONSISTENT_READS;
+      else process.env.JAMF_SMART_GROUP_VERIFY_REQUIRED_CONSISTENT_READS = oldEnv.consistent;
+    }
+  });
+
   test('updateSmartComputerGroup falls back to Classic API when Modern fails', async () => {
     const client = createClient();
     const criteria: SmartGroupCriteriaInput[] = [
@@ -297,7 +347,8 @@ describe('JamfApiClientHybrid smart group behavior', () => {
 
     jestGlobals
       .spyOn(client, 'getComputerGroupDetails')
-      .mockResolvedValue({ id: '123', name: 'Smart Group', is_smart: true, criteria });
+      .mockResolvedValueOnce({ id: '123', name: 'Smart Group', is_smart: true, criteria })
+      .mockResolvedValueOnce({ id: '123', name: 'Updated Group', is_smart: true, criteria });
 
     mockAxiosInstance.put
       .mockRejectedValueOnce({
@@ -346,7 +397,13 @@ describe('JamfApiClientHybrid smart group behavior', () => {
 
     jestGlobals
       .spyOn(client, 'getComputerGroupDetails')
-      .mockResolvedValue({ id: '123', name: 'Patch Reporting Group', is_smart: true, criteria });
+      .mockResolvedValueOnce({ id: '123', name: 'Patch Reporting Group', is_smart: true, criteria })
+      .mockResolvedValueOnce({
+        id: '123',
+        name: 'Updated Patch Reporting Group',
+        is_smart: true,
+        criteria,
+      });
 
     mockAxiosInstance.put
       .mockRejectedValueOnce({
@@ -363,6 +420,103 @@ describe('JamfApiClientHybrid smart group behavior', () => {
     expect(mockAxiosInstance.put).toHaveBeenCalledTimes(2);
     expect(mockAxiosInstance.put.mock.calls[0][0]).toBe('/api/v2/computer-groups/smart-groups/123');
     expect(mockAxiosInstance.put.mock.calls[1][0]).toBe('/JSSResource/computergroups/id/123');
+  });
+
+  test('updateSmartComputerGroup resolves Patch Reporting criterion name from tenant catalog', async () => {
+    const client = createClient();
+    const criteria: SmartGroupCriteriaInput[] = [
+      {
+        name: 'Patch Reporting: Mozilla Firefox',
+        priority: 0,
+        and_or: 'and',
+        search_type: 'less than',
+        value: 'Latest Version',
+      },
+    ];
+
+    mockAxiosInstance.get.mockResolvedValueOnce({
+      data: {
+        computer_group_criteria: {
+          criterion: [{ name: 'Patch Reporting: Firefox' }],
+        },
+      },
+    });
+
+    jestGlobals
+      .spyOn(client, 'getComputerGroupDetails')
+      .mockResolvedValueOnce({ id: '123', name: 'Patch Reporting Group', is_smart: true, criteria })
+      .mockResolvedValueOnce({
+        id: '123',
+        name: 'Updated Patch Reporting Group',
+        is_smart: true,
+        criteria: [
+          {
+            ...criteria[0],
+            name: 'Patch Reporting: Firefox',
+          },
+        ],
+      });
+
+    mockAxiosInstance.put.mockResolvedValueOnce({ data: { id: '123' } });
+
+    await client.updateSmartComputerGroup('123', {
+      name: 'Updated Patch Reporting Group',
+      criteria,
+    });
+
+    expect(mockAxiosInstance.put).toHaveBeenCalledTimes(1);
+    expect(mockAxiosInstance.put.mock.calls[0][1]).toEqual(
+      expect.objectContaining({
+        criteria: [
+          expect.objectContaining({ name: 'Patch Reporting: Firefox' }),
+        ],
+      })
+    );
+  });
+
+  test('updateSmartComputerGroup includes patch diagnostics on Classic 409 criteria errors', async () => {
+    const client = createClient();
+    const criteria: SmartGroupCriteriaInput[] = [
+      {
+        name: 'Patch Reporting: Mozilla Firefox',
+        priority: 0,
+        and_or: 'and',
+        search_type: 'less than',
+        value: 'Latest Version',
+      },
+    ];
+
+    mockAxiosInstance.get.mockResolvedValueOnce({
+      data: {
+        computer_group_criteria: {
+          criterion: [{ name: 'Patch Reporting: Firefox' }],
+        },
+      },
+    });
+
+    jestGlobals
+      .spyOn(client, 'getComputerGroupDetails')
+      .mockResolvedValueOnce({ id: '123', name: 'Patch Reporting Group', is_smart: true, criteria });
+
+    mockAxiosInstance.put
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: {
+          status: 400,
+          data: { message: 'The criterion Patch Reporting: Mozilla Firefox is not valid (undefined)' },
+        },
+      })
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: {
+          status: 409,
+          data: { message: 'Problem with criteria' },
+        },
+      });
+
+    await expect(
+      client.updateSmartComputerGroup('123', { name: 'Updated Patch Reporting Group', criteria })
+    ).rejects.toThrow('requestedPatchCriteria=');
   });
 
   test('updateSmartComputerGroup does not fall back to Classic API on Modern 400 for non-patch criteria', async () => {
@@ -395,6 +549,7 @@ describe('JamfApiClientHybrid smart group behavior', () => {
     expect(mockAxiosInstance.put).toHaveBeenCalledTimes(1);
     expect(mockAxiosInstance.put.mock.calls[0][0]).toBe('/api/v2/computer-groups/smart-groups/123');
   });
+
 
   test('createSmartComputerGroup maps normalized criteria to Modern payload', async () => {
     const client = createClient();
