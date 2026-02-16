@@ -2518,15 +2518,26 @@ export class JamfApiClientHybrid {
       1,
       Number(process.env.JAMF_POLICY_VERIFY_REQUIRED_CONSISTENT_READS ?? 2)
     );
+    const maxDurationRaw = Number(process.env.JAMF_POLICY_VERIFY_MAX_DURATION_MS ?? 45000);
+    const maxDurationMs = Number.isFinite(maxDurationRaw) && maxDurationRaw > 0 ? maxDurationRaw : 0;
+    const deadlineAt = maxDurationMs > 0 ? Date.now() + maxDurationMs : null;
 
     let candidate: any;
     let lastMismatches: string[] = [];
     let matchedReads = 0;
+    let completedChecks = 0;
+    let deadlineExceeded = false;
 
     for (let attempt = 1; attempt <= attempts; attempt++) {
+      if (deadlineAt !== null && Date.now() > deadlineAt) {
+        deadlineExceeded = true;
+        break;
+      }
+
       // Always use a fresh read for verification.
       // Never trust the immediate write response as persisted ground truth.
       candidate = await this.getPolicyDetailsFresh(policyId);
+      completedChecks += 1;
 
       const jsonMismatches = this.findPolicyExpectationMismatches(candidate, expectations);
 
@@ -2550,11 +2561,27 @@ export class JamfApiClientHybrid {
       }
 
       if (attempt < attempts) {
-        await this.sleep(delayMs * attempt);
+        let sleepMs = delayMs * attempt;
+        if (deadlineAt !== null) {
+          const remainingMs = deadlineAt - Date.now();
+          if (remainingMs <= 0) {
+            deadlineExceeded = true;
+            break;
+          }
+          sleepMs = Math.min(sleepMs, remainingMs);
+        }
+        if (sleepMs > 0) {
+          await this.sleep(sleepMs);
+        }
       }
     }
 
     const sample = lastMismatches.slice(0, 6).join('; ');
+    if (deadlineExceeded && maxDurationMs > 0) {
+      throw new Error(
+        `Policy ${policyId} update did not persist requested fields before verify deadline (${maxDurationMs}ms) after ${completedChecks} fresh checks (required consistent reads: ${requiredConsistentReads}): ${sample}`
+      );
+    }
     throw new Error(
       `Policy ${policyId} update did not persist requested fields after ${attempts} fresh checks (required consistent reads: ${requiredConsistentReads}): ${sample}`
     );

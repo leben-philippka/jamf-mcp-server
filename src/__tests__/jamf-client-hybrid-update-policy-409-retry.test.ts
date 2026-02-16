@@ -276,4 +276,61 @@ describe('JamfApiClientHybrid updatePolicyXml strict verify for date_time_limita
       )
     ).resolves.toBeDefined();
   });
+
+  test('returns verify deadline error before exhausting all attempts', async () => {
+    const client = createClient();
+    const prevAttempts = process.env.JAMF_POLICY_VERIFY_ATTEMPTS;
+    const prevDelay = process.env.JAMF_POLICY_VERIFY_DELAY_MS;
+    const prevConsistentReads = process.env.JAMF_POLICY_VERIFY_REQUIRED_CONSISTENT_READS;
+    const prevRequireXml = process.env.JAMF_POLICY_VERIFY_REQUIRE_XML;
+    const prevMaxDuration = process.env.JAMF_POLICY_VERIFY_MAX_DURATION_MS;
+
+    process.env.JAMF_POLICY_VERIFY_ATTEMPTS = '20';
+    process.env.JAMF_POLICY_VERIFY_DELAY_MS = '500';
+    process.env.JAMF_POLICY_VERIFY_REQUIRED_CONSISTENT_READS = '1';
+    process.env.JAMF_POLICY_VERIFY_REQUIRE_XML = 'false';
+    process.env.JAMF_POLICY_VERIFY_MAX_DURATION_MS = '50';
+
+    const nowValues = [0, 10, 80];
+    const dateNowSpy = jest.spyOn(Date, 'now').mockImplementation(() => nowValues.shift() ?? 80);
+
+    try {
+      mockAxiosInstance.put.mockResolvedValueOnce({ data: {} });
+
+      jest.spyOn(client as any, 'getPolicyDetails').mockResolvedValue({
+        id: 74,
+        general: {
+          date_time_limitations: {
+            no_execute_start: '09:00',
+          },
+        },
+      });
+
+      jest.spyOn(client as any, 'getPolicyDetailsFresh').mockResolvedValue({
+        id: 74,
+        general: {
+          date_time_limitations: {
+            no_execute_start: '08:00',
+          },
+        },
+      });
+
+      await expect(
+        (client as any).updatePolicyXml(
+          '74',
+          '<?xml version="1.0" encoding="UTF-8"?>' +
+            '<policy><general><name>Auto Update - Notion</name>' +
+            '<date_time_limitations><no_execute_start>09:00</no_execute_start></date_time_limitations>' +
+            '</general></policy>'
+        )
+      ).rejects.toThrow('before verify deadline (50ms)');
+    } finally {
+      dateNowSpy.mockRestore();
+      process.env.JAMF_POLICY_VERIFY_ATTEMPTS = prevAttempts;
+      process.env.JAMF_POLICY_VERIFY_DELAY_MS = prevDelay;
+      process.env.JAMF_POLICY_VERIFY_REQUIRED_CONSISTENT_READS = prevConsistentReads;
+      process.env.JAMF_POLICY_VERIFY_REQUIRE_XML = prevRequireXml;
+      process.env.JAMF_POLICY_VERIFY_MAX_DURATION_MS = prevMaxDuration;
+    }
+  });
 });
