@@ -436,7 +436,7 @@ Add these optional environment variables:
     "JAMF_ENABLE_RATE_LIMITING": "false",  // Enable rate limiting (default: false)
     "JAMF_ENABLE_CIRCUIT_BREAKER": "false", // Enable circuit breaker (default: false)
     "MCP_STDIO_GUARD_ENABLED": "true",      // Auto-clean stdio ghost processes
-    "MCP_STDIO_IDLE_TIMEOUT_MS": "1800000", // 30m idle timeout; set 0 to disable
+    "MCP_STDIO_IDLE_TIMEOUT_MS": "0",       // Default disabled for stable sessions; set >0 to auto-shutdown idle stdio servers
     "MCP_STDIO_PARENT_CHECK_INTERVAL_MS": "30000", // 30s parent watchdog; set 0 to disable
     "JAMF_POLICY_VERIFY_ATTEMPTS": "20",                // Strict policy verification attempts
     "JAMF_POLICY_VERIFY_DELAY_MS": "500",                // Base delay between verification reads

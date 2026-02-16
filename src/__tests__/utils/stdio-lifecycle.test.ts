@@ -11,11 +11,11 @@ describe('stdio lifecycle guard', () => {
     jest.useFakeTimers();
   });
 
-  test('uses strict defaults when env vars are missing', () => {
+  test('uses defaults that keep stdio sessions stable when env vars are missing', () => {
     const config = getStdioLifecycleConfig({});
 
     expect(config.enabled).toBe(true);
-    expect(config.idleTimeoutMs).toBe(30 * 60 * 1000);
+    expect(config.idleTimeoutMs).toBe(0);
     expect(config.parentCheckIntervalMs).toBe(30 * 1000);
   });
 
