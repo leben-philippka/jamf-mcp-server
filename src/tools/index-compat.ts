@@ -370,10 +370,16 @@ const CreatePolicyDataSchema = z.object({
       target_drive: z.string().optional().describe('Target drive for installations'),
       offline: z.boolean().optional().describe('Make available offline'),
       date_time_limitations: z.object({
-        no_execute_start: z.string().optional().describe('Do not execute between start time (HH:MM)'),
-        no_execute_end: z.string().optional().describe('Do not execute between end time (HH:MM)'),
+        activation_date: z.string().optional().describe('Server-side activation date/time (Jamf host timezone, typically UTC)'),
+        activation_date_epoch: z.number().optional().describe('Server-side activation epoch time'),
+        activation_date_utc: z.string().optional().describe('Server-side activation UTC timestamp'),
+        expiration_date: z.string().optional().describe('Server-side expiration date/time (Jamf host timezone, typically UTC)'),
+        expiration_date_epoch: z.number().optional().describe('Server-side expiration epoch time'),
+        expiration_date_utc: z.string().optional().describe('Server-side expiration UTC timestamp'),
+        no_execute_start: z.string().optional().describe('Client-side: do not execute between start time (HH:MM, tenant-dependent; some Jamf tenants expect 12h format like 5:00 PM)'),
+        no_execute_end: z.string().optional().describe('Client-side: do not execute between end time (HH:MM, tenant-dependent; some Jamf tenants expect 12h format like 9:00 AM)'),
         no_execute_on: z.string().optional().describe('Do not execute on specified days (Jamf Classic string)'),
-      }).optional().describe('Date and time execution limitations'),
+      }).optional().describe('Date/time limits. Server-side limits use Jamf Pro host timezone (typically UTC). Client-side no_execute_* parsing can vary by tenant/version.'),
       category: z.string().optional().describe('Policy category'),
     }).describe('General policy settings'),
     scope: z.object({
@@ -491,10 +497,16 @@ const UpdatePolicyDataSchema = z.object({
       target_drive: z.string().optional().describe('Target drive for installations'),
       offline: z.boolean().optional().describe('Make available offline'),
       date_time_limitations: z.object({
-        no_execute_start: z.string().optional().describe('Do not execute between start time (HH:MM)'),
-        no_execute_end: z.string().optional().describe('Do not execute between end time (HH:MM)'),
+        activation_date: z.string().optional().describe('Server-side activation date/time (Jamf host timezone, typically UTC)'),
+        activation_date_epoch: z.number().optional().describe('Server-side activation epoch time'),
+        activation_date_utc: z.string().optional().describe('Server-side activation UTC timestamp'),
+        expiration_date: z.string().optional().describe('Server-side expiration date/time (Jamf host timezone, typically UTC)'),
+        expiration_date_epoch: z.number().optional().describe('Server-side expiration epoch time'),
+        expiration_date_utc: z.string().optional().describe('Server-side expiration UTC timestamp'),
+        no_execute_start: z.string().optional().describe('Client-side: do not execute between start time (HH:MM, tenant-dependent; some Jamf tenants expect 12h format like 5:00 PM)'),
+        no_execute_end: z.string().optional().describe('Client-side: do not execute between end time (HH:MM, tenant-dependent; some Jamf tenants expect 12h format like 9:00 AM)'),
         no_execute_on: z.string().optional().describe('Do not execute on specified days (Jamf Classic string)'),
-      }).optional().describe('Date and time execution limitations'),
+      }).optional().describe('Date/time limits. Server-side limits use Jamf Pro host timezone (typically UTC). Client-side no_execute_* parsing can vary by tenant/version.'),
       category: z.string().optional().describe('Policy category'),
     }).optional().describe('General policy settings to update'),
     scope: z.object({
@@ -2167,10 +2179,43 @@ export function createBaseToolHandlers(jamfClient: any): {
 	                    },
 	                    date_time_limitations: {
                       type: 'object',
-                      description: 'Date and time execution limitations',
+                      description:
+                        'Date/time limits. Server-side limits use Jamf Pro host timezone (typically UTC). Client-side no_execute_* parsing can vary by tenant/version.',
                       properties: {
-                        no_execute_start: { type: 'string', description: 'Do not execute between start time (HH:MM)' },
-                        no_execute_end: { type: 'string', description: 'Do not execute between end time (HH:MM)' },
+                        activation_date: {
+                          type: 'string',
+                          description: 'Server-side activation date/time (Jamf host timezone, typically UTC)',
+                        },
+                        activation_date_epoch: {
+                          type: 'number',
+                          description: 'Server-side activation epoch time',
+                        },
+                        activation_date_utc: {
+                          type: 'string',
+                          description: 'Server-side activation UTC timestamp',
+                        },
+                        expiration_date: {
+                          type: 'string',
+                          description: 'Server-side expiration date/time (Jamf host timezone, typically UTC)',
+                        },
+                        expiration_date_epoch: {
+                          type: 'number',
+                          description: 'Server-side expiration epoch time',
+                        },
+                        expiration_date_utc: {
+                          type: 'string',
+                          description: 'Server-side expiration UTC timestamp',
+                        },
+                        no_execute_start: {
+                          type: 'string',
+                          description:
+                            'Client-side: do not execute between start time (HH:MM, tenant-dependent; some Jamf tenants expect 12h format like 5:00 PM)',
+                        },
+                        no_execute_end: {
+                          type: 'string',
+                          description:
+                            'Client-side: do not execute between end time (HH:MM, tenant-dependent; some Jamf tenants expect 12h format like 9:00 AM)',
+                        },
                         no_execute_on: { type: 'string', description: 'Do not execute on specified days (Jamf Classic string)' },
                       },
                     },
@@ -2410,10 +2455,43 @@ export function createBaseToolHandlers(jamfClient: any): {
 	                    },
 	                    date_time_limitations: {
                       type: 'object',
-                      description: 'Date and time execution limitations',
+                      description:
+                        'Date/time limits. Server-side limits use Jamf Pro host timezone (typically UTC). Client-side no_execute_* parsing can vary by tenant/version.',
                       properties: {
-                        no_execute_start: { type: 'string', description: 'Do not execute between start time (HH:MM)' },
-                        no_execute_end: { type: 'string', description: 'Do not execute between end time (HH:MM)' },
+                        activation_date: {
+                          type: 'string',
+                          description: 'Server-side activation date/time (Jamf host timezone, typically UTC)',
+                        },
+                        activation_date_epoch: {
+                          type: 'number',
+                          description: 'Server-side activation epoch time',
+                        },
+                        activation_date_utc: {
+                          type: 'string',
+                          description: 'Server-side activation UTC timestamp',
+                        },
+                        expiration_date: {
+                          type: 'string',
+                          description: 'Server-side expiration date/time (Jamf host timezone, typically UTC)',
+                        },
+                        expiration_date_epoch: {
+                          type: 'number',
+                          description: 'Server-side expiration epoch time',
+                        },
+                        expiration_date_utc: {
+                          type: 'string',
+                          description: 'Server-side expiration UTC timestamp',
+                        },
+                        no_execute_start: {
+                          type: 'string',
+                          description:
+                            'Client-side: do not execute between start time (HH:MM, tenant-dependent; some Jamf tenants expect 12h format like 5:00 PM)',
+                        },
+                        no_execute_end: {
+                          type: 'string',
+                          description:
+                            'Client-side: do not execute between end time (HH:MM, tenant-dependent; some Jamf tenants expect 12h format like 9:00 AM)',
+                        },
                         no_execute_on: { type: 'string', description: 'Do not execute on specified days (Jamf Classic string)' },
                       },
                     },

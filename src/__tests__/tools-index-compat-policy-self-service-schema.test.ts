@@ -120,9 +120,21 @@ describe('policy tool schemas', () => {
     expect(createDateTime?.no_execute_start).toBeDefined();
     expect(createDateTime?.no_execute_end).toBeDefined();
     expect(createDateTime?.no_execute_on).toBeDefined();
+    expect(createDateTime?.activation_date).toBeDefined();
+    expect(createDateTime?.activation_date_epoch).toBeDefined();
+    expect(createDateTime?.activation_date_utc).toBeDefined();
+    expect(createDateTime?.expiration_date).toBeDefined();
+    expect(createDateTime?.expiration_date_epoch).toBeDefined();
+    expect(createDateTime?.expiration_date_utc).toBeDefined();
     expect(updateDateTime?.no_execute_start).toBeDefined();
     expect(updateDateTime?.no_execute_end).toBeDefined();
     expect(updateDateTime?.no_execute_on).toBeDefined();
+    expect(updateDateTime?.activation_date).toBeDefined();
+    expect(updateDateTime?.activation_date_epoch).toBeDefined();
+    expect(updateDateTime?.activation_date_utc).toBeDefined();
+    expect(updateDateTime?.expiration_date).toBeDefined();
+    expect(updateDateTime?.expiration_date_epoch).toBeDefined();
+    expect(updateDateTime?.expiration_date_utc).toBeDefined();
   });
 
   test('updatePolicy forwards general.date_time_limitations to jamf client', async () => {
