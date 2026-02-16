@@ -2,8 +2,8 @@ import { createLogger } from '../server/logger.js';
 
 const logger = createLogger('stdio-lifecycle');
 
-const DEFAULT_IDLE_TIMEOUT_MS = 0;
-const DEFAULT_PARENT_CHECK_INTERVAL_MS = 30 * 1000;
+const DEFAULT_IDLE_TIMEOUT_MS = 6 * 60 * 60 * 1000;
+const DEFAULT_PARENT_CHECK_INTERVAL_MS = 10 * 1000;
 
 export interface StdioLifecycleConfig {
   enabled: boolean;
