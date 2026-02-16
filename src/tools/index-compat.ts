@@ -4960,9 +4960,11 @@ export function createBaseToolHandlers(jamfClient: any): {
           } catch (err: any) {
             const status = err?.response?.status;
             const responseData = err?.response?.data;
-            if (status === 409) {
-              const bodyText = typeof responseData === 'string' ? responseData : '';
-              const isCategoryProblem = bodyText.toLowerCase().includes('problem with category');
+            const bodyText = typeof responseData === 'string' ? responseData : '';
+            const errorText = `${String(err?.message ?? '')} ${bodyText}`.toLowerCase();
+            const isCategoryProblem = errorText.includes('problem with category');
+            const isDateTimeProblem = errorText.includes('problem with date_time_limitations');
+            if (status === 409 || isDateTimeProblem) {
               const content: TextContent = {
                 type: 'text',
                 text:
@@ -4970,6 +4972,10 @@ export function createBaseToolHandlers(jamfClient: any): {
                     ? `Jamf returned 409 Conflict while updating policy ${policyId}: "Problem with category". ` +
                       `This typically means the category you referenced does not exist or the payload shape is invalid for your Jamf Pro version. ` +
                       `Try using an existing Self Service category id (preferred) or create the category in the Jamf UI, then retry.`
+                    : isDateTimeProblem
+                      ? `Jamf rejected date_time_limitations while updating policy ${policyId} (409: "Problem with date_time_limitations"). ` +
+                        `This is a Jamf validation conflict, not a transient MCP success. ` +
+                        `Verify via getPolicyXml/getPolicyDetails that no_execute_start/no_execute_end did not persist, then adjust payload/tenant settings before retry.`
                     : `Jamf returned 409 Conflict while updating policy ${policyId}. ` +
                       `This can mean the policy is locked for editing (open in the Jamf UI) OR there is a data conflict (Jamf sometimes reports those as 409). ` +
                       `Close any browser tabs editing that policy, wait ~30-120s, then retry. If it persists, inspect the response body in server logs (combined.log).`,
@@ -5014,9 +5020,11 @@ export function createBaseToolHandlers(jamfClient: any): {
           } catch (err: any) {
             const status = err?.response?.status;
             const responseData = err?.response?.data;
-            if (status === 409) {
-              const bodyText = typeof responseData === 'string' ? responseData : '';
-              const isCategoryProblem = bodyText.toLowerCase().includes('problem with category');
+            const bodyText = typeof responseData === 'string' ? responseData : '';
+            const errorText = `${String(err?.message ?? '')} ${bodyText}`.toLowerCase();
+            const isCategoryProblem = errorText.includes('problem with category');
+            const isDateTimeProblem = errorText.includes('problem with date_time_limitations');
+            if (status === 409 || isDateTimeProblem) {
               const content: TextContent = {
                 type: 'text',
                 text:
@@ -5024,6 +5032,10 @@ export function createBaseToolHandlers(jamfClient: any): {
                     ? `Jamf returned 409 Conflict while updating policy ${policyId}: "Problem with category". ` +
                       `This typically means the category you referenced does not exist or the payload shape is invalid for your Jamf Pro version. ` +
                       `Try using an existing Self Service category id (preferred) or create the category in the Jamf UI, then retry.`
+                    : isDateTimeProblem
+                      ? `Jamf rejected date_time_limitations while updating policy ${policyId} (409: "Problem with date_time_limitations"). ` +
+                        `This is a Jamf validation conflict, not a transient MCP success. ` +
+                        `Verify via getPolicyXml/getPolicyDetails that no_execute_start/no_execute_end did not persist, then adjust payload/tenant settings before retry.`
                     : `Jamf returned 409 Conflict while updating policy ${policyId}. ` +
                       `This can mean the policy is locked for editing (open in the Jamf UI) OR there is a data conflict (Jamf sometimes reports those as 409). ` +
                       `Close any browser tabs editing that policy, wait ~30-120s, then retry. If it persists, inspect the response body in server logs (combined.log).`,

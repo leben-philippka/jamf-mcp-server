@@ -577,30 +577,46 @@ export class JamfApiClientHybrid {
       const requestedXmlPayload = this.normalizeDateTimeLimitationsInPolicyXml(
         normalizePolicyXmlFrequencies(String(policyXml))
       );
+      const requestedDateTimePatch = this.extractDateTimeLimitationsPatchFromPolicyXml(requestedXmlPayload);
       let xmlPayload = requestedXmlPayload;
       if (!options?.skipPolicyWriteLock && this.shouldMergeDateTimeLimitationsXmlPatch(xmlPayload)) {
         const existingXml = await this.getPolicyXml(policyId);
         xmlPayload = this.mergeDateTimeLimitationsIntoPolicyXml(existingXml, xmlPayload);
       }
-      await this.with409Retry(
-        async () =>
-          await this.axiosInstance.put(
-            `/JSSResource/policies/id/${policyId}`,
-            xmlPayload,
-            {
-              headers: {
-                'Content-Type': 'application/xml',
-                'Accept': 'application/xml',
-              },
-            }
-          ),
-        { operation: 'updatePolicyXml', resourceType: 'policy', resourceId: String(policyId) }
-      );
+      try {
+        await this.with409Retry(
+          async () =>
+            await this.axiosInstance.put(
+              `/JSSResource/policies/id/${policyId}`,
+              xmlPayload,
+              {
+                headers: {
+                  'Content-Type': 'application/xml',
+                  'Accept': 'application/xml',
+                },
+              }
+            ),
+          { operation: 'updatePolicyXml', resourceType: 'policy', resourceId: String(policyId) }
+        );
+      } catch (writeError) {
+        if (
+          requestedDateTimePatch &&
+          this.isClassicDateTimeLimitationsConflict(writeError)
+        ) {
+          const diagnostics = this.buildDateTimeLimitationsWriteDiagnostics(
+            policyId,
+            requestedDateTimePatch,
+            writeError
+          );
+          throw new Error(
+            `Classic policy XML update failed with 409 (Problem with date_time_limitations). ${diagnostics}`
+          );
+        }
+        throw writeError;
+      }
       const updatedPolicy = await this.getPolicyDetails(policyId);
       const shouldStrictVerifyXmlPayload = !options?.skipPolicyWriteLock;
-      const xmlVerifyPatch = shouldStrictVerifyXmlPayload
-        ? this.extractDateTimeLimitationsPatchFromPolicyXml(requestedXmlPayload)
-        : null;
+      const xmlVerifyPatch = shouldStrictVerifyXmlPayload ? requestedDateTimePatch : null;
       if (xmlVerifyPatch) {
         return await this.verifyPolicyUpdatePersisted(policyId, xmlVerifyPatch, updatedPolicy);
       }
@@ -612,6 +628,51 @@ export class JamfApiClientHybrid {
       return await run();
     }
     return await this.withPolicyWriteLock(policyId, run);
+  }
+
+  private isClassicDateTimeLimitationsConflict(error: unknown): boolean {
+    if (getAxiosErrorStatus(error) !== 409) return false;
+
+    const candidates = [
+      getErrorMessage(error),
+      this.stringifyAxiosErrorData(error),
+    ]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase();
+
+    return (
+      candidates.includes('problem with date_time_limitations') ||
+      (candidates.includes('date_time_limitations') && candidates.includes('problem with'))
+    );
+  }
+
+  private stringifyAxiosErrorData(error: unknown): string {
+    const data = getAxiosErrorData(error);
+    if (data === undefined || data === null) return '';
+    if (typeof data === 'string') return data;
+    try {
+      return JSON.stringify(data);
+    } catch {
+      return String(data);
+    }
+  }
+
+  private buildDateTimeLimitationsWriteDiagnostics(
+    policyId: string,
+    requestedDateTimePatch: any,
+    error: unknown
+  ): string {
+    const requested = requestedDateTimePatch?.general?.date_time_limitations ?? {};
+    const status = getAxiosErrorStatus(error);
+    const jamfError = this.stringifyAxiosErrorData(error) || getErrorMessage(error);
+
+    return [
+      `policyId=${JSON.stringify(String(policyId))}`,
+      `requestedDateTime=${JSON.stringify(requested)}`,
+      `jamfStatus=${JSON.stringify(status)}`,
+      `jamfError=${JSON.stringify(jamfError)}`,
+    ].join('; ');
   }
 
   /**

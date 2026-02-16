@@ -176,4 +176,87 @@ describe('policy tool schemas', () => {
       })
     );
   });
+
+  test('updatePolicyXml returns explicit date_time_limitations 409 diagnostics', async () => {
+    const handlers = new Map<any, any>();
+    const server = {
+      setRequestHandler: jest.fn((schema: any, handler: any) => {
+        handlers.set(schema, handler);
+      }),
+    } as any;
+
+    const skillsManager = new SkillsManager();
+    const jamfClient = {
+      updatePolicyXml: jest.fn(async () => {
+        throw new Error(
+          'Classic policy XML update failed with 409 (Problem with date_time_limitations). policyId="134"'
+        );
+      }),
+    } as any;
+
+    registerAllTools(server, skillsManager, jamfClient);
+
+    const callHandler = handlers.get(CallToolRequestSchema);
+    expect(callHandler).toBeDefined();
+
+    const response = await callHandler({
+      params: {
+        name: 'updatePolicyXml',
+        arguments: {
+          confirm: true,
+          policyId: '134',
+          policyXml:
+            '<?xml version="1.0" encoding="UTF-8"?><policy><general><date_time_limitations><no_execute_start>5:00 PM</no_execute_start></date_time_limitations></general></policy>',
+        },
+      },
+    });
+
+    const text = String(response?.content?.[0]?.text ?? '');
+    expect(text).toContain('Jamf rejected date_time_limitations while updating policy 134');
+  });
+
+  test('updatePolicy returns explicit date_time_limitations 409 diagnostics', async () => {
+    const handlers = new Map<any, any>();
+    const server = {
+      setRequestHandler: jest.fn((schema: any, handler: any) => {
+        handlers.set(schema, handler);
+      }),
+    } as any;
+
+    const skillsManager = new SkillsManager();
+    const jamfClient = {
+      updatePolicy: jest.fn(async () => {
+        throw new Error(
+          'Classic policy XML update failed with 409 (Problem with date_time_limitations). policyId="134"'
+        );
+      }),
+    } as any;
+
+    registerAllTools(server, skillsManager, jamfClient);
+
+    const callHandler = handlers.get(CallToolRequestSchema);
+    expect(callHandler).toBeDefined();
+
+    const response = await callHandler({
+      params: {
+        name: 'updatePolicy',
+        arguments: {
+          confirm: true,
+          policyId: '134',
+          policyData: {
+            general: {
+              date_time_limitations: {
+                no_execute_start: '5:00 PM',
+                no_execute_end: '9:00 AM',
+                no_execute_on: '',
+              },
+            },
+          },
+        },
+      },
+    });
+
+    const text = String(response?.content?.[0]?.text ?? '');
+    expect(text).toContain('Jamf rejected date_time_limitations while updating policy 134');
+  });
 });

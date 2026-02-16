@@ -67,6 +67,31 @@ describe('JamfApiClientHybrid updatePolicyXml 409 retry', () => {
 
     expect(mockAxiosInstance.put).toHaveBeenCalledTimes(2);
   });
+
+  test('surfaces explicit diagnostics when Jamf rejects date_time_limitations with 409', async () => {
+    const client = createClient();
+
+    process.env.JAMF_CONFLICT_RETRY_MAX = '1';
+    process.env.JAMF_CONFLICT_RETRY_DELAY_MS = '0';
+
+    mockAxiosInstance.put.mockRejectedValueOnce({
+      isAxiosError: true,
+      response: {
+        status: 409,
+        data: 'Error: Problem with date_time_limitations',
+      },
+    });
+
+    await expect(
+      (client as any).updatePolicyXml(
+        '134',
+        '<?xml version="1.0" encoding="UTF-8"?>' +
+          '<policy><general><name>Auto Update - Google Chrome</name>' +
+          '<date_time_limitations><no_execute_start>5:00 PM</no_execute_start><no_execute_end>9:00 AM</no_execute_end></date_time_limitations>' +
+          '</general></policy>'
+      )
+    ).rejects.toThrow('Classic policy XML update failed with 409 (Problem with date_time_limitations)');
+  });
 });
 
 
