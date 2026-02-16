@@ -574,7 +574,14 @@ export class JamfApiClientHybrid {
     await this.ensureAuthenticated();
 
     const run = async (): Promise<any> => {
-      const xmlPayload = normalizePolicyXmlFrequencies(String(policyXml));
+      const requestedXmlPayload = this.normalizeDateTimeLimitationsInPolicyXml(
+        normalizePolicyXmlFrequencies(String(policyXml))
+      );
+      let xmlPayload = requestedXmlPayload;
+      if (!options?.skipPolicyWriteLock && this.shouldMergeDateTimeLimitationsXmlPatch(xmlPayload)) {
+        const existingXml = await this.getPolicyXml(policyId);
+        xmlPayload = this.mergeDateTimeLimitationsIntoPolicyXml(existingXml, xmlPayload);
+      }
       await this.with409Retry(
         async () =>
           await this.axiosInstance.put(
@@ -592,7 +599,7 @@ export class JamfApiClientHybrid {
       const updatedPolicy = await this.getPolicyDetails(policyId);
       const shouldStrictVerifyXmlPayload = !options?.skipPolicyWriteLock;
       const xmlVerifyPatch = shouldStrictVerifyXmlPayload
-        ? this.extractDateTimeLimitationsPatchFromPolicyXml(xmlPayload)
+        ? this.extractDateTimeLimitationsPatchFromPolicyXml(requestedXmlPayload)
         : null;
       if (xmlVerifyPatch) {
         return await this.verifyPolicyUpdatePersisted(policyId, xmlVerifyPatch, updatedPolicy);
@@ -1857,6 +1864,16 @@ export class JamfApiClientHybrid {
           continue;
         }
 
+        if (key === 'date_time_limitations' && rawValue && typeof rawValue === 'object') {
+          next = this.upsertSectionChild(
+            next,
+            'general',
+            key,
+            this.serializeXmlNodeValue(this.normalizeDateTimeLimitationsObject(rawValue), key)
+          );
+          continue;
+        }
+
         next = this.upsertSectionChild(next, 'general', key, this.serializeXmlNodeValue(rawValue, key));
       }
       return next;
@@ -1981,6 +1998,89 @@ export class JamfApiClientHybrid {
     return xml;
   }
 
+  private normalizePolicyTimeWindowValue(value: unknown): string {
+    const raw = String(value ?? '').trim();
+    if (!raw) return '';
+
+    const twelveHour = raw.match(/^(\d{1,2})(?::([0-5]\d))?\s*([AaPp][Mm])$/);
+    if (twelveHour) {
+      const hourRaw = Number(twelveHour[1]);
+      const minute = Number(twelveHour[2] ?? '0');
+      const suffix = String(twelveHour[3]).toUpperCase();
+      if (hourRaw >= 1 && hourRaw <= 12) {
+        let hour = hourRaw % 12;
+        if (suffix === 'PM') hour += 12;
+        return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+      }
+    }
+
+    const twentyFourHour = raw.match(/^([01]?\d|2[0-3]):([0-5]\d)$/);
+    if (twentyFourHour) {
+      return `${String(Number(twentyFourHour[1])).padStart(2, '0')}:${twentyFourHour[2]}`;
+    }
+
+    return raw;
+  }
+
+  private normalizeDateTimeLimitationsObject(input: any): any {
+    if (!input || typeof input !== 'object') return input;
+    return {
+      ...(input as any),
+      ...(Object.prototype.hasOwnProperty.call(input, 'no_execute_start')
+        ? { no_execute_start: this.normalizePolicyTimeWindowValue((input as any).no_execute_start) }
+        : {}),
+      ...(Object.prototype.hasOwnProperty.call(input, 'no_execute_end')
+        ? { no_execute_end: this.normalizePolicyTimeWindowValue((input as any).no_execute_end) }
+        : {}),
+    };
+  }
+
+  private normalizeDateTimeLimitationsInPolicyXml(policyXml: string): string {
+    return String(policyXml ?? '').replace(
+      /<(no_execute_start|no_execute_end)(?:\s[^>]*)?>\s*([^<]*)\s*<\/\1>/gi,
+      (_m, field: string, rawValue: string) => {
+        const normalized = this.normalizePolicyTimeWindowValue(this.decodeXmlEntities(String(rawValue ?? '')));
+        return `<${field}>${this.escapeXmlValue(normalized)}</${field}>`;
+      }
+    );
+  }
+
+  private shouldMergeDateTimeLimitationsXmlPatch(policyXml: string): boolean {
+    const xml = String(policyXml ?? '');
+    if (!/<date_time_limitations(?:\s[^>]*)?>/i.test(xml)) return false;
+    if (!/<policy(?:\s[^>]*)?>/i.test(xml)) return true;
+
+    const hasGeneralName = /<general(?:\s[^>]*)?>[\s\S]*?<name(?:\s[^>]*)?>[\s\S]*?<\/name>[\s\S]*?<\/general>/i.test(xml);
+    const hasGeneralId = /<general(?:\s[^>]*)?>[\s\S]*?<id(?:\s[^>]*)?>[\s\S]*?<\/id>[\s\S]*?<\/general>/i.test(xml);
+    return !(hasGeneralName || hasGeneralId);
+  }
+
+  private extractXmlTagInnerContent(xml: string, tagName: string): string | undefined {
+    const escapedTag = String(tagName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const fullTagMatch = String(xml ?? '').match(
+      new RegExp(`<${escapedTag}(?:\\s[^>]*)?>\\s*([\\s\\S]*?)\\s*<\\/${escapedTag}>`, 'i')
+    );
+    if (fullTagMatch) {
+      return String(fullTagMatch[1] ?? '');
+    }
+
+    const selfClosingTag = new RegExp(`<${escapedTag}(?:\\s[^>]*)?\\s*/>`, 'i');
+    if (selfClosingTag.test(String(xml ?? ''))) {
+      return '';
+    }
+
+    return undefined;
+  }
+
+  private mergeDateTimeLimitationsIntoPolicyXml(existingPolicyXml: string, patchPolicyXml: string): string {
+    const dateTimeInner = this.extractXmlTagInnerContent(patchPolicyXml, 'date_time_limitations');
+    if (dateTimeInner === undefined) return patchPolicyXml;
+
+    return this.withPolicySection(existingPolicyXml, 'general', (sectionXml) =>
+      this.upsertSectionChild(sectionXml, 'general', 'date_time_limitations', dateTimeInner)
+    );
+  }
+
   private collectVerifiablePolicyExpectations(
     value: any,
     pathPrefix: string,
@@ -2022,6 +2122,14 @@ export class JamfApiClientHybrid {
         out.push({ path, expected: normalizedConn });
         continue;
       }
+      if (
+        (path === 'general.date_time_limitations.no_execute_start' ||
+          path === 'general.date_time_limitations.no_execute_end') &&
+        (typeof raw === 'string' || typeof raw === 'number')
+      ) {
+        out.push({ path, expected: this.normalizePolicyTimeWindowValue(raw) });
+        continue;
+      }
 
       this.collectVerifiablePolicyExpectations(raw, path, out);
     }
@@ -2054,16 +2162,37 @@ export class JamfApiClientHybrid {
     return JSON.stringify(actual) === JSON.stringify(expected);
   }
 
+  private normalizePolicyExpectationValue(path: string, value: any): any {
+    if (value === undefined || value === null) return value;
+
+    const isDateTimePath =
+      path === 'general.date_time_limitations.no_execute_start' ||
+      path === 'general.date_time_limitations.no_execute_end' ||
+      path === 'general.date_time_limitations.no_execute_on';
+    if (!isDateTimePath) return value;
+
+    if (typeof value === 'object' && !Array.isArray(value) && Object.keys(value as Record<string, unknown>).length === 0) {
+      return '';
+    }
+
+    if (path === 'general.date_time_limitations.no_execute_start' || path === 'general.date_time_limitations.no_execute_end') {
+      return this.normalizePolicyTimeWindowValue(value);
+    }
+
+    return String(value ?? '').trim();
+  }
+
   private findPolicyExpectationMismatches(
     policy: any,
     expectations: Array<{ path: string; expected: any }>
   ): string[] {
     const mismatches: string[] = [];
     for (const exp of expectations) {
-      const actual = this.getValueAtPath(policy, exp.path);
-      if (!this.policyValuesEqual(actual, exp.expected)) {
+      const actual = this.normalizePolicyExpectationValue(exp.path, this.getValueAtPath(policy, exp.path));
+      const expected = this.normalizePolicyExpectationValue(exp.path, exp.expected);
+      if (!this.policyValuesEqual(actual, expected)) {
         mismatches.push(
-          `${exp.path} (expected=${JSON.stringify(exp.expected)}, actual=${JSON.stringify(actual)})`
+          `${exp.path} (expected=${JSON.stringify(expected)}, actual=${JSON.stringify(actual)})`
         );
       }
     }
@@ -2300,7 +2429,10 @@ export class JamfApiClientHybrid {
     for (const field of dateTimeFields) {
       const value = this.getXmlValueAtPath(policyXml, "general.date_time_limitations." + field);
       if (value !== undefined) {
-        dateTimePatch[field] = String(value);
+        dateTimePatch[field] =
+          field === 'no_execute_start' || field === 'no_execute_end'
+            ? this.normalizePolicyTimeWindowValue(value)
+            : String(value);
       }
     }
 
@@ -2327,11 +2459,22 @@ export class JamfApiClientHybrid {
     let current = String(xml ?? '');
     if (!current || !path) return undefined;
 
-    for (const segment of String(path).split('.')) {
+    const segments = String(path).split('.');
+    for (let index = 0; index < segments.length; index++) {
+      const segment = segments[index];
       const tag = segment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const match = current.match(new RegExp(`<${tag}>\\s*([\\s\\S]*?)\\s*</${tag}>`, 'i'));
-      if (!match) return undefined;
-      current = String(match[1] ?? '');
+      const fullTagMatch = current.match(new RegExp(`<${tag}(?:\\s[^>]*)?>\\s*([\\s\\S]*?)\\s*</${tag}>`, 'i'));
+      if (fullTagMatch) {
+        current = String(fullTagMatch[1] ?? '');
+        continue;
+      }
+
+      const selfClosingTag = new RegExp(`<${tag}(?:\\s[^>]*)?\\s*/>`, 'i');
+      if (selfClosingTag.test(current)) {
+        return index === segments.length - 1 ? '' : undefined;
+      }
+
+      return undefined;
     }
 
     if (/<[a-zA-Z][\w:-]*[\s>]/.test(current)) {
@@ -2346,10 +2489,11 @@ export class JamfApiClientHybrid {
   ): string[] {
     const mismatches: string[] = [];
     for (const exp of expectations) {
-      const actual = this.getXmlValueAtPath(xml, exp.path);
-      if (!this.policyValuesEqual(actual, exp.expected)) {
+      const actual = this.normalizePolicyExpectationValue(exp.path, this.getXmlValueAtPath(xml, exp.path));
+      const expected = this.normalizePolicyExpectationValue(exp.path, exp.expected);
+      if (!this.policyValuesEqual(actual, expected)) {
         mismatches.push(
-          `${exp.path} (expected=${JSON.stringify(exp.expected)}, actual=${JSON.stringify(actual)})`
+          `${exp.path} (expected=${JSON.stringify(expected)}, actual=${JSON.stringify(actual)})`
         );
       }
     }
@@ -2602,7 +2746,7 @@ export class JamfApiClientHybrid {
       }
 
       if ((policyData.general as any).date_time_limitations) {
-        const dt = (policyData.general as any).date_time_limitations;
+        const dt = this.normalizeDateTimeLimitationsObject((policyData.general as any).date_time_limitations);
         const hasDateTimeValues =
           dt.no_execute_start !== undefined || dt.no_execute_end !== undefined || dt.no_execute_on !== undefined;
         if (hasDateTimeValues) {

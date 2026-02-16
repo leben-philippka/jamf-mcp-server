@@ -89,6 +89,15 @@ describe('JamfApiClientHybrid updatePolicyXml strict verify for date_time_limita
 
     mockAxiosInstance.put.mockResolvedValueOnce({ data: {} });
 
+    // Existing full policy XML used as merge base for partial updatePolicyXml payload.
+    mockAxiosInstance.get.mockResolvedValueOnce({
+      data:
+        '<?xml version="1.0" encoding="UTF-8"?>' +
+        '<policy><general><id>74</id><name>Auto Update - Notion</name>' +
+        '<date_time_limitations><no_execute_start>08:00</no_execute_start></date_time_limitations>' +
+        '</general></policy>',
+    });
+
     // Immediate post-write read.
     mockAxiosInstance.get.mockResolvedValueOnce({
       data: {
@@ -148,5 +157,123 @@ describe('JamfApiClientHybrid updatePolicyXml strict verify for date_time_limita
           '<policy><general><date_time_limitations><no_execute_start>09:00</no_execute_start></date_time_limitations></general></policy>'
       )
     ).rejects.toThrow('did not persist requested fields');
+  });
+
+  test('merges partial date_time_limitations XML payload and normalizes AM/PM values', async () => {
+    const client = createClient();
+
+    mockAxiosInstance.put.mockResolvedValueOnce({ data: {} });
+
+    // Existing full policy XML used as merge base for partial updatePolicyXml payload.
+    mockAxiosInstance.get.mockResolvedValueOnce({
+      data:
+        '<?xml version="1.0" encoding="UTF-8"?>' +
+        '<policy><general><id>74</id><name>Auto Update - Google Chrome</name>' +
+        '<date_time_limitations><no_execute_on/><no_execute_start/><no_execute_end/></date_time_limitations>' +
+        '</general></policy>',
+    });
+
+    // Immediate post-write read.
+    mockAxiosInstance.get.mockResolvedValueOnce({
+      data: {
+        policy: {
+          id: 74,
+          general: {
+            date_time_limitations: {
+              no_execute_start: '17:00',
+              no_execute_end: '09:00',
+            },
+          },
+        },
+      },
+    });
+
+    // Verify readback: JSON + XML both updated.
+    mockAxiosInstance.get.mockResolvedValueOnce({
+      data: {
+        policy: {
+          id: 74,
+          general: {
+            date_time_limitations: {
+              no_execute_start: '17:00',
+              no_execute_end: '09:00',
+            },
+          },
+        },
+      },
+    });
+    mockAxiosInstance.get.mockResolvedValueOnce({
+      data:
+        '<?xml version="1.0" encoding="UTF-8"?>' +
+        '<policy><general><date_time_limitations><no_execute_start>17:00</no_execute_start><no_execute_end>09:00</no_execute_end></date_time_limitations></general></policy>',
+    });
+
+    await (client as any).updatePolicyXml(
+      '74',
+      '<?xml version="1.0" encoding="UTF-8"?>' +
+        '<policy><general><date_time_limitations><no_execute_start>5:00 PM</no_execute_start><no_execute_end>9:00 AM</no_execute_end></date_time_limitations></general></policy>'
+    );
+
+    expect(mockAxiosInstance.put).toHaveBeenCalledTimes(1);
+    const putPayload = String(mockAxiosInstance.put.mock.calls[0]?.[1] ?? '');
+    expect(putPayload).toContain('<name>Auto Update - Google Chrome</name>');
+    expect(putPayload).toContain('<no_execute_start>17:00</no_execute_start>');
+    expect(putPayload).toContain('<no_execute_end>09:00</no_execute_end>');
+  });
+
+  test('treats self-closing no_execute_on as an explicit empty value for strict verify', async () => {
+    const client = createClient();
+
+    mockAxiosInstance.put.mockResolvedValueOnce({ data: {} });
+
+    // Existing full policy XML used as merge base for partial updatePolicyXml payload.
+    mockAxiosInstance.get.mockResolvedValueOnce({
+      data:
+        '<?xml version="1.0" encoding="UTF-8"?>' +
+        '<policy><general><id>74</id><name>Auto Update - Google Chrome</name>' +
+        '<date_time_limitations><no_execute_on>Monday</no_execute_on></date_time_limitations>' +
+        '</general></policy>',
+    });
+
+    // Immediate post-write read.
+    mockAxiosInstance.get.mockResolvedValueOnce({
+      data: {
+        policy: {
+          id: 74,
+          general: {
+            date_time_limitations: {
+              no_execute_on: {},
+            },
+          },
+        },
+      },
+    });
+
+    // Verify readback: JSON empty-object + XML self-closing should both be accepted as empty.
+    mockAxiosInstance.get.mockResolvedValueOnce({
+      data: {
+        policy: {
+          id: 74,
+          general: {
+            date_time_limitations: {
+              no_execute_on: {},
+            },
+          },
+        },
+      },
+    });
+    mockAxiosInstance.get.mockResolvedValueOnce({
+      data:
+        '<?xml version="1.0" encoding="UTF-8"?>' +
+        '<policy><general><date_time_limitations><no_execute_on/></date_time_limitations></general></policy>',
+    });
+
+    await expect(
+      (client as any).updatePolicyXml(
+        '74',
+        '<?xml version="1.0" encoding="UTF-8"?>' +
+          '<policy><general><date_time_limitations><no_execute_on/></date_time_limitations></general></policy>'
+      )
+    ).resolves.toBeDefined();
   });
 });

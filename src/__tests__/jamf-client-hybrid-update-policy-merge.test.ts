@@ -622,6 +622,83 @@ describe('JamfApiClientHybrid updatePolicy date_time_limitations behavior', () =
     }
   });
 
+  test('updatePolicy normalizes AM/PM date_time_limitations to HH:MM in XML patch', async () => {
+    const client = createClient();
+    const prevAttempts = process.env.JAMF_POLICY_VERIFY_ATTEMPTS;
+    const prevDelay = process.env.JAMF_POLICY_VERIFY_DELAY_MS;
+    const prevConsistentReads = process.env.JAMF_POLICY_VERIFY_REQUIRED_CONSISTENT_READS;
+    const prevRequireXml = process.env.JAMF_POLICY_VERIFY_REQUIRE_XML;
+    process.env.JAMF_POLICY_VERIFY_ATTEMPTS = '1';
+    process.env.JAMF_POLICY_VERIFY_DELAY_MS = '0';
+    process.env.JAMF_POLICY_VERIFY_REQUIRED_CONSISTENT_READS = '1';
+    process.env.JAMF_POLICY_VERIFY_REQUIRE_XML = 'false';
+
+    try {
+      mockAxiosInstance.get.mockResolvedValueOnce({
+        data:
+          '<?xml version="1.0" encoding="UTF-8"?>' +
+          '<policy>' +
+          '<general><name>Auto Update - Notion</name><date_time_limitations><no_execute_on/></date_time_limitations></general>' +
+          '</policy>',
+      });
+
+      mockAxiosInstance.put.mockResolvedValueOnce({ data: {} });
+
+      mockAxiosInstance.get.mockResolvedValueOnce({
+        data: {
+          policy: {
+            id: 74,
+            general: {
+              name: 'Auto Update - Notion',
+              date_time_limitations: {
+                no_execute_start: '17:00',
+                no_execute_end: '09:00',
+                no_execute_on: '',
+              },
+            },
+          },
+        },
+      });
+
+      mockAxiosInstance.get.mockResolvedValueOnce({
+        data: {
+          policy: {
+            id: 74,
+            general: {
+              name: 'Auto Update - Notion',
+              date_time_limitations: {
+                no_execute_start: '17:00',
+                no_execute_end: '09:00',
+                no_execute_on: '',
+              },
+            },
+          },
+        },
+      });
+
+      await client.updatePolicy('74', {
+        general: {
+          date_time_limitations: {
+            no_execute_start: '5:00 PM',
+            no_execute_end: '9:00 AM',
+            no_execute_on: '',
+          },
+        },
+      });
+
+      expect(mockAxiosInstance.put).toHaveBeenCalled();
+      const putArgs = mockAxiosInstance.put.mock.calls[0];
+      const xml = String(putArgs[1] ?? '');
+      expect(xml).toContain('<no_execute_start>17:00</no_execute_start>');
+      expect(xml).toContain('<no_execute_end>09:00</no_execute_end>');
+    } finally {
+      process.env.JAMF_POLICY_VERIFY_ATTEMPTS = prevAttempts;
+      process.env.JAMF_POLICY_VERIFY_DELAY_MS = prevDelay;
+      process.env.JAMF_POLICY_VERIFY_REQUIRED_CONSISTENT_READS = prevConsistentReads;
+      process.env.JAMF_POLICY_VERIFY_REQUIRE_XML = prevRequireXml;
+    }
+  });
+
   test('updatePolicy strict mode verifies date_time_limitations fields against XML source', async () => {
     const client = createClient();
 
