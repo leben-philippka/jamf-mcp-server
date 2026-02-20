@@ -335,17 +335,43 @@ export class JamfApiClientHybrid {
         const originalRequest = error.config as AxiosError['config'] & {
           _retry?: boolean;
           _retryBasicAuth?: boolean;
+          _retryBasicAuthOnConflict?: boolean;
         };
 
         const isClassicEndpoint = Boolean(originalRequest?.url?.includes('/JSSResource/'));
+        const authHeader =
+          (originalRequest?.headers as any)?.Authorization ?? (originalRequest?.headers as any)?.authorization;
+
+        if (
+          error.response?.status === 409 &&
+          isClassicEndpoint &&
+          this.basicAuthHeader &&
+          typeof authHeader === 'string' &&
+          authHeader.startsWith('Bearer ') &&
+          !originalRequest?._retryBasicAuthOnConflict
+        ) {
+          const url = String(originalRequest?.url ?? '');
+          const body = typeof error.response?.data === 'string' ? error.response.data : '';
+          const isConfigProfileEndpoint =
+            url.includes('/JSSResource/osxconfigurationprofiles/') ||
+            url.includes('/JSSResource/mobiledeviceconfigurationprofiles/');
+          const looksLikeClassicConflict = body.toLowerCase().includes('unable to update the database');
+
+          if (isConfigProfileEndpoint && looksLikeClassicConflict) {
+            originalRequest._retryBasicAuthOnConflict = true;
+            (originalRequest.headers as any).Authorization = this.basicAuthHeader;
+            logger.warn('Classic config profile write returned 409 with Bearer auth; retrying once with Basic auth', {
+              url: originalRequest.url,
+            });
+            return this.axiosInstance(originalRequest);
+          }
+        }
 
         // Only retry on 401 and if we haven't already retried
         if (error.response?.status === 401 && originalRequest) {
           // Some Jamf tenants reject Bearer tokens for certain Classic endpoints (especially writes),
           // while still accepting Basic auth. If we have Basic configured and we just tried Bearer,
           // retry once with Basic before forcing a token refresh flow.
-          const authHeader =
-            (originalRequest.headers as any)?.Authorization ?? (originalRequest.headers as any)?.authorization;
           if (
             isClassicEndpoint &&
             this.basicAuthHeader &&
