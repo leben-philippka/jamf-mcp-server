@@ -118,20 +118,36 @@ const RemoveConfigurationProfileSchema = z.object({
   confirm: z.boolean().optional().default(false).describe('Confirmation flag for profile removal'),
 });
 
-const ConfigurationProfileDataSchema = z.object({
-  name: z.string().min(1).describe('Configuration profile name'),
-  description: z.string().optional().describe('Profile description'),
-  categoryId: z.number().optional().describe('Optional category ID'),
-  siteId: z.number().optional().describe('Optional site ID'),
-  distribution_method: z.string().optional().describe('Optional distribution method'),
-  user_removable: z.boolean().optional().describe('Whether users can remove the profile'),
-  level: z.string().optional().describe('Profile level (computer-level/user-level depending on profile type)'),
-  redeploy_on_update: z.boolean().optional().describe('Redeploy profile when updated'),
-  scope: z.record(z.unknown()).optional().describe('Optional profile scope object'),
-  payloads: z.string().min(1).describe('Raw payload plist/XML string'),
-  preferenceDomain: z.string().optional().describe('Optional convenience input for managed preferences domain'),
-  settingsJson: z.union([z.string(), z.record(z.unknown())]).optional().describe('Optional convenience settings JSON'),
-});
+const ConfigurationProfileDataSchema = z
+  .object({
+    name: z.string().min(1).describe('Configuration profile name'),
+    description: z.string().optional().describe('Profile description'),
+    categoryId: z.number().optional().describe('Optional category ID'),
+    siteId: z.number().optional().describe('Optional site ID'),
+    distribution_method: z.string().optional().describe('Optional distribution method'),
+    user_removable: z.boolean().optional().describe('Whether users can remove the profile'),
+    level: z.string().optional().describe('Profile level (computer-level/user-level depending on profile type)'),
+    redeploy_on_update: z.boolean().optional().describe('Redeploy profile when updated'),
+    scope: z.record(z.unknown()).optional().describe('Optional profile scope object'),
+    payloads: z.string().min(1).optional().describe('Raw payload plist/XML string'),
+    preferenceDomain: z.string().optional().describe('Optional convenience input for managed preferences domain'),
+    settingsJson: z.union([z.string(), z.record(z.unknown())]).optional().describe('Optional convenience settings JSON'),
+  })
+  .superRefine((profileData, ctx) => {
+    const hasPayload = typeof profileData.payloads === 'string' && profileData.payloads.trim().length > 0;
+    const hasPreferenceDomain =
+      typeof profileData.preferenceDomain === 'string' && profileData.preferenceDomain.trim().length > 0;
+    const hasSettingsJson = profileData.settingsJson !== undefined;
+
+    if (!hasPayload && !(hasPreferenceDomain && hasSettingsJson)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['payloads'],
+        message:
+          'profileData.payloads is required unless both profileData.preferenceDomain and profileData.settingsJson are provided.',
+      });
+    }
+  });
 
 const CreateConfigurationProfileSchema = z.object({
   type: ConfigurationProfileTypeSchema,
@@ -1213,7 +1229,11 @@ export function createBaseToolHandlers(jamfClient: any): {
                 level: { type: 'string', description: 'Profile level' },
                 redeploy_on_update: { type: 'boolean', description: 'Redeploy on profile update' },
                 scope: { type: 'object', description: 'Optional profile scope object' },
-                payloads: { type: 'string', description: 'Raw payload plist/XML string' },
+                payloads: {
+                  type: 'string',
+                  description:
+                    'Raw payload plist/XML string (required unless preferenceDomain and settingsJson are both provided)',
+                },
                 preferenceDomain: {
                   type: 'string',
                   description: 'Optional convenience input for managed preferences domain',
@@ -1223,7 +1243,7 @@ export function createBaseToolHandlers(jamfClient: any): {
                   anyOf: [{ type: 'string' }, { type: 'object' }],
                 },
               },
-              required: ['name', 'payloads'],
+              required: ['name'],
             },
             confirm: {
               type: 'boolean',
@@ -1264,7 +1284,11 @@ export function createBaseToolHandlers(jamfClient: any): {
                 level: { type: 'string', description: 'Profile level' },
                 redeploy_on_update: { type: 'boolean', description: 'Redeploy on profile update' },
                 scope: { type: 'object', description: 'Optional profile scope object' },
-                payloads: { type: 'string', description: 'Raw payload plist/XML string' },
+                payloads: {
+                  type: 'string',
+                  description:
+                    'Raw payload plist/XML string (required unless preferenceDomain and settingsJson are both provided)',
+                },
                 preferenceDomain: {
                   type: 'string',
                   description: 'Optional convenience input for managed preferences domain',
@@ -1274,7 +1298,7 @@ export function createBaseToolHandlers(jamfClient: any): {
                   anyOf: [{ type: 'string' }, { type: 'object' }],
                 },
               },
-              required: ['name', 'payloads'],
+              required: ['name'],
             },
             confirm: {
               type: 'boolean',

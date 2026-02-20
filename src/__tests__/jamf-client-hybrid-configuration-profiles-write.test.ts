@@ -153,6 +153,105 @@ describe('JamfApiClientHybrid configuration profile create/update', () => {
     expect(result).toMatchObject({ id: '42', name: 'New Name' });
   });
 
+  test('createConfigurationProfile falls back to Classic API and still verifies persistence', async () => {
+    const client = createClient();
+    const payload =
+      '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>k</key><string>v</string></dict></plist>';
+
+    mockAxiosInstance.post
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 500, data: { error: 'modern unavailable' } },
+      })
+      .mockResolvedValueOnce({
+        status: 201,
+        data: { os_x_configuration_profile: { id: '888' } },
+        headers: {},
+      });
+    mockAxiosInstance.get.mockResolvedValueOnce({
+      data: {
+        id: '888',
+        name: 'Classic Fallback',
+        payloads: payload,
+      },
+    });
+
+    const result = await client.createConfigurationProfile('computer', {
+      name: 'Classic Fallback',
+      payloads: payload,
+    });
+
+    expect(mockAxiosInstance.post).toHaveBeenNthCalledWith(
+      1,
+      '/api/v2/computer-configuration-profiles',
+      expect.objectContaining({ name: 'Classic Fallback', payloads: payload })
+    );
+    expect(mockAxiosInstance.post).toHaveBeenNthCalledWith(
+      2,
+      '/JSSResource/osxconfigurationprofiles/id/0',
+      expect.objectContaining({
+        os_x_configuration_profile: expect.objectContaining({
+          general: expect.objectContaining({ name: 'Classic Fallback', payloads: payload }),
+        }),
+      })
+    );
+    expect(mockAxiosInstance.get).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ id: '888', name: 'Classic Fallback' });
+  });
+
+  test('updateConfigurationProfile falls back to Classic API and still verifies persistence', async () => {
+    const client = createClient();
+    const payload =
+      '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>k2</key><string>v2</string></dict></plist>';
+
+    mockAxiosInstance.get
+      .mockResolvedValueOnce({
+        data: {
+          id: '42',
+          name: 'Before Fallback',
+          payloads: '<plist><dict/></plist>',
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          id: '42',
+          name: 'After Fallback',
+          payloads: payload,
+        },
+      });
+    mockAxiosInstance.put
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 500, data: { error: 'modern unavailable' } },
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        data: { os_x_configuration_profile: { id: '42' } },
+      });
+
+    const result = await client.updateConfigurationProfile('42', 'computer', {
+      name: 'After Fallback',
+      payloads: payload,
+    });
+
+    expect(mockAxiosInstance.put).toHaveBeenNthCalledWith(
+      1,
+      '/api/v2/computer-configuration-profiles/42',
+      expect.objectContaining({ name: 'After Fallback', payloads: payload })
+    );
+    expect(mockAxiosInstance.put).toHaveBeenNthCalledWith(
+      2,
+      '/JSSResource/osxconfigurationprofiles/id/42',
+      expect.objectContaining({
+        os_x_configuration_profile: expect.objectContaining({
+          general: expect.objectContaining({ name: 'After Fallback', payloads: payload }),
+        }),
+      })
+    );
+    expect(mockAxiosInstance.get).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ id: '42', name: 'After Fallback' });
+  });
+
   test('serializes parallel updates to the same profile with per-profile write lock', async () => {
     const client = createClient();
     process.env.JAMF_CONFIG_PROFILE_VERIFY_ENABLED = 'false';
@@ -262,4 +361,3 @@ describe('JamfApiClientHybrid configuration profile create/update', () => {
     );
   });
 });
-

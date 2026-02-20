@@ -5,7 +5,7 @@ const { SkillsManager } = await import('../skills/manager.js');
 const { ListToolsRequestSchema, CallToolRequestSchema } = await import('@modelcontextprotocol/sdk/types.js');
 
 describe('configuration profile write tools', () => {
-  test('advertises create/update configuration profile tools with required payload field', async () => {
+  test('advertises create/update configuration profile tools with conditional payload requirement', async () => {
     const handlers = new Map<any, any>();
     const server = {
       setRequestHandler: jest.fn((schema: any, handler: any) => {
@@ -24,8 +24,10 @@ describe('configuration profile write tools', () => {
 
     expect(createTool).toBeDefined();
     expect(updateTool).toBeDefined();
-    expect(createTool?.inputSchema?.properties?.profileData?.required).toContain('payloads');
-    expect(updateTool?.inputSchema?.properties?.profileData?.required).toContain('payloads');
+    expect(createTool?.inputSchema?.properties?.profileData?.required).toContain('name');
+    expect(updateTool?.inputSchema?.properties?.profileData?.required).toContain('name');
+    expect(createTool?.inputSchema?.properties?.profileData?.required).not.toContain('payloads');
+    expect(updateTool?.inputSchema?.properties?.profileData?.required).not.toContain('payloads');
     expect(createTool?.inputSchema?.properties?.type?.enum).toContain('mobile_device');
     expect(updateTool?.inputSchema?.properties?.type?.enum).toContain('mobile_device');
   });
@@ -79,6 +81,29 @@ describe('configuration profile write tools', () => {
       expect.objectContaining({
         name: 'Mobile Profile',
         payloads: '<plist/>',
+      })
+    );
+
+    await callHandler({
+      params: {
+        name: 'createConfigurationProfile',
+        arguments: {
+          confirm: true,
+          type: 'computer',
+          profileData: {
+            name: 'Convenience Profile',
+            preferenceDomain: 'com.example.app',
+            settingsJson: { key: 'value' },
+          },
+        },
+      },
+    });
+    expect(jamfClient.createConfigurationProfile).toHaveBeenCalledWith(
+      'computer',
+      expect.objectContaining({
+        name: 'Convenience Profile',
+        preferenceDomain: 'com.example.app',
+        settingsJson: { key: 'value' },
       })
     );
   });
@@ -139,4 +164,3 @@ describe('configuration profile write tools', () => {
     );
   });
 });
-
