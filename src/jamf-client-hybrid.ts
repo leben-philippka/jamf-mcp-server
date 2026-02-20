@@ -3756,15 +3756,44 @@ export class JamfApiClientHybrid {
 
     const normalizedType = this.normalizeConfigurationProfileType(type);
     const lockKey = `${normalizedType}:${String(profileId)}`;
-    const normalizedData = this.normalizeConfigurationProfileWriteData(normalizedType, profileData);
 
     return await this.withConfigurationProfileWriteLock(lockKey, async () => {
       let fallbackFromModern = false;
       let modernStatus: number | undefined;
       let classicStatus: number | undefined;
 
+      const existingProfile = await this.getConfigurationProfileDetails(profileId, normalizedType);
+      const existingName = String(existingProfile?.name ?? existingProfile?.general?.name ?? '').trim();
+      const existingPayloads = String(existingProfile?.payloads ?? existingProfile?.general?.payloads ?? '').trim();
+      const existingDistributionMethod =
+        existingProfile?.distributionMethod ?? existingProfile?.general?.distribution_method;
+      const existingUserRemovable = existingProfile?.userRemovable ?? existingProfile?.general?.user_removable;
+      const existingLevel = existingProfile?.level ?? existingProfile?.general?.level;
+      const existingRedeployOnUpdate =
+        existingProfile?.redeployOnUpdate ?? existingProfile?.general?.redeploy_on_update;
+      const existingCategoryId = existingProfile?.categoryId ?? existingProfile?.general?.category?.id;
+      const existingSiteId = existingProfile?.siteId ?? existingProfile?.general?.site?.id;
+      const existingDescription = existingProfile?.description ?? existingProfile?.general?.description;
+      const existingScope = existingProfile?.scope ?? undefined;
+
+      const mergedWriteInput = {
+        name: profileData?.name ?? existingName,
+        payloads: profileData?.payloads ?? existingPayloads,
+        description: profileData?.description ?? existingDescription,
+        categoryId: profileData?.categoryId ?? existingCategoryId,
+        siteId: profileData?.siteId ?? existingSiteId,
+        distribution_method: profileData?.distribution_method ?? profileData?.distributionMethod ?? existingDistributionMethod,
+        user_removable: profileData?.user_removable ?? profileData?.userRemovable ?? existingUserRemovable,
+        level: profileData?.level ?? existingLevel,
+        redeploy_on_update:
+          profileData?.redeploy_on_update ?? profileData?.redeployOnUpdate ?? existingRedeployOnUpdate,
+        scope: profileData?.scope ?? existingScope,
+        preferenceDomain: profileData?.preferenceDomain,
+        settingsJson: profileData?.settingsJson,
+      };
+      const normalizedData = this.normalizeConfigurationProfileWriteData(normalizedType, mergedWriteInput);
+
       try {
-        const existingProfile = await this.getConfigurationProfileDetails(profileId, normalizedType);
         const modernPayload = {
           ...existingProfile,
           ...this.buildModernConfigurationProfilePayload(normalizedType, normalizedData),

@@ -153,6 +153,47 @@ describe('JamfApiClientHybrid configuration profile create/update', () => {
     expect(result).toMatchObject({ id: '42', name: 'New Name' });
   });
 
+  test('updateConfigurationProfile supports partial updates and reuses existing payloads', async () => {
+    const client = createClient();
+    const existingPayload =
+      '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>existing</key><string>payload</string></dict></plist>';
+
+    mockAxiosInstance.get
+      .mockResolvedValueOnce({
+        data: {
+          id: '42',
+          name: 'Before Name',
+          description: 'Old description',
+          payloads: existingPayload,
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          id: '42',
+          name: 'After Name',
+          description: 'Old description',
+          payloads: existingPayload,
+        },
+      });
+    mockAxiosInstance.put.mockResolvedValueOnce({
+      status: 200,
+      data: { id: '42' },
+    });
+
+    const result = await client.updateConfigurationProfile('42', 'computer', {
+      name: 'After Name',
+    });
+
+    expect(mockAxiosInstance.put).toHaveBeenCalledWith(
+      '/api/v2/computer-configuration-profiles/42',
+      expect.objectContaining({
+        name: 'After Name',
+        payloads: existingPayload,
+      })
+    );
+    expect(result).toMatchObject({ id: '42', name: 'After Name' });
+  });
+
   test('createConfigurationProfile falls back to Classic API and still verifies persistence', async () => {
     const client = createClient();
     const payload =

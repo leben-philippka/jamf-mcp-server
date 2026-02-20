@@ -118,7 +118,7 @@ const RemoveConfigurationProfileSchema = z.object({
   confirm: z.boolean().optional().default(false).describe('Confirmation flag for profile removal'),
 });
 
-const ConfigurationProfileDataSchema = z
+const ConfigurationProfileBaseDataSchema = z
   .object({
     name: z.string().min(1).describe('Configuration profile name'),
     description: z.string().optional().describe('Profile description'),
@@ -133,7 +133,7 @@ const ConfigurationProfileDataSchema = z
     preferenceDomain: z.string().optional().describe('Optional convenience input for managed preferences domain'),
     settingsJson: z.union([z.string(), z.record(z.unknown())]).optional().describe('Optional convenience settings JSON'),
   })
-  .superRefine((profileData, ctx) => {
+const CreateConfigurationProfileDataSchema = ConfigurationProfileBaseDataSchema.superRefine((profileData, ctx) => {
     const hasPayload = typeof profileData.payloads === 'string' && profileData.payloads.trim().length > 0;
     const hasPreferenceDomain =
       typeof profileData.preferenceDomain === 'string' && profileData.preferenceDomain.trim().length > 0;
@@ -151,14 +151,14 @@ const ConfigurationProfileDataSchema = z
 
 const CreateConfigurationProfileSchema = z.object({
   type: ConfigurationProfileTypeSchema,
-  profileData: ConfigurationProfileDataSchema,
+  profileData: CreateConfigurationProfileDataSchema,
   confirm: z.boolean().optional().default(false).describe('Confirmation flag for profile creation'),
 });
 
 const UpdateConfigurationProfileSchema = z.object({
   profileId: z.string().describe('The configuration profile ID to update'),
   type: ConfigurationProfileTypeSchema,
-  profileData: ConfigurationProfileDataSchema,
+  profileData: ConfigurationProfileBaseDataSchema,
   confirm: z.boolean().optional().default(false).describe('Confirmation flag for profile update'),
 });
 

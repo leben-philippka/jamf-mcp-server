@@ -162,5 +162,26 @@ describe('configuration profile write tools', () => {
         payloads: '<plist/>',
       })
     );
+
+    await callHandler({
+      params: {
+        name: 'updateConfigurationProfile',
+        arguments: {
+          confirm: true,
+          profileId: '42',
+          type: 'computer',
+          profileData: {
+            name: 'Updated Name Only',
+          },
+        },
+      },
+    });
+    expect(jamfClient.updateConfigurationProfile).toHaveBeenCalledWith(
+      '42',
+      'computer',
+      expect.objectContaining({
+        name: 'Updated Name Only',
+      })
+    );
   });
 });
