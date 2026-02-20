@@ -134,6 +134,10 @@ export class JamfApiClientHybrid {
   private circuitBreakerEnabled: boolean = false;
   private readonly policyWriteLocks: Map<string, Promise<void>> = new Map();
   private readonly configurationProfileWriteLocks: Map<string, Promise<void>> = new Map();
+  private readonly configurationProfileClassicBlockedCache: Map<
+    string,
+    { recordedAt: number; diagnostics: Record<string, unknown> }
+  > = new Map();
   private smartGroupCriteriaCatalogCache: { fetchedAt: number; names: string[] } | null = null;
 
   private async sleep(ms: number): Promise<void> {
@@ -218,6 +222,41 @@ export class JamfApiClientHybrid {
         this.configurationProfileWriteLocks.delete(key);
       }
     }
+  }
+
+  private getConfigurationProfileClassicBlockedCacheTtlMs(): number {
+    return Math.max(0, Number(process.env.JAMF_CONFIG_PROFILE_BLOCK_CACHE_TTL_MS ?? 900000));
+  }
+
+  private getConfigurationProfileClassicBlockedCacheEntry(
+    lockKey: string
+  ): { recordedAt: number; diagnostics: Record<string, unknown> } | null {
+    const key = String(lockKey);
+    const entry = this.configurationProfileClassicBlockedCache.get(key) ?? null;
+    if (!entry) return null;
+
+    const ttlMs = this.getConfigurationProfileClassicBlockedCacheTtlMs();
+    if (ttlMs <= 0) {
+      this.configurationProfileClassicBlockedCache.delete(key);
+      return null;
+    }
+    if (Date.now() - entry.recordedAt <= ttlMs) return entry;
+
+    this.configurationProfileClassicBlockedCache.delete(key);
+    return null;
+  }
+
+  private setConfigurationProfileClassicBlockedCacheEntry(lockKey: string, diagnostics: Record<string, unknown>): void {
+    const ttlMs = this.getConfigurationProfileClassicBlockedCacheTtlMs();
+    if (ttlMs <= 0) return;
+    this.configurationProfileClassicBlockedCache.set(String(lockKey), {
+      recordedAt: Date.now(),
+      diagnostics,
+    });
+  }
+
+  private clearConfigurationProfileClassicBlockedCacheEntry(lockKey: string): void {
+    this.configurationProfileClassicBlockedCache.delete(String(lockKey));
   }
 
   private getAuthorizationHeaderValue(headers: unknown): string | undefined {
@@ -3587,6 +3626,108 @@ export class JamfApiClientHybrid {
     return String(raw).replace(/\s+/g, '').trim();
   }
 
+  private decodeXmlEntitiesRepeated(input: string): string {
+    let value = String(input ?? '');
+    for (let i = 0; i < 4; i += 1) {
+      const decoded = value
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&apos;/g, "'")
+        .replace(/&amp;/g, '&');
+      if (decoded === value) break;
+      value = decoded;
+    }
+    return value;
+  }
+
+  private normalizeConfigurationProfilePayloadForSemanticCompare(payload: unknown): string {
+    if (payload === undefined || payload === null) return '';
+    const decoded = this.decodeXmlEntitiesRepeated(typeof payload === 'string' ? payload : JSON.stringify(payload));
+    return decoded
+      .replace(/<\?xml[\s\S]*?\?>/gi, '')
+      .replace(/<!DOCTYPE[\s\S]*?>/gi, '')
+      .replace(/version="1\.0"/g, 'version="1"')
+      .replace(/\s+/g, '')
+      .trim();
+  }
+
+  private extractConfigurationProfilePayloadSemanticTokens(payload: unknown): string[] {
+    const normalized = this.normalizeConfigurationProfilePayloadForSemanticCompare(payload);
+    if (!normalized) return [];
+
+    const ignoredKeys = new Set([
+      'payloaduuid',
+      'payloadidentifier',
+      'payloaddisplayname',
+      'payloaddescription',
+      'payloadorganization',
+    ]);
+
+    const tokens: string[] = [];
+    const scalarRe =
+      /<key>([^<]+)<\/key>\s*(?:<string>([\s\S]*?)<\/string>|<integer>([\s\S]*?)<\/integer>|<real>([\s\S]*?)<\/real>|<data>([\s\S]*?)<\/data>|<date>([\s\S]*?)<\/date>|<(true|false)\s*\/>)/gi;
+
+    let match: RegExpExecArray | null = null;
+    while ((match = scalarRe.exec(normalized)) !== null) {
+      const key = String(match[1] ?? '').trim();
+      const keyNorm = key.toLowerCase();
+      if (!keyNorm || ignoredKeys.has(keyNorm)) continue;
+
+      const stringValue = match[2] !== undefined ? String(match[2]).trim() : undefined;
+      const integerValue = match[3] !== undefined ? String(match[3]).trim() : undefined;
+      const realValue = match[4] !== undefined ? String(match[4]).trim() : undefined;
+      const dataValue = match[5] !== undefined ? String(match[5]).trim() : undefined;
+      const dateValue = match[6] !== undefined ? String(match[6]).trim() : undefined;
+      const boolValue = match[7] !== undefined ? String(match[7]).trim().toLowerCase() : undefined;
+
+      let type = '';
+      let value = '';
+      if (stringValue !== undefined) {
+        type = 'string';
+        value = stringValue;
+      } else if (integerValue !== undefined) {
+        type = 'integer';
+        value = integerValue;
+      } else if (realValue !== undefined) {
+        type = 'real';
+        value = realValue;
+      } else if (dataValue !== undefined) {
+        type = 'data';
+        value = dataValue;
+      } else if (dateValue !== undefined) {
+        type = 'date';
+        value = dateValue;
+      } else if (boolValue !== undefined) {
+        type = 'boolean';
+        value = boolValue;
+      }
+
+      if (!type) continue;
+      tokens.push(`${keyNorm}:${type}:${value}`);
+    }
+
+    return Array.from(new Set(tokens)).sort();
+  }
+
+  private isConfigurationProfilePayloadPersisted(expectedPayload: unknown, observedPayload: unknown): boolean {
+    const expectedStrict = this.normalizeConfigurationProfilePayloadString(expectedPayload);
+    const observedStrict = this.normalizeConfigurationProfilePayloadString(observedPayload);
+    if (expectedStrict === observedStrict) return true;
+
+    const expectedSemantic = this.normalizeConfigurationProfilePayloadForSemanticCompare(expectedPayload);
+    const observedSemantic = this.normalizeConfigurationProfilePayloadForSemanticCompare(observedPayload);
+    if (expectedSemantic === observedSemantic) return true;
+
+    const expectedTokens = this.extractConfigurationProfilePayloadSemanticTokens(expectedPayload);
+    if (expectedTokens.length === 0) {
+      return false;
+    }
+
+    const observedTokenSet = new Set(this.extractConfigurationProfilePayloadSemanticTokens(observedPayload));
+    return expectedTokens.every((token) => observedTokenSet.has(token));
+  }
+
   private extractConfigurationProfileObservedFields(profile: any, type: ConfigurationProfileType): any {
     const scope = profile?.scope ?? {};
     const observedScope =
@@ -3629,6 +3770,103 @@ export class JamfApiClientHybrid {
     return {
       length: value.length,
       preview: value.slice(0, 160),
+    };
+  }
+
+  private summarizeConfigurationProfileWriteInput(data: any): Record<string, unknown> {
+    return {
+      name: data?.name ?? null,
+      description: data?.description ?? null,
+      categoryId: data?.categoryId ?? null,
+      siteId: data?.siteId ?? null,
+      distribution_method: data?.distributionMethod ?? data?.distribution_method ?? null,
+      user_removable:
+        data?.userRemovable !== undefined
+          ? Boolean(data.userRemovable)
+          : data?.user_removable !== undefined
+            ? Boolean(data.user_removable)
+            : null,
+      level: data?.level ?? null,
+      redeploy_on_update:
+        data?.redeployOnUpdate !== undefined
+          ? String(data.redeployOnUpdate)
+          : data?.redeploy_on_update !== undefined
+            ? String(data.redeploy_on_update)
+            : null,
+      scope:
+        data?.scope && typeof data.scope === 'object'
+          ? Object.fromEntries(
+              Object.entries(data.scope).filter(([, value]) => Array.isArray(value) || typeof value === 'boolean')
+            )
+          : null,
+      payloads: this.summarizeConfigurationProfilePayload(data?.payloads),
+    };
+  }
+
+  private summarizeConfigurationProfileForSupportBundle(
+    profile: any,
+    type: ConfigurationProfileType
+  ): Record<string, unknown> {
+    const observed = this.extractConfigurationProfileObservedFields(profile, type);
+    return {
+      id: profile?.id ?? profile?.general?.id ?? null,
+      name: observed.name ?? null,
+      categoryId: observed.categoryId ?? null,
+      siteId: observed.siteId ?? null,
+      distribution_method: observed.distribution_method ?? null,
+      user_removable: observed.user_removable ?? null,
+      level: observed.level ?? null,
+      redeploy_on_update: observed.redeploy_on_update ?? null,
+      scope: observed.scope ?? null,
+      payloads: this.summarizeConfigurationProfilePayload(observed.payloads),
+    };
+  }
+
+  private buildConfigurationProfileWriteSupportBundle(params: {
+    operation: 'create' | 'update';
+    phase: 'preflight' | 'classic-write';
+    profileId?: string | null;
+    type: ConfigurationProfileType;
+    fallbackFromModern: boolean;
+    modernStatus?: number;
+    classicStatus?: number;
+    requestedData: any;
+    existingProfile?: any;
+    lockKey?: string;
+    cacheHit?: boolean;
+    additionalMessage?: string;
+  }): Record<string, unknown> {
+    const normalizedType = params.type;
+    return {
+      kind: 'configuration_profile_classic_write_block',
+      timestamp: new Date().toISOString(),
+      operation: params.operation,
+      phase: params.phase,
+      profileId: params.profileId ?? null,
+      profileType: normalizedType,
+      lockKey: params.lockKey ?? null,
+      cacheHit: Boolean(params.cacheHit),
+      endpoints: {
+        modern: this.getConfigurationProfileModernEndpoint(normalizedType, params.profileId ?? undefined),
+        classic: this.getConfigurationProfileClassicEndpoint(normalizedType, params.profileId ?? undefined),
+      },
+      statuses: {
+        fallbackFromModern: params.fallbackFromModern,
+        modernStatus: params.modernStatus ?? null,
+        classicStatus: params.classicStatus ?? null,
+      },
+      auth: {
+        hasBasicAuth: Boolean(this.basicAuthHeader),
+        oauth2Available: this.oauth2Available,
+        bearerTokenAvailable: this.bearerTokenAvailable,
+      },
+      requestedFields: this.summarizeConfigurationProfileWriteInput(params.requestedData),
+      observedProfile: params.existingProfile
+        ? this.summarizeConfigurationProfileForSupportBundle(params.existingProfile, normalizedType)
+        : null,
+      hint:
+        params.additionalMessage ??
+        'Classic write returned 409 (Unable to update the database). This profile appears blocked for Classic writes in the current tenant/runtime.',
     };
   }
 
@@ -3694,8 +3932,6 @@ export class JamfApiClientHybrid {
       if (Array.isArray(expectedScope.mobileDeviceGroupIds)) expectedFields.scope = { ...(expectedFields.scope ?? {}), mobileDeviceGroupIds: this.toNumericIdArray(expectedScope.mobileDeviceGroupIds) };
     }
 
-    const expectedPayloadNormalized = this.normalizeConfigurationProfilePayloadString(requestedData.payloads);
-
     let matchedReads = 0;
     let completedChecks = 0;
     let lastObservedFields: Record<string, unknown> = {};
@@ -3713,8 +3949,7 @@ export class JamfApiClientHybrid {
       candidate = attempt === 1 && context.initialProfile ? context.initialProfile : await this.getConfigurationProfileDetails(profileId, type);
       completedChecks += 1;
       const observed = this.extractConfigurationProfileObservedFields(candidate, type);
-      const observedPayloadNormalized = this.normalizeConfigurationProfilePayloadString(observed.payloads);
-      const payloadPersisted = observedPayloadNormalized === expectedPayloadNormalized;
+      const payloadPersisted = this.isConfigurationProfilePayloadPersisted(requestedData.payloads, observed.payloads);
       const mismatches: string[] = [];
 
       for (const [field, expectedValue] of Object.entries(expectedFields)) {
@@ -3866,15 +4101,23 @@ export class JamfApiClientHybrid {
       });
     } catch (error) {
       classicStatus = getAxiosErrorStatus(error);
-      if (this.isClassicConfigProfileDatabaseConflict(error) && !this.basicAuthHeader) {
+      if (this.isClassicConfigProfileDatabaseConflict(error)) {
+        const supportBundle = this.buildConfigurationProfileWriteSupportBundle({
+          operation: 'create',
+          phase: 'classic-write',
+          profileId: null,
+          type: normalizedType,
+          fallbackFromModern,
+          modernStatus,
+          classicStatus,
+          requestedData: normalizedData,
+          additionalMessage: !this.basicAuthHeader
+            ? 'Classic create returned 409 and Basic auth fallback is not available. Configure JAMF_USERNAME/JAMF_PASSWORD and verify no concurrent Jamf edit lock.'
+            : undefined,
+        });
         throw new Error(
-          `Classic configuration profile create failed with 409 (Unable to update the database). Basic auth is not configured, so automatic Classic fallback retry with Basic auth is unavailable. Configure JAMF_USERNAME/JAMF_PASSWORD to enable fallback, and verify there is no concurrent Jamf edit lock. ${JSON.stringify(
-            {
-              fallbackFromModern,
-              modernStatus: modernStatus ?? null,
-              classicStatus: classicStatus ?? null,
-              hasBasicAuth: Boolean(this.basicAuthHeader),
-            }
+          `Configuration profile create blocked by Jamf Classic database conflict (409 Unable to update the database). ${JSON.stringify(
+            supportBundle
           )}`
         );
       }
@@ -3898,6 +4141,31 @@ export class JamfApiClientHybrid {
       let fallbackFromModern = false;
       let modernStatus: number | undefined;
       let classicStatus: number | undefined;
+      const blockedCacheEntry = this.getConfigurationProfileClassicBlockedCacheEntry(lockKey);
+      if (blockedCacheEntry) {
+        const preflightBundle = this.buildConfigurationProfileWriteSupportBundle({
+          operation: 'update',
+          phase: 'preflight',
+          profileId: String(profileId),
+          type: normalizedType,
+          fallbackFromModern: true,
+          modernStatus: 404,
+          classicStatus: 409,
+          requestedData: profileData ?? {},
+          lockKey,
+          cacheHit: true,
+          additionalMessage:
+            'Fast-fail preflight: this profile recently returned Classic 409 and is cached as blocked. Retry after TTL, clear the cache by restarting the MCP server, or investigate Jamf-side lock/object constraints.',
+        });
+        throw new Error(
+          `Configuration profile ${profileId} update preflight blocked due to recent Classic 409 conflict. ${JSON.stringify(
+            {
+              ...preflightBundle,
+              previousFailure: blockedCacheEntry.diagnostics,
+            }
+          )}`
+        );
+      }
 
       const existingProfile = await this.getConfigurationProfileDetails(profileId, normalizedType);
       const existingName = String(existingProfile?.name ?? existingProfile?.general?.name ?? '').trim();
@@ -3944,6 +4212,7 @@ export class JamfApiClientHybrid {
           { operation: 'updateConfigurationProfile', resourceType: 'configurationProfile', resourceId: String(profileId) }
         );
         modernStatus = response.status;
+        this.clearConfigurationProfileClassicBlockedCacheEntry(lockKey);
         return await this.verifyConfigurationProfileWritePersisted(profileId, normalizedType, normalizedData, {
           operation: 'update',
           fallbackFromModern,
@@ -3975,6 +4244,7 @@ export class JamfApiClientHybrid {
           { operation: 'updateConfigurationProfileClassic', resourceType: 'configurationProfile', resourceId: String(profileId) }
         );
         classicStatus = response.status;
+        this.clearConfigurationProfileClassicBlockedCacheEntry(lockKey);
         return await this.verifyConfigurationProfileWritePersisted(profileId, normalizedType, normalizedData, {
           operation: 'update',
           fallbackFromModern,
@@ -3983,16 +4253,26 @@ export class JamfApiClientHybrid {
         });
       } catch (error) {
         classicStatus = getAxiosErrorStatus(error);
-        if (this.isClassicConfigProfileDatabaseConflict(error) && !this.basicAuthHeader) {
+        if (this.isClassicConfigProfileDatabaseConflict(error)) {
+          const supportBundle = this.buildConfigurationProfileWriteSupportBundle({
+            operation: 'update',
+            phase: 'classic-write',
+            profileId: String(profileId),
+            type: normalizedType,
+            fallbackFromModern,
+            modernStatus,
+            classicStatus,
+            requestedData: normalizedData,
+            existingProfile,
+            lockKey,
+            additionalMessage: !this.basicAuthHeader
+              ? 'Classic update returned 409 and Basic auth fallback is not available. Configure JAMF_USERNAME/JAMF_PASSWORD and verify no concurrent Jamf edit lock.'
+              : undefined,
+          });
+          this.setConfigurationProfileClassicBlockedCacheEntry(lockKey, supportBundle);
           throw new Error(
-            `Classic configuration profile update failed with 409 (Unable to update the database). Basic auth is not configured, so automatic Classic fallback retry with Basic auth is unavailable. Configure JAMF_USERNAME/JAMF_PASSWORD to enable fallback, and verify there is no concurrent Jamf edit lock. ${JSON.stringify(
-              {
-                profileId: String(profileId),
-                fallbackFromModern,
-                modernStatus: modernStatus ?? null,
-                classicStatus: classicStatus ?? null,
-                hasBasicAuth: Boolean(this.basicAuthHeader),
-              }
+            `Configuration profile ${profileId} update blocked by Jamf Classic database conflict (409 Unable to update the database). ${JSON.stringify(
+              supportBundle
             )}`
           );
         }

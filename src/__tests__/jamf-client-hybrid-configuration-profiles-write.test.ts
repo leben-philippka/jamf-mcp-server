@@ -69,6 +69,7 @@ describe('JamfApiClientHybrid configuration profile create/update', () => {
     process.env.JAMF_CONFIG_PROFILE_VERIFY_MAX_DURATION_MS = '10000';
     process.env.JAMF_CONFLICT_RETRY_MAX = '1';
     process.env.JAMF_CONFLICT_RETRY_DELAY_MS = '0';
+    process.env.JAMF_CONFIG_PROFILE_BLOCK_CACHE_TTL_MS = '900000';
   });
 
   test('createConfigurationProfile creates and verifies persisted profile', async () => {
@@ -104,6 +105,66 @@ describe('JamfApiClientHybrid configuration profile create/update', () => {
       })
     );
     expect(result).toMatchObject({ id: '501', name: 'Baseline Profile' });
+  });
+
+  test('createConfigurationProfile strict verify tolerates Jamf payload metadata normalization', async () => {
+    const client = createClient();
+    const expectedPayload =
+      '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>PayloadType</key><string>Configuration</string><key>PayloadVersion</key><integer>1</integer><key>PayloadIdentifier</key><string>com.test.original</string><key>PayloadUUID</key><string>ABCDEFAB-CDEF-ABCD-EFAB-CDEFABCDEFAB</string><key>PayloadDisplayName</key><string>Original Name</string><key>PayloadOrganization</key><string>Original Org</string><key>PayloadDescription</key><string>Original Desc</string><key>PayloadContent</key><array/></dict></plist>';
+    const observedPayload =
+      '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1"><dict><key>PayloadUUID</key><string>9e27d55f-94b0-4dac-988f-b0d38f2b8aa3</string><key>PayloadType</key><string>Configuration</string><key>PayloadOrganization</key><string>Jamf Rewritten Org</string><key>PayloadIdentifier</key><string>9e27d55f-94b0-4dac-988f-b0d38f2b8aa3</string><key>PayloadDisplayName</key><string>Jamf Rewritten Name</string><key>PayloadDescription</key><string>Jamf Rewritten Desc</string><key>PayloadVersion</key><integer>1</integer><key>PayloadContent</key><array/></dict></plist>';
+
+    mockAxiosInstance.post.mockResolvedValueOnce({
+      status: 201,
+      data: { id: '777' },
+      headers: {},
+    });
+    mockAxiosInstance.get.mockResolvedValueOnce({
+      data: {
+        id: '777',
+        name: 'Metadata Rewrite',
+        description: 'Created by Jamf',
+        payloads: observedPayload,
+      },
+    });
+
+    const result = await client.createConfigurationProfile('computer', {
+      name: 'Metadata Rewrite',
+      description: 'Created by Jamf',
+      payloads: expectedPayload,
+    });
+
+    expect(result).toMatchObject({ id: '777', name: 'Metadata Rewrite' });
+  });
+
+  test('createConfigurationProfile strict verify rejects payload content mismatch beyond metadata rewrites', async () => {
+    const client = createClient();
+    const expectedPayload =
+      '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>PayloadType</key><string>Configuration</string><key>PayloadVersion</key><integer>1</integer><key>PayloadIdentifier</key><string>com.test.expected</string><key>PayloadUUID</key><string>ABCDEFAB-CDEF-ABCD-EFAB-CDEFABCDEFAB</string><key>PayloadDisplayName</key><string>Expected Name</string><key>PayloadOrganization</key><string>Expected Org</string><key>PayloadDescription</key><string>Expected Desc</string><key>ManagedSetting</key><string>must-stay</string><key>PayloadContent</key><array/></dict></plist>';
+    const observedPayload =
+      '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1"><dict><key>PayloadUUID</key><string>9e27d55f-94b0-4dac-988f-b0d38f2b8aa3</string><key>PayloadType</key><string>Configuration</string><key>PayloadOrganization</key><string>Jamf Rewritten Org</string><key>PayloadIdentifier</key><string>9e27d55f-94b0-4dac-988f-b0d38f2b8aa3</string><key>PayloadDisplayName</key><string>Jamf Rewritten Name</string><key>PayloadDescription</key><string>Jamf Rewritten Desc</string><key>PayloadVersion</key><integer>1</integer><key>PayloadContent</key><array/></dict></plist>';
+
+    mockAxiosInstance.post.mockResolvedValueOnce({
+      status: 201,
+      data: { id: '778' },
+      headers: {},
+    });
+    mockAxiosInstance.get.mockResolvedValueOnce({
+      data: {
+        id: '778',
+        name: 'Metadata Rewrite',
+        description: 'Created by Jamf',
+        payloads: observedPayload,
+      },
+    });
+
+    await expect(
+      client.createConfigurationProfile('computer', {
+        name: 'Metadata Rewrite',
+        description: 'Created by Jamf',
+        payloads: expectedPayload,
+      })
+    ).rejects.toThrow(/payloadPersisted":false|did not persist/i);
   });
 
   test('updateConfigurationProfile updates name and payload with strict verify', async () => {
@@ -379,6 +440,111 @@ describe('JamfApiClientHybrid configuration profile create/update', () => {
         payloads: payload,
       })
     ).rejects.toThrow(/Basic auth is not configured|JAMF_USERNAME\/JAMF_PASSWORD/);
+  });
+
+  test('updateConfigurationProfile caches classic 409 conflicts and fast-fails subsequent attempts', async () => {
+    const client = createClient();
+    process.env.JAMF_CONFIG_PROFILE_VERIFY_ENABLED = 'false';
+    process.env.JAMF_CONFIG_PROFILE_BLOCK_CACHE_TTL_MS = '600000';
+
+    mockAxiosInstance.get.mockResolvedValueOnce({
+      data: {
+        id: '21',
+        name: 'Blocked Profile',
+        payloads: '<plist><dict/></plist>',
+      },
+    });
+    mockAxiosInstance.put
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 500, data: { error: 'modern unavailable' } },
+      })
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: {
+          status: 409,
+          data: '<html><body>Unable to update the database</body></html>',
+        },
+      });
+
+    await expect(
+      client.updateConfigurationProfile('21', 'computer', {
+        name: 'Blocked Profile',
+      })
+    ).rejects.toThrow(/Classic database conflict|Unable to update the database/);
+
+    const getCallsAfterFirst = mockAxiosInstance.get.mock.calls.length;
+    const putCallsAfterFirst = mockAxiosInstance.put.mock.calls.length;
+
+    await expect(
+      client.updateConfigurationProfile('21', 'computer', {
+        name: 'Blocked Profile',
+      })
+    ).rejects.toThrow(/preflight blocked|recent Classic 409/i);
+
+    expect(mockAxiosInstance.get.mock.calls.length).toBe(getCallsAfterFirst);
+    expect(mockAxiosInstance.put.mock.calls.length).toBe(putCallsAfterFirst);
+  });
+
+  test('updateConfigurationProfile does not cache classic 409 conflicts when block cache ttl is disabled', async () => {
+    const client = createClient();
+    process.env.JAMF_CONFIG_PROFILE_VERIFY_ENABLED = 'false';
+    process.env.JAMF_CONFIG_PROFILE_BLOCK_CACHE_TTL_MS = '0';
+
+    mockAxiosInstance.get
+      .mockResolvedValueOnce({
+        data: {
+          id: '21',
+          name: 'Blocked Profile',
+          payloads: '<plist><dict/></plist>',
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          id: '21',
+          name: 'Blocked Profile',
+          payloads: '<plist><dict/></plist>',
+        },
+      });
+
+    mockAxiosInstance.put
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 500, data: { error: 'modern unavailable' } },
+      })
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: {
+          status: 409,
+          data: '<html><body>Unable to update the database</body></html>',
+        },
+      })
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 500, data: { error: 'modern unavailable' } },
+      })
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: {
+          status: 409,
+          data: '<html><body>Unable to update the database</body></html>',
+        },
+      });
+
+    await expect(
+      client.updateConfigurationProfile('21', 'computer', {
+        name: 'Blocked Profile',
+      })
+    ).rejects.toThrow(/Classic database conflict|Unable to update the database/);
+
+    await expect(
+      client.updateConfigurationProfile('21', 'computer', {
+        name: 'Blocked Profile',
+      })
+    ).rejects.toThrow(/Classic database conflict|Unable to update the database/);
+
+    expect(mockAxiosInstance.get).toHaveBeenCalledTimes(2);
+    expect(mockAxiosInstance.put).toHaveBeenCalledTimes(4);
   });
 
   test('serializes parallel updates to the same profile with per-profile write lock', async () => {
