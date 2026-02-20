@@ -3340,28 +3340,94 @@ export class JamfApiClientHybrid {
     return payload;
   }
 
-  private buildClassicConfigurationProfilePayload(type: ConfigurationProfileType, profileData: any): any {
+  private buildClassicConfigurationProfileScopeXml(type: ConfigurationProfileType, scope: Record<string, unknown>): string {
+    let xml = '  <scope>\n';
+    let hasAnyScope = false;
+
+    if (type === 'computer') {
+      const computers = this.toNumericIdArray((scope as any).computers);
+      const computerGroups = this.toNumericIdArray((scope as any).computer_groups);
+
+      if (computers.length > 0) {
+        hasAnyScope = true;
+        xml += '    <computers>\n';
+        for (const id of computers) {
+          xml += `      <computer><id>${this.escapeXml(String(id))}</id></computer>\n`;
+        }
+        xml += '    </computers>\n';
+      }
+
+      if (computerGroups.length > 0) {
+        hasAnyScope = true;
+        xml += '    <computer_groups>\n';
+        for (const id of computerGroups) {
+          xml += `      <computer_group><id>${this.escapeXml(String(id))}</id></computer_group>\n`;
+        }
+        xml += '    </computer_groups>\n';
+      }
+    } else {
+      const mobileDevices = this.toNumericIdArray((scope as any).mobile_devices);
+      const mobileDeviceGroups = this.toNumericIdArray((scope as any).mobile_device_groups);
+
+      if (mobileDevices.length > 0) {
+        hasAnyScope = true;
+        xml += '    <mobile_devices>\n';
+        for (const id of mobileDevices) {
+          xml += `      <mobile_device><id>${this.escapeXml(String(id))}</id></mobile_device>\n`;
+        }
+        xml += '    </mobile_devices>\n';
+      }
+
+      if (mobileDeviceGroups.length > 0) {
+        hasAnyScope = true;
+        xml += '    <mobile_device_groups>\n';
+        for (const id of mobileDeviceGroups) {
+          xml += `      <mobile_device_group><id>${this.escapeXml(String(id))}</id></mobile_device_group>\n`;
+        }
+        xml += '    </mobile_device_groups>\n';
+      }
+    }
+
+    xml += '  </scope>\n';
+    return hasAnyScope ? xml : '';
+  }
+
+  private buildClassicConfigurationProfileXml(type: ConfigurationProfileType, profileData: any): string {
     const wrapper = this.getConfigurationProfileClassicWrapperKey(type);
-    const general: any = {
-      name: profileData.name,
-      payloads: profileData.payloads,
-    };
-    if (profileData.description !== undefined) general.description = profileData.description;
-    if (profileData.distributionMethod !== undefined) general.distribution_method = String(profileData.distributionMethod);
-    if (profileData.userRemovable !== undefined) general.user_removable = Boolean(profileData.userRemovable);
-    if (profileData.level !== undefined) general.level = String(profileData.level);
-    if (profileData.redeployOnUpdate !== undefined) general.redeploy_on_update = Boolean(profileData.redeployOnUpdate);
-    if (profileData.categoryId !== undefined) general.category = { id: Number(profileData.categoryId) };
-    if (profileData.siteId !== undefined) general.site = { id: Number(profileData.siteId) };
+    let xml = `<?xml version="1.0" encoding="UTF-8"?>\n<${wrapper}>\n`;
+    xml += '  <general>\n';
+    xml += `    <name>${this.escapeXml(String(profileData.name))}</name>\n`;
+    if (profileData.description !== undefined) {
+      xml += `    <description>${this.escapeXml(String(profileData.description))}</description>\n`;
+    }
+    if (profileData.distributionMethod !== undefined) {
+      xml += `    <distribution_method>${this.escapeXml(String(profileData.distributionMethod))}</distribution_method>\n`;
+    }
+    if (profileData.userRemovable !== undefined) {
+      xml += `    <user_removable>${Boolean(profileData.userRemovable)}</user_removable>\n`;
+    }
+    if (profileData.level !== undefined) {
+      xml += `    <level>${this.escapeXml(String(profileData.level))}</level>\n`;
+    }
+    if (profileData.redeployOnUpdate !== undefined) {
+      xml += `    <redeploy_on_update>${Boolean(profileData.redeployOnUpdate)}</redeploy_on_update>\n`;
+    }
+    if (profileData.categoryId !== undefined) {
+      xml += `    <category><id>${this.escapeXml(String(Number(profileData.categoryId)))}</id></category>\n`;
+    }
+    if (profileData.siteId !== undefined) {
+      xml += `    <site><id>${this.escapeXml(String(Number(profileData.siteId)))}</id></site>\n`;
+    }
+    xml += `    <payloads>${this.escapeXml(String(profileData.payloads))}</payloads>\n`;
+    xml += '  </general>\n';
 
     const scope = this.normalizeConfigurationProfileScopeForClassic(type, profileData.scope);
-    const payload: any = {
-      [wrapper]: {
-        general,
-      },
-    };
-    if (scope) payload[wrapper].scope = scope;
-    return payload;
+    if (scope) {
+      xml += this.buildClassicConfigurationProfileScopeXml(type, scope);
+    }
+
+    xml += `</${wrapper}>`;
+    return xml;
   }
 
   private extractConfigurationProfileId(data: any): string | null {
@@ -3638,10 +3704,16 @@ export class JamfApiClientHybrid {
       fallbackFromModern = true;
     }
 
-    const classicPayload = this.buildClassicConfigurationProfilePayload(normalizedType, normalizedData);
+    const classicPayload = this.buildClassicConfigurationProfileXml(normalizedType, normalizedData);
     try {
       const response = await this.with409Retry(
-        async () => await this.axiosInstance.post(this.getConfigurationProfileClassicEndpoint(normalizedType), classicPayload),
+        async () =>
+          await this.axiosInstance.post(this.getConfigurationProfileClassicEndpoint(normalizedType), classicPayload, {
+            headers: {
+              'Content-Type': 'application/xml',
+              'Accept': 'application/xml',
+            },
+          }),
         { operation: 'createConfigurationProfileClassic', resourceType: 'configurationProfile', resourceId: normalizedData.name }
       );
       classicStatus = response.status;
@@ -3720,13 +3792,19 @@ export class JamfApiClientHybrid {
         fallbackFromModern = true;
       }
 
-      const classicPayload = this.buildClassicConfigurationProfilePayload(normalizedType, normalizedData);
+      const classicPayload = this.buildClassicConfigurationProfileXml(normalizedType, normalizedData);
       try {
         const response = await this.with409Retry(
           async () =>
             await this.axiosInstance.put(
               this.getConfigurationProfileClassicEndpoint(normalizedType, profileId),
-              classicPayload
+              classicPayload,
+              {
+                headers: {
+                  'Content-Type': 'application/xml',
+                  'Accept': 'application/xml',
+                },
+              }
             ),
           { operation: 'updateConfigurationProfileClassic', resourceType: 'configurationProfile', resourceId: String(profileId) }
         );

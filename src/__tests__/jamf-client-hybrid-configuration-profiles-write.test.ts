@@ -189,12 +189,17 @@ describe('JamfApiClientHybrid configuration profile create/update', () => {
     expect(mockAxiosInstance.post).toHaveBeenNthCalledWith(
       2,
       '/JSSResource/osxconfigurationprofiles/id/0',
+      expect.stringContaining('<os_x_configuration_profile>'),
       expect.objectContaining({
-        os_x_configuration_profile: expect.objectContaining({
-          general: expect.objectContaining({ name: 'Classic Fallback', payloads: payload }),
+        headers: expect.objectContaining({
+          'Content-Type': 'application/xml',
+          Accept: 'application/xml',
         }),
       })
     );
+    const classicCreateXml = String((mockAxiosInstance.post.mock.calls[1] as any)?.[1] ?? '');
+    expect(classicCreateXml).toContain('<name>Classic Fallback</name>');
+    expect(classicCreateXml).toContain('&lt;plist');
     expect(mockAxiosInstance.get).toHaveBeenCalledTimes(1);
     expect(result).toMatchObject({ id: '888', name: 'Classic Fallback' });
   });
@@ -242,12 +247,17 @@ describe('JamfApiClientHybrid configuration profile create/update', () => {
     expect(mockAxiosInstance.put).toHaveBeenNthCalledWith(
       2,
       '/JSSResource/osxconfigurationprofiles/id/42',
+      expect.stringContaining('<os_x_configuration_profile>'),
       expect.objectContaining({
-        os_x_configuration_profile: expect.objectContaining({
-          general: expect.objectContaining({ name: 'After Fallback', payloads: payload }),
+        headers: expect.objectContaining({
+          'Content-Type': 'application/xml',
+          Accept: 'application/xml',
         }),
       })
     );
+    const classicUpdateXml = String((mockAxiosInstance.put.mock.calls[1] as any)?.[1] ?? '');
+    expect(classicUpdateXml).toContain('<name>After Fallback</name>');
+    expect(classicUpdateXml).toContain('&lt;plist');
     expect(mockAxiosInstance.get).toHaveBeenCalledTimes(2);
     expect(result).toMatchObject({ id: '42', name: 'After Fallback' });
   });
