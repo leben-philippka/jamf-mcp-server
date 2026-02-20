@@ -87,6 +87,56 @@ describe('JamfApiClientHybrid auth selection', () => {
     expect(cfg.headers.Authorization).toBe('Bearer basic-bearer');
   });
 
+  test('keeps explicit Authorization header for Classic endpoints (needed for Basic retry)', () => {
+    const client = new JamfApiClientHybrid({
+      baseUrl: 'https://example.test',
+      username: 'user',
+      password: 'pass',
+    });
+
+    const requestInterceptor = (mockAxiosInstance.interceptors.request.use as jest.Mock).mock.calls[0][0] as any;
+
+    (client as any).bearerTokenAvailable = true;
+    (client as any).bearerToken = { token: 'basic-bearer', issuedAt: new Date(), expires: new Date(Date.now() + 60_000), expiresIn: 60 };
+
+    const cfg = requestInterceptor({
+      url: '/JSSResource/osxconfigurationprofiles/id/21',
+      method: 'put',
+      headers: { Authorization: 'Basic Zm9vOmJhcg==' },
+    });
+    expect(cfg.headers.Authorization).toBe('Basic Zm9vOmJhcg==');
+  });
+
+  test('keeps explicit Authorization header when headers implement get/set', () => {
+    const client = new JamfApiClientHybrid({
+      baseUrl: 'https://example.test',
+      username: 'user',
+      password: 'pass',
+    });
+
+    const requestInterceptor = (mockAxiosInstance.interceptors.request.use as jest.Mock).mock.calls[0][0] as any;
+
+    (client as any).bearerTokenAvailable = true;
+    (client as any).bearerToken = { token: 'basic-bearer', issuedAt: new Date(), expires: new Date(Date.now() + 60_000), expiresIn: 60 };
+
+    const headers = {
+      store: { Authorization: 'Basic Zm9vOmJhcg==' },
+      get(name: string) {
+        return (this.store as any)[name];
+      },
+      set(name: string, value: string) {
+        (this.store as any)[name] = value;
+      },
+    };
+
+    const cfg = requestInterceptor({
+      url: '/JSSResource/osxconfigurationprofiles/id/21',
+      method: 'put',
+      headers,
+    });
+    expect(cfg.headers.get('Authorization')).toBe('Basic Zm9vOmJhcg==');
+  });
+
   test('ensureAuthenticated refreshes OAuth2 even when bearer token exists', async () => {
     const client = new JamfApiClientHybrid({
       baseUrl: 'https://example.test',

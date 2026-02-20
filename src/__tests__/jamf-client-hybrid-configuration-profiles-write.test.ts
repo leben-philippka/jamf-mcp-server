@@ -347,6 +347,40 @@ describe('JamfApiClientHybrid configuration profile create/update', () => {
     expect(result).toMatchObject({ id: '42', name: 'After Fallback' });
   });
 
+  test('updateConfigurationProfile returns explicit diagnostic for classic 409 when basic auth is unavailable', async () => {
+    const client = createClient();
+    const payload =
+      '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>k2</key><string>v2</string></dict></plist>';
+
+    (client as any).basicAuthHeader = null;
+    mockAxiosInstance.get.mockResolvedValueOnce({
+      data: {
+        id: '42',
+        name: 'Before Fallback',
+        payloads: '<plist><dict/></plist>',
+      },
+    });
+    mockAxiosInstance.put
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 500, data: { error: 'modern unavailable' } },
+      })
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: {
+          status: 409,
+          data: '<html><body>Unable to update the database</body></html>',
+        },
+      });
+
+    await expect(
+      client.updateConfigurationProfile('42', 'computer', {
+        name: 'After Fallback',
+        payloads: payload,
+      })
+    ).rejects.toThrow(/Basic auth is not configured|JAMF_USERNAME\/JAMF_PASSWORD/);
+  });
+
   test('serializes parallel updates to the same profile with per-profile write lock', async () => {
     const client = createClient();
     process.env.JAMF_CONFIG_PROFILE_VERIFY_ENABLED = 'false';

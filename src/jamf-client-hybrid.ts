@@ -220,6 +220,34 @@ export class JamfApiClientHybrid {
     }
   }
 
+  private getAuthorizationHeaderValue(headers: unknown): string | undefined {
+    if (!headers || typeof headers !== 'object') return undefined;
+    const headersAny = headers as any;
+    const direct = headersAny.Authorization ?? headersAny.authorization;
+    if (typeof direct === 'string' && direct.trim()) return direct;
+
+    if (typeof headersAny.get === 'function') {
+      const viaGet = headersAny.get('Authorization') ?? headersAny.get('authorization');
+      if (typeof viaGet === 'string' && viaGet.trim()) return viaGet;
+      if (Array.isArray(viaGet) && viaGet.length > 0) {
+        const first = viaGet[0];
+        if (typeof first === 'string' && first.trim()) return first;
+      }
+    }
+
+    return undefined;
+  }
+
+  private setAuthorizationHeader(headers: unknown, value: string): void {
+    if (!headers || typeof headers !== 'object') return;
+    const headersAny = headers as any;
+    if (typeof headersAny.set === 'function') {
+      headersAny.set('Authorization', value);
+      return;
+    }
+    headersAny.Authorization = value;
+  }
+
   constructor(config: JamfApiClientConfig) {
     this.config = config;
     this._readOnlyMode = config.readOnlyMode ?? false;
@@ -274,22 +302,30 @@ export class JamfApiClientHybrid {
     // Add request interceptor to handle auth based on endpoint
     this.axiosInstance.interceptors.request.use((config) => {
       const requestMethod = String(config.method ?? 'get').toLowerCase();
+      const headersAny = (config.headers ?? {}) as any;
+      config.headers = headersAny;
+      const existingAuthorization = this.getAuthorizationHeaderValue(headersAny);
+      const hasExplicitAuthorization = typeof existingAuthorization === 'string' && existingAuthorization.length > 0;
 
       // Classic API endpoints - try Bearer token first, fallback to Basic auth
       if (config.url?.includes('/JSSResource/')) {
-        // Try Bearer token first (some Jamf environments require this)
-        if (this.bearerTokenAvailable && this.bearerToken) {
-          config.headers['Authorization'] = `Bearer ${this.bearerToken.token}`;
-          logger.info(`  🔑 Setting Bearer token for Classic API endpoint: ${config.url}`);
-        } else if (this.oauth2Available && this.oauth2Token) {
-          // Many Jamf tenants accept OAuth2 access tokens for Classic API as well.
-          config.headers['Authorization'] = `Bearer ${this.oauth2Token.token}`;
-          logger.info(`  🔑 Setting OAuth2 Bearer token for Classic API endpoint: ${config.url}`);
-        } else if (this.basicAuthHeader) {
-          config.headers['Authorization'] = this.basicAuthHeader;
-          logger.info(`  🔑 Setting Basic Auth for Classic API endpoint: ${config.url}`);
+        if (hasExplicitAuthorization) {
+          logger.debug(`  🔑 Keeping explicit Authorization for Classic API endpoint: ${config.url}`);
         } else {
-          logger.warn(`Classic API endpoint ${config.url} requested but no auth credentials available`);
+          // Try Bearer token first (some Jamf environments require this)
+          if (this.bearerTokenAvailable && this.bearerToken) {
+            this.setAuthorizationHeader(config.headers, `Bearer ${this.bearerToken.token}`);
+            logger.info(`  🔑 Setting Bearer token for Classic API endpoint: ${config.url}`);
+          } else if (this.oauth2Available && this.oauth2Token) {
+            // Many Jamf tenants accept OAuth2 access tokens for Classic API as well.
+            this.setAuthorizationHeader(config.headers, `Bearer ${this.oauth2Token.token}`);
+            logger.info(`  🔑 Setting OAuth2 Bearer token for Classic API endpoint: ${config.url}`);
+          } else if (this.basicAuthHeader) {
+            this.setAuthorizationHeader(config.headers, this.basicAuthHeader);
+            logger.info(`  🔑 Setting Basic Auth for Classic API endpoint: ${config.url}`);
+          } else {
+            logger.warn(`Classic API endpoint ${config.url} requested but no auth credentials available`);
+          }
         }
 
         // Reduce stale-read risk across Classic reads by forcing cache bypass headers
@@ -316,13 +352,14 @@ export class JamfApiClientHybrid {
         // Jamf Classic API can return JSON if Accept header is set to application/json
       } else {
         // Modern API endpoints:
-        // Prefer OAuth2 client-credentials token if configured, since it is the
-        // intended Modern API auth method and may differ in permissions from a
-        // Basic-derived bearer token.
-        if (this.oauth2Available && this.oauth2Token) {
-          config.headers['Authorization'] = `Bearer ${this.oauth2Token.token}`;
-        } else if (this.bearerTokenAvailable && this.bearerToken) {
-          config.headers['Authorization'] = `Bearer ${this.bearerToken.token}`;
+        // Prefer OAuth2 client-credentials token if configured, unless a caller
+        // already set an explicit Authorization header (e.g., response-retry path).
+        if (!hasExplicitAuthorization) {
+          if (this.oauth2Available && this.oauth2Token) {
+            this.setAuthorizationHeader(config.headers, `Bearer ${this.oauth2Token.token}`);
+          } else if (this.bearerTokenAvailable && this.bearerToken) {
+            this.setAuthorizationHeader(config.headers, `Bearer ${this.bearerToken.token}`);
+          }
         }
       }
       return config;
@@ -339,8 +376,7 @@ export class JamfApiClientHybrid {
         };
 
         const isClassicEndpoint = Boolean(originalRequest?.url?.includes('/JSSResource/'));
-        const authHeader =
-          (originalRequest?.headers as any)?.Authorization ?? (originalRequest?.headers as any)?.authorization;
+        const authHeader = this.getAuthorizationHeaderValue(originalRequest?.headers);
 
         if (
           error.response?.status === 409 &&
@@ -359,7 +395,7 @@ export class JamfApiClientHybrid {
 
           if (isConfigProfileEndpoint && looksLikeClassicConflict) {
             originalRequest._retryBasicAuthOnConflict = true;
-            (originalRequest.headers as any).Authorization = this.basicAuthHeader;
+            this.setAuthorizationHeader(originalRequest.headers, this.basicAuthHeader);
             logger.warn('Classic config profile write returned 409 with Bearer auth; retrying once with Basic auth', {
               url: originalRequest.url,
             });
@@ -380,7 +416,7 @@ export class JamfApiClientHybrid {
             !originalRequest._retryBasicAuth
           ) {
             originalRequest._retryBasicAuth = true;
-            (originalRequest.headers as any).Authorization = this.basicAuthHeader;
+            this.setAuthorizationHeader(originalRequest.headers, this.basicAuthHeader);
             logger.info('Classic endpoint returned 401 with Bearer auth; retrying once with Basic auth', {
               url: originalRequest.url,
             });
@@ -793,11 +829,11 @@ export class JamfApiClientHybrid {
     if (!config.headers) return;
 
     if (this.oauth2Available && this.oauth2Token) {
-      config.headers['Authorization'] = `Bearer ${this.oauth2Token.token}`;
+      this.setAuthorizationHeader(config.headers, `Bearer ${this.oauth2Token.token}`);
     } else if (this.bearerTokenAvailable && this.bearerToken) {
-      config.headers['Authorization'] = `Bearer ${this.bearerToken.token}`;
+      this.setAuthorizationHeader(config.headers, `Bearer ${this.bearerToken.token}`);
     } else if (this.basicAuthHeader && config.url?.includes('/JSSResource/')) {
-      config.headers['Authorization'] = this.basicAuthHeader;
+      this.setAuthorizationHeader(config.headers, this.basicAuthHeader);
     }
   }
 
@@ -3596,6 +3632,19 @@ export class JamfApiClientHybrid {
     };
   }
 
+  private isClassicConfigProfileDatabaseConflict(error: unknown): boolean {
+    const status = getAxiosErrorStatus(error);
+    if (status !== 409) return false;
+    const data = getAxiosErrorData(error);
+    const body =
+      typeof data === 'string'
+        ? data
+        : data === undefined || data === null
+          ? ''
+          : JSON.stringify(data);
+    return String(body).toLowerCase().includes('unable to update the database');
+  }
+
   private async verifyConfigurationProfileWritePersisted(
     profileId: string,
     type: ConfigurationProfileType,
@@ -3817,6 +3866,18 @@ export class JamfApiClientHybrid {
       });
     } catch (error) {
       classicStatus = getAxiosErrorStatus(error);
+      if (this.isClassicConfigProfileDatabaseConflict(error) && !this.basicAuthHeader) {
+        throw new Error(
+          `Classic configuration profile create failed with 409 (Unable to update the database). Basic auth is not configured, so automatic Classic fallback retry with Basic auth is unavailable. Configure JAMF_USERNAME/JAMF_PASSWORD to enable fallback, and verify there is no concurrent Jamf edit lock. ${JSON.stringify(
+            {
+              fallbackFromModern,
+              modernStatus: modernStatus ?? null,
+              classicStatus: classicStatus ?? null,
+              hasBasicAuth: Boolean(this.basicAuthHeader),
+            }
+          )}`
+        );
+      }
       throw error;
     }
   }
@@ -3922,6 +3983,19 @@ export class JamfApiClientHybrid {
         });
       } catch (error) {
         classicStatus = getAxiosErrorStatus(error);
+        if (this.isClassicConfigProfileDatabaseConflict(error) && !this.basicAuthHeader) {
+          throw new Error(
+            `Classic configuration profile update failed with 409 (Unable to update the database). Basic auth is not configured, so automatic Classic fallback retry with Basic auth is unavailable. Configure JAMF_USERNAME/JAMF_PASSWORD to enable fallback, and verify there is no concurrent Jamf edit lock. ${JSON.stringify(
+              {
+                profileId: String(profileId),
+                fallbackFromModern,
+                modernStatus: modernStatus ?? null,
+                classicStatus: classicStatus ?? null,
+                hasBasicAuth: Boolean(this.basicAuthHeader),
+              }
+            )}`
+          );
+        }
         throw error;
       }
     });
