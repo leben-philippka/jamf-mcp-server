@@ -3872,7 +3872,6 @@ export class JamfApiClientHybrid {
 
   private isClassicConfigProfileDatabaseConflict(error: unknown): boolean {
     const status = getAxiosErrorStatus(error);
-    if (status !== 409) return false;
     const data = getAxiosErrorData(error);
     const body =
       typeof data === 'string'
@@ -3880,7 +3879,25 @@ export class JamfApiClientHybrid {
         : data === undefined || data === null
           ? ''
           : JSON.stringify(data);
-    return String(body).toLowerCase().includes('unable to update the database');
+    const message =
+      error instanceof Error
+        ? error.message
+        : error === undefined || error === null
+          ? ''
+          : String(error);
+    const combined = `${String(body)} ${String(message)}`.toLowerCase();
+
+    const has409Signal =
+      status === 409 ||
+      combined.includes('status code 409') ||
+      combined.includes('http 409') ||
+      combined.includes(' conflict');
+    const hasClassicDatabaseSignal = combined.includes('unable to update the database');
+    const hasConfigProfileEndpointSignal =
+      combined.includes('/jssresource/osxconfigurationprofiles/') ||
+      combined.includes('/jssresource/mobiledeviceconfigurationprofiles/');
+
+    return hasClassicDatabaseSignal && has409Signal && (status === 409 || hasConfigProfileEndpointSignal);
   }
 
   private async verifyConfigurationProfileWritePersisted(

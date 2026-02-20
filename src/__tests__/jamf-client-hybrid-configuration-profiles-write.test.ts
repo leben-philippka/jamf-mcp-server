@@ -442,6 +442,38 @@ describe('JamfApiClientHybrid configuration profile create/update', () => {
     ).rejects.toThrow(/Basic auth is not configured|JAMF_USERNAME\/JAMF_PASSWORD/);
   });
 
+  test('updateConfigurationProfile classifies classic 409 conflicts from normalized non-Axios errors', async () => {
+    const client = createClient();
+    process.env.JAMF_CONFIG_PROFILE_VERIFY_ENABLED = 'false';
+    const payload =
+      '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>k2</key><string>v2</string></dict></plist>';
+
+    mockAxiosInstance.get.mockResolvedValueOnce({
+      data: {
+        id: '21',
+        name: 'Blocked Profile',
+        payloads: payload,
+      },
+    });
+
+    mockAxiosInstance.put
+      .mockRejectedValueOnce({
+        isAxiosError: true,
+        response: { status: 404, data: { error: 'modern unavailable' } },
+      })
+      .mockRejectedValueOnce(
+        new Error(
+          'HTTP 409 PUT /JSSResource/osxconfigurationprofiles/id/21: <html><body>Conflict Unable to update the database</body></html> (undefined)'
+        )
+      );
+
+    await expect(
+      client.updateConfigurationProfile('21', 'computer', {
+        name: 'Blocked Profile',
+      })
+    ).rejects.toThrow(/Configuration profile 21 update blocked by Jamf Classic database conflict/);
+  });
+
   test('updateConfigurationProfile caches classic 409 conflicts and fast-fails subsequent attempts', async () => {
     const client = createClient();
     process.env.JAMF_CONFIG_PROFILE_VERIFY_ENABLED = 'false';
