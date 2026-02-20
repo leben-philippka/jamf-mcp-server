@@ -194,6 +194,46 @@ describe('JamfApiClientHybrid configuration profile create/update', () => {
     expect(result).toMatchObject({ id: '42', name: 'After Name' });
   });
 
+  test('updateConfigurationProfile maps redeploy_on_update=true to Jamf enum All', async () => {
+    const client = createClient();
+    const existingPayload =
+      '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>existing</key><string>payload</string></dict></plist>';
+
+    mockAxiosInstance.get
+      .mockResolvedValueOnce({
+        data: {
+          id: '21',
+          name: 'Config Profile',
+          payloads: existingPayload,
+          redeployOnUpdate: 'Newly Assigned',
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          id: '21',
+          name: 'Config Profile',
+          payloads: existingPayload,
+          redeployOnUpdate: 'All',
+        },
+      });
+    mockAxiosInstance.put.mockResolvedValueOnce({
+      status: 200,
+      data: { id: '21' },
+    });
+
+    await client.updateConfigurationProfile('21', 'computer', {
+      name: 'Config Profile',
+      redeploy_on_update: true,
+    });
+
+    expect(mockAxiosInstance.put).toHaveBeenCalledWith(
+      '/api/v2/computer-configuration-profiles/21',
+      expect.objectContaining({
+        redeployOnUpdate: true,
+      })
+    );
+  });
+
   test('createConfigurationProfile falls back to Classic API and still verifies persistence', async () => {
     const client = createClient();
     const payload =
@@ -256,6 +296,7 @@ describe('JamfApiClientHybrid configuration profile create/update', () => {
           id: '42',
           name: 'Before Fallback',
           payloads: '<plist><dict/></plist>',
+          redeployOnUpdate: 'Newly Assigned',
         },
       })
       .mockResolvedValueOnce({
@@ -263,6 +304,7 @@ describe('JamfApiClientHybrid configuration profile create/update', () => {
           id: '42',
           name: 'After Fallback',
           payloads: payload,
+          redeployOnUpdate: 'All',
         },
       });
     mockAxiosInstance.put
@@ -278,12 +320,13 @@ describe('JamfApiClientHybrid configuration profile create/update', () => {
     const result = await client.updateConfigurationProfile('42', 'computer', {
       name: 'After Fallback',
       payloads: payload,
+      redeploy_on_update: true,
     });
 
     expect(mockAxiosInstance.put).toHaveBeenNthCalledWith(
       1,
       '/api/v2/computer-configuration-profiles/42',
-      expect.objectContaining({ name: 'After Fallback', payloads: payload })
+      expect.objectContaining({ name: 'After Fallback', payloads: payload, redeployOnUpdate: true })
     );
     expect(mockAxiosInstance.put).toHaveBeenNthCalledWith(
       2,
@@ -298,6 +341,7 @@ describe('JamfApiClientHybrid configuration profile create/update', () => {
     );
     const classicUpdateXml = String((mockAxiosInstance.put.mock.calls[1] as any)?.[1] ?? '');
     expect(classicUpdateXml).toContain('<name>After Fallback</name>');
+    expect(classicUpdateXml).toContain('<redeploy_on_update>All</redeploy_on_update>');
     expect(classicUpdateXml).toContain('&lt;plist');
     expect(mockAxiosInstance.get).toHaveBeenCalledTimes(2);
     expect(result).toMatchObject({ id: '42', name: 'After Fallback' });

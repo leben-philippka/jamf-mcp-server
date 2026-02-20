@@ -183,5 +183,27 @@ describe('configuration profile write tools', () => {
         name: 'Updated Name Only',
       })
     );
+
+    await callHandler({
+      params: {
+        name: 'updateConfigurationProfile',
+        arguments: {
+          confirm: true,
+          profileId: '42',
+          type: 'computer',
+          profileData: {
+            name: 'Updated Redeploy Enum',
+            redeploy_on_update: 'Newly Assigned',
+          },
+        },
+      },
+    });
+    expect(jamfClient.updateConfigurationProfile).toHaveBeenCalledWith(
+      '42',
+      'computer',
+      expect.objectContaining({
+        redeploy_on_update: 'Newly Assigned',
+      })
+    );
   });
 });

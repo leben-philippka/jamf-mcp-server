@@ -127,7 +127,10 @@ const ConfigurationProfileBaseDataSchema = z
     distribution_method: z.string().optional().describe('Optional distribution method'),
     user_removable: z.boolean().optional().describe('Whether users can remove the profile'),
     level: z.string().optional().describe('Profile level (computer-level/user-level depending on profile type)'),
-    redeploy_on_update: z.boolean().optional().describe('Redeploy profile when updated'),
+    redeploy_on_update: z
+      .union([z.boolean(), z.enum(['All', 'Newly Assigned'])])
+      .optional()
+      .describe('Redeploy profile when updated (boolean or "All"/"Newly Assigned")'),
     scope: z.record(z.unknown()).optional().describe('Optional profile scope object'),
     payloads: z.string().min(1).optional().describe('Raw payload plist/XML string'),
     preferenceDomain: z.string().optional().describe('Optional convenience input for managed preferences domain'),
@@ -1227,7 +1230,10 @@ export function createBaseToolHandlers(jamfClient: any): {
                 distribution_method: { type: 'string', description: 'Optional distribution method' },
                 user_removable: { type: 'boolean', description: 'Whether users can remove the profile' },
                 level: { type: 'string', description: 'Profile level' },
-                redeploy_on_update: { type: 'boolean', description: 'Redeploy on profile update' },
+                redeploy_on_update: {
+                  description: 'Redeploy on profile update (boolean or "All"/"Newly Assigned")',
+                  anyOf: [{ type: 'boolean' }, { type: 'string', enum: ['All', 'Newly Assigned'] }],
+                },
                 scope: { type: 'object', description: 'Optional profile scope object' },
                 payloads: {
                   type: 'string',
@@ -1282,7 +1288,10 @@ export function createBaseToolHandlers(jamfClient: any): {
                 distribution_method: { type: 'string', description: 'Optional distribution method' },
                 user_removable: { type: 'boolean', description: 'Whether users can remove the profile' },
                 level: { type: 'string', description: 'Profile level' },
-                redeploy_on_update: { type: 'boolean', description: 'Redeploy on profile update' },
+                redeploy_on_update: {
+                  description: 'Redeploy on profile update (boolean or "All"/"Newly Assigned")',
+                  anyOf: [{ type: 'boolean' }, { type: 'string', enum: ['All', 'Newly Assigned'] }],
+                },
                 scope: { type: 'object', description: 'Optional profile scope object' },
                 payloads: {
                   type: 'string',

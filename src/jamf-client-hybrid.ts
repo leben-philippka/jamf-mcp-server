@@ -3306,6 +3306,47 @@ export class JamfApiClientHybrid {
     );
   }
 
+  private normalizeConfigurationProfileRedeployOnUpdate(
+    value: unknown,
+    options: { strict?: boolean; fieldName?: string } = {}
+  ): 'All' | 'Newly Assigned' | string | undefined {
+    const strict = options.strict !== false;
+    const fieldName = options.fieldName ?? 'profileData.redeploy_on_update';
+
+    if (value === undefined || value === null) return undefined;
+
+    if (typeof value === 'boolean') {
+      return value ? 'All' : 'Newly Assigned';
+    }
+
+    const raw = String(value).trim();
+    if (!raw) return undefined;
+    const lower = raw.toLowerCase();
+    if (lower === 'all' || lower === 'true' || lower === '1' || lower === 'yes') return 'All';
+    if (
+      lower === 'newly assigned' ||
+      lower === 'newly_assigned' ||
+      lower === 'newlyassigned' ||
+      lower === 'false' ||
+      lower === '0' ||
+      lower === 'no'
+    ) {
+      return 'Newly Assigned';
+    }
+
+    if (!strict) {
+      return raw;
+    }
+
+    throw new Error(`${fieldName} should be All or Newly Assigned`);
+  }
+
+  private normalizeConfigurationProfileRedeployOnUpdateForModern(value: unknown): boolean | undefined {
+    const normalized = this.normalizeConfigurationProfileRedeployOnUpdate(value, { strict: true });
+    if (normalized === undefined) return undefined;
+    return normalized === 'All';
+  }
+
   private normalizeConfigurationProfileWriteData(type: ConfigurationProfileType, profileData: any): any {
     if (!profileData || typeof profileData !== 'object') {
       throw new Error('profileData is required and must be an object');
@@ -3331,7 +3372,10 @@ export class JamfApiClientHybrid {
       distributionMethod: profileData.distribution_method ?? profileData.distributionMethod,
       userRemovable: profileData.user_removable ?? profileData.userRemovable,
       level: profileData.level,
-      redeployOnUpdate: profileData.redeploy_on_update ?? profileData.redeployOnUpdate,
+      redeployOnUpdate: this.normalizeConfigurationProfileRedeployOnUpdate(
+        profileData.redeploy_on_update ?? profileData.redeployOnUpdate,
+        { strict: true, fieldName: 'profileData.redeploy_on_update' }
+      ),
       scope: this.normalizeConfigurationProfileScopeForModern(type, profileData.scope),
       payloads,
     };
@@ -3355,7 +3399,11 @@ export class JamfApiClientHybrid {
     if (profileData.distributionMethod !== undefined) payload.distributionMethod = String(profileData.distributionMethod);
     if (profileData.userRemovable !== undefined) payload.userRemovable = Boolean(profileData.userRemovable);
     if (profileData.level !== undefined) payload.level = String(profileData.level);
-    if (profileData.redeployOnUpdate !== undefined) payload.redeployOnUpdate = Boolean(profileData.redeployOnUpdate);
+    if (profileData.redeployOnUpdate !== undefined) {
+      payload.redeployOnUpdate = this.normalizeConfigurationProfileRedeployOnUpdateForModern(
+        profileData.redeployOnUpdate
+      );
+    }
     if (profileData.scope !== undefined) payload.scope = profileData.scope;
 
     if (type === 'mobiledevice' && payload.distributionMethod === undefined) {
@@ -3436,7 +3484,7 @@ export class JamfApiClientHybrid {
       xml += `    <level>${this.escapeXml(String(profileData.level))}</level>\n`;
     }
     if (profileData.redeployOnUpdate !== undefined) {
-      xml += `    <redeploy_on_update>${Boolean(profileData.redeployOnUpdate)}</redeploy_on_update>\n`;
+      xml += `    <redeploy_on_update>${this.escapeXml(String(profileData.redeployOnUpdate))}</redeploy_on_update>\n`;
     }
     if (profileData.categoryId !== undefined) {
       xml += `    <category><id>${this.escapeXml(String(Number(profileData.categoryId)))}</id></category>\n`;
@@ -3525,8 +3573,10 @@ export class JamfApiClientHybrid {
         profile?.distributionMethod ?? profile?.distribution_method ?? profile?.general?.distribution_method,
       user_removable: profile?.userRemovable ?? profile?.user_removable ?? profile?.general?.user_removable,
       level: profile?.level ?? profile?.general?.level,
-      redeploy_on_update:
+      redeploy_on_update: this.normalizeConfigurationProfileRedeployOnUpdate(
         profile?.redeployOnUpdate ?? profile?.redeploy_on_update ?? profile?.general?.redeploy_on_update,
+        { strict: false }
+      ),
       scope: observedScope,
       payloads: profile?.payloads ?? profile?.general?.payloads,
     };
@@ -3582,7 +3632,7 @@ export class JamfApiClientHybrid {
       ...(requestedData.userRemovable !== undefined ? { user_removable: Boolean(requestedData.userRemovable) } : {}),
       ...(requestedData.level !== undefined ? { level: String(requestedData.level) } : {}),
       ...(requestedData.redeployOnUpdate !== undefined
-        ? { redeploy_on_update: Boolean(requestedData.redeployOnUpdate) }
+        ? { redeploy_on_update: String(requestedData.redeployOnUpdate) }
         : {}),
     };
 
