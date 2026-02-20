@@ -84,32 +84,66 @@ const GetScriptDetailsSchema = z.object({
   scriptId: z.string().describe('The Jamf script ID'),
 });
 
+const ConfigurationProfileTypeSchema = z
+  .enum(['computer', 'mobiledevice', 'mobile_device'])
+  .optional()
+  .default('computer')
+  .describe('Type of configuration profile');
+
 const ListConfigurationProfilesSchema = z.object({
-  type: z.enum(['computer', 'mobiledevice']).optional().default('computer').describe('Type of configuration profiles to list'),
+  type: ConfigurationProfileTypeSchema.describe('Type of configuration profiles to list'),
 });
 
 const GetConfigurationProfileDetailsSchema = z.object({
   profileId: z.string().describe('The configuration profile ID'),
-  type: z.enum(['computer', 'mobiledevice']).optional().default('computer').describe('Type of configuration profile'),
+  type: ConfigurationProfileTypeSchema,
 });
 
 const SearchConfigurationProfilesSchema = z.object({
   query: z.string().describe('Search query to find configuration profiles by name'),
-  type: z.enum(['computer', 'mobiledevice']).optional().default('computer').describe('Type of configuration profiles to search'),
+  type: ConfigurationProfileTypeSchema.describe('Type of configuration profiles to search'),
 });
 
 const DeployConfigurationProfileSchema = z.object({
   profileId: z.string().describe('The configuration profile ID to deploy'),
   deviceIds: z.array(z.string()).describe('Array of device IDs to deploy the profile to'),
-  type: z.enum(['computer', 'mobiledevice']).optional().default('computer').describe('Type of configuration profile'),
+  type: ConfigurationProfileTypeSchema,
   confirm: z.boolean().optional().default(false).describe('Confirmation flag for profile deployment'),
 });
 
 const RemoveConfigurationProfileSchema = z.object({
   profileId: z.string().describe('The configuration profile ID to remove'),
   deviceIds: z.array(z.string()).describe('Array of device IDs to remove the profile from'),
-  type: z.enum(['computer', 'mobiledevice']).optional().default('computer').describe('Type of configuration profile'),
+  type: ConfigurationProfileTypeSchema,
   confirm: z.boolean().optional().default(false).describe('Confirmation flag for profile removal'),
+});
+
+const ConfigurationProfileDataSchema = z.object({
+  name: z.string().min(1).describe('Configuration profile name'),
+  description: z.string().optional().describe('Profile description'),
+  categoryId: z.number().optional().describe('Optional category ID'),
+  siteId: z.number().optional().describe('Optional site ID'),
+  distribution_method: z.string().optional().describe('Optional distribution method'),
+  user_removable: z.boolean().optional().describe('Whether users can remove the profile'),
+  level: z.string().optional().describe('Profile level (computer-level/user-level depending on profile type)'),
+  redeploy_on_update: z.boolean().optional().describe('Redeploy profile when updated'),
+  scope: z.record(z.unknown()).optional().describe('Optional profile scope object'),
+  payloads: z.string().min(1).describe('Raw payload plist/XML string'),
+  preferenceDomain: z.string().optional().describe('Optional convenience input for managed preferences domain'),
+  settingsJson: z.union([z.string(), z.record(z.unknown())]).optional().describe('Optional convenience settings JSON'),
+});
+
+const CreateConfigurationProfileSchema = z.object({
+  type: ConfigurationProfileTypeSchema,
+  profileData: ConfigurationProfileDataSchema,
+  confirm: z.boolean().optional().default(false).describe('Confirmation flag for profile creation'),
+});
+
+const UpdateConfigurationProfileSchema = z.object({
+  profileId: z.string().describe('The configuration profile ID to update'),
+  type: ConfigurationProfileTypeSchema,
+  profileData: ConfigurationProfileDataSchema,
+  confirm: z.boolean().optional().default(false).describe('Confirmation flag for profile update'),
 });
 
 const ListComputerGroupsSchema = z.object({
@@ -1106,7 +1140,7 @@ export function createBaseToolHandlers(jamfClient: any): {
           properties: {
             type: {
               type: 'string',
-              enum: ['computer', 'mobiledevice'],
+              enum: ['computer', 'mobiledevice', 'mobile_device'],
               description: 'Type of configuration profiles to list',
               default: 'computer',
             },
@@ -1125,7 +1159,7 @@ export function createBaseToolHandlers(jamfClient: any): {
             },
             type: {
               type: 'string',
-              enum: ['computer', 'mobiledevice'],
+              enum: ['computer', 'mobiledevice', 'mobile_device'],
               description: 'Type of configuration profile',
               default: 'computer',
             },
@@ -1145,12 +1179,110 @@ export function createBaseToolHandlers(jamfClient: any): {
             },
             type: {
               type: 'string',
-              enum: ['computer', 'mobiledevice'],
+              enum: ['computer', 'mobiledevice', 'mobile_device'],
               description: 'Type of configuration profiles to search',
               default: 'computer',
             },
           },
           required: ['query'],
+        },
+      },
+      {
+        name: 'createConfigurationProfile',
+        description:
+          'Create a new configuration profile (computer or mobile device) with strict post-write persistence verification (requires confirmation). Writes require `confirm:true` and (in MCP mode) `JAMF_WRITE_ENABLED=true`. Writes are serialized to reduce Jamf 409 conflicts.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            type: {
+              type: 'string',
+              enum: ['computer', 'mobiledevice', 'mobile_device'],
+              description: 'Type of configuration profile',
+              default: 'computer',
+            },
+            profileData: {
+              type: 'object',
+              description: 'Configuration profile payload data',
+              properties: {
+                name: { type: 'string', description: 'Configuration profile name' },
+                description: { type: 'string', description: 'Profile description' },
+                categoryId: { type: 'number', description: 'Optional category ID' },
+                siteId: { type: 'number', description: 'Optional site ID' },
+                distribution_method: { type: 'string', description: 'Optional distribution method' },
+                user_removable: { type: 'boolean', description: 'Whether users can remove the profile' },
+                level: { type: 'string', description: 'Profile level' },
+                redeploy_on_update: { type: 'boolean', description: 'Redeploy on profile update' },
+                scope: { type: 'object', description: 'Optional profile scope object' },
+                payloads: { type: 'string', description: 'Raw payload plist/XML string' },
+                preferenceDomain: {
+                  type: 'string',
+                  description: 'Optional convenience input for managed preferences domain',
+                },
+                settingsJson: {
+                  description: 'Optional convenience JSON settings (string or object)',
+                  anyOf: [{ type: 'string' }, { type: 'object' }],
+                },
+              },
+              required: ['name', 'payloads'],
+            },
+            confirm: {
+              type: 'boolean',
+              description: 'Confirmation flag for profile creation',
+              default: false,
+            },
+          },
+          required: ['type', 'profileData'],
+        },
+      },
+      {
+        name: 'updateConfigurationProfile',
+        description:
+          'Update an existing configuration profile (computer or mobile device) with strict post-write persistence verification (requires confirmation). Writes require `confirm:true` and (in MCP mode) `JAMF_WRITE_ENABLED=true`. Writes are serialized to reduce Jamf 409 conflicts.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            profileId: {
+              type: 'string',
+              description: 'The configuration profile ID to update',
+            },
+            type: {
+              type: 'string',
+              enum: ['computer', 'mobiledevice', 'mobile_device'],
+              description: 'Type of configuration profile',
+              default: 'computer',
+            },
+            profileData: {
+              type: 'object',
+              description: 'Configuration profile payload data',
+              properties: {
+                name: { type: 'string', description: 'Configuration profile name' },
+                description: { type: 'string', description: 'Profile description' },
+                categoryId: { type: 'number', description: 'Optional category ID' },
+                siteId: { type: 'number', description: 'Optional site ID' },
+                distribution_method: { type: 'string', description: 'Optional distribution method' },
+                user_removable: { type: 'boolean', description: 'Whether users can remove the profile' },
+                level: { type: 'string', description: 'Profile level' },
+                redeploy_on_update: { type: 'boolean', description: 'Redeploy on profile update' },
+                scope: { type: 'object', description: 'Optional profile scope object' },
+                payloads: { type: 'string', description: 'Raw payload plist/XML string' },
+                preferenceDomain: {
+                  type: 'string',
+                  description: 'Optional convenience input for managed preferences domain',
+                },
+                settingsJson: {
+                  description: 'Optional convenience JSON settings (string or object)',
+                  anyOf: [{ type: 'string' }, { type: 'object' }],
+                },
+              },
+              required: ['name', 'payloads'],
+            },
+            confirm: {
+              type: 'boolean',
+              description: 'Confirmation flag for profile update',
+              default: false,
+            },
+          },
+          required: ['profileId', 'type', 'profileData'],
         },
       },
       {
@@ -1172,7 +1304,7 @@ export function createBaseToolHandlers(jamfClient: any): {
             },
             type: {
               type: 'string',
-              enum: ['computer', 'mobiledevice'],
+              enum: ['computer', 'mobiledevice', 'mobile_device'],
               description: 'Type of configuration profile',
               default: 'computer',
             },
@@ -1204,7 +1336,7 @@ export function createBaseToolHandlers(jamfClient: any): {
             },
             type: {
               type: 'string',
-              enum: ['computer', 'mobiledevice'],
+              enum: ['computer', 'mobiledevice', 'mobile_device'],
               description: 'Type of configuration profile',
               default: 'computer',
             },
@@ -3830,6 +3962,68 @@ export function createBaseToolHandlers(jamfClient: any): {
                 level: p.level || p.distribution_method,
               })),
             }, null, 2),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'createConfigurationProfile': {
+          const { type, profileData, confirm } = CreateConfigurationProfileSchema.parse(args);
+
+          if (!confirm) {
+            const content: TextContent = {
+              type: 'text',
+              text: 'Configuration profile creation requires confirmation. Please set confirm: true to proceed.',
+            };
+            return { content: [content] };
+          }
+
+          const profile = await (jamfClient as any).createConfigurationProfile(type, profileData);
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                message: 'Configuration profile created successfully',
+                profile: {
+                  id: profile?.id,
+                  name: profile?.name ?? profile?.displayName ?? profile?.general?.name,
+                  type,
+                },
+              },
+              null,
+              2
+            ),
+          };
+
+          return { content: [content] };
+        }
+
+        case 'updateConfigurationProfile': {
+          const { profileId, type, profileData, confirm } = UpdateConfigurationProfileSchema.parse(args);
+
+          if (!confirm) {
+            const content: TextContent = {
+              type: 'text',
+              text: 'Configuration profile update requires confirmation. Please set confirm: true to proceed.',
+            };
+            return { content: [content] };
+          }
+
+          const profile = await (jamfClient as any).updateConfigurationProfile(profileId, type, profileData);
+          const content: TextContent = {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                message: 'Configuration profile updated successfully',
+                profile: {
+                  id: profile?.id ?? profileId,
+                  name: profile?.name ?? profile?.displayName ?? profile?.general?.name,
+                  type,
+                },
+              },
+              null,
+              2
+            ),
           };
 
           return { content: [content] };

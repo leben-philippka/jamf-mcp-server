@@ -200,6 +200,8 @@ Full device management capabilities including:
 - **listConfigurationProfiles**: List all configuration profiles (computer or mobile device)
 - **getConfigurationProfileDetails**: Get detailed information about a specific configuration profile
 - **searchConfigurationProfiles**: Search for configuration profiles by name
+- **createConfigurationProfile**: Create a configuration profile with strict post-write persistence verification (with confirmation)
+- **updateConfigurationProfile**: Update a configuration profile with strict post-write persistence verification (with confirmation)
 - **deployConfigurationProfile**: Deploy a configuration profile to one or more devices (with confirmation)
 - **removeConfigurationProfile**: Remove a configuration profile from one or more devices (with confirmation)
 

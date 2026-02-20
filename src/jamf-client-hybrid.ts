@@ -37,6 +37,8 @@ type SmartGroupCriteriaContainer = {
   criterion?: SmartGroupCriteriaInput[];
   criteria?: SmartGroupCriteriaInput[];
 };
+type ConfigurationProfileTypeInput = 'computer' | 'mobiledevice' | 'mobile_device';
+type ConfigurationProfileType = 'computer' | 'mobiledevice';
 
 export interface JamfApiClientConfig {
   baseUrl: string;
@@ -131,6 +133,7 @@ export class JamfApiClientHybrid {
   private circuitBreaker: CircuitBreaker | null = null;
   private circuitBreakerEnabled: boolean = false;
   private readonly policyWriteLocks: Map<string, Promise<void>> = new Map();
+  private readonly configurationProfileWriteLocks: Map<string, Promise<void>> = new Map();
   private smartGroupCriteriaCatalogCache: { fetchedAt: number; names: string[] } | null = null;
 
   private async sleep(ms: number): Promise<void> {
@@ -191,6 +194,28 @@ export class JamfApiClientHybrid {
       releaseCurrent();
       if (this.policyWriteLocks.get(key) === queued) {
         this.policyWriteLocks.delete(key);
+      }
+    }
+  }
+
+  private async withConfigurationProfileWriteLock<T>(profileLockKey: string, fn: () => Promise<T>): Promise<T> {
+    const key = String(profileLockKey);
+    const previous = this.configurationProfileWriteLocks.get(key) ?? Promise.resolve();
+
+    let releaseCurrent!: () => void;
+    const current = new Promise<void>((resolve) => {
+      releaseCurrent = resolve;
+    });
+    const queued = previous.then(() => current);
+    this.configurationProfileWriteLocks.set(key, queued);
+
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      releaseCurrent();
+      if (this.configurationProfileWriteLocks.get(key) === queued) {
+        this.configurationProfileWriteLocks.delete(key);
       }
     }
   }
@@ -3142,6 +3167,583 @@ export class JamfApiClientHybrid {
     }
   }
 
+  private normalizeConfigurationProfileType(type: ConfigurationProfileTypeInput = 'computer'): ConfigurationProfileType {
+    const value = String(type ?? 'computer').trim().toLowerCase();
+    if (value === 'mobiledevice' || value === 'mobile_device' || value === 'mobile-device') {
+      return 'mobiledevice';
+    }
+    return 'computer';
+  }
+
+  private getConfigurationProfileModernEndpoint(type: ConfigurationProfileType, profileId?: string): string {
+    const base =
+      type === 'computer'
+        ? '/api/v2/computer-configuration-profiles'
+        : '/api/v2/mobile-device-configuration-profiles';
+    return profileId ? `${base}/${profileId}` : base;
+  }
+
+  private getConfigurationProfileClassicEndpoint(type: ConfigurationProfileType, profileId?: string): string {
+    const base =
+      type === 'computer'
+        ? '/JSSResource/osxconfigurationprofiles'
+        : '/JSSResource/mobiledeviceconfigurationprofiles';
+    return profileId ? `${base}/id/${profileId}` : `${base}/id/0`;
+  }
+
+  private getConfigurationProfileClassicWrapperKey(type: ConfigurationProfileType): 'os_x_configuration_profile' | 'configuration_profile' {
+    return type === 'computer' ? 'os_x_configuration_profile' : 'configuration_profile';
+  }
+
+  private toNumericIdArray(values: unknown): number[] {
+    if (!Array.isArray(values)) return [];
+    return values
+      .map((entry) => {
+        if (entry === null || entry === undefined) return null;
+        if (typeof entry === 'object') {
+          const id = (entry as any).id;
+          const parsed = Number(id);
+          return Number.isFinite(parsed) ? parsed : null;
+        }
+        const parsed = Number(entry);
+        return Number.isFinite(parsed) ? parsed : null;
+      })
+      .filter((value): value is number => value !== null)
+      .map((value) => Math.trunc(value));
+  }
+
+  private normalizeConfigurationProfileScopeForModern(type: ConfigurationProfileType, scope: any): Record<string, unknown> | undefined {
+    if (!scope || typeof scope !== 'object') return undefined;
+
+    const out: Record<string, unknown> = {};
+    if (type === 'computer') {
+      const computerIds = this.toNumericIdArray(scope.computerIds ?? scope.computers);
+      const computerGroupIds = this.toNumericIdArray(scope.computerGroupIds ?? scope.computer_groups);
+      if (computerIds.length > 0) out.computerIds = Array.from(new Set(computerIds));
+      if (computerGroupIds.length > 0) out.computerGroupIds = Array.from(new Set(computerGroupIds));
+    } else {
+      const mobileDeviceIds = this.toNumericIdArray(scope.mobileDeviceIds ?? scope.mobile_devices);
+      const mobileDeviceGroupIds = this.toNumericIdArray(scope.mobileDeviceGroupIds ?? scope.mobile_device_groups);
+      if (mobileDeviceIds.length > 0) out.mobileDeviceIds = Array.from(new Set(mobileDeviceIds));
+      if (mobileDeviceGroupIds.length > 0) out.mobileDeviceGroupIds = Array.from(new Set(mobileDeviceGroupIds));
+    }
+
+    for (const [key, value] of Object.entries(scope)) {
+      if (value === undefined) continue;
+      if (key in out) continue;
+      if (['computers', 'computer_groups', 'mobile_devices', 'mobile_device_groups'].includes(key)) continue;
+      out[key] = value;
+    }
+
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
+
+  private normalizeConfigurationProfileScopeForClassic(type: ConfigurationProfileType, scope: any): Record<string, unknown> | undefined {
+    if (!scope || typeof scope !== 'object') return undefined;
+
+    const out: Record<string, unknown> = {};
+    if (type === 'computer') {
+      const computers = this.toNumericIdArray(scope.computerIds ?? scope.computers).map((id) => ({ id }));
+      const computerGroups = this.toNumericIdArray(scope.computerGroupIds ?? scope.computer_groups).map((id) => ({ id }));
+      if (computers.length > 0) out.computers = computers;
+      if (computerGroups.length > 0) out.computer_groups = computerGroups;
+    } else {
+      const mobileDevices = this.toNumericIdArray(scope.mobileDeviceIds ?? scope.mobile_devices).map((id) => ({ id }));
+      const mobileDeviceGroups = this.toNumericIdArray(scope.mobileDeviceGroupIds ?? scope.mobile_device_groups).map((id) => ({ id }));
+      if (mobileDevices.length > 0) out.mobile_devices = mobileDevices;
+      if (mobileDeviceGroups.length > 0) out.mobile_device_groups = mobileDeviceGroups;
+    }
+
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
+
+  private buildConfigurationProfilePayloadFromSettings(
+    preferenceDomain: string | undefined,
+    settingsJson: unknown
+  ): string | undefined {
+    const domain = String(preferenceDomain ?? '').trim();
+    if (!domain || settingsJson === undefined) return undefined;
+
+    const settingsText =
+      typeof settingsJson === 'string'
+        ? settingsJson
+        : JSON.stringify(settingsJson, null, 2);
+
+    return (
+      '<?xml version="1.0" encoding="UTF-8"?>\n' +
+      '<plist version="1.0">\n' +
+      '<dict>\n' +
+      `  <key>${this.escapeXml(domain)}</key>\n` +
+      `  <string>${this.escapeXml(settingsText)}</string>\n` +
+      '</dict>\n' +
+      '</plist>'
+    );
+  }
+
+  private normalizeConfigurationProfileWriteData(type: ConfigurationProfileType, profileData: any): any {
+    if (!profileData || typeof profileData !== 'object') {
+      throw new Error('profileData is required and must be an object');
+    }
+
+    const payloadFromSettings = this.buildConfigurationProfilePayloadFromSettings(
+      String(profileData.preferenceDomain ?? '').trim() || undefined,
+      profileData.settingsJson
+    );
+    const payloads = String(profileData.payloads ?? payloadFromSettings ?? '').trim();
+    if (!payloads) {
+      throw new Error('profileData.payloads is required (raw plist/XML string)');
+    }
+
+    const normalized = {
+      name: String(profileData.name ?? '').trim(),
+      description:
+        profileData.description !== undefined && profileData.description !== null
+          ? String(profileData.description)
+          : undefined,
+      categoryId: profileData.categoryId ?? profileData.category_id,
+      siteId: profileData.siteId ?? profileData.site_id,
+      distributionMethod: profileData.distribution_method ?? profileData.distributionMethod,
+      userRemovable: profileData.user_removable ?? profileData.userRemovable,
+      level: profileData.level,
+      redeployOnUpdate: profileData.redeploy_on_update ?? profileData.redeployOnUpdate,
+      scope: this.normalizeConfigurationProfileScopeForModern(type, profileData.scope),
+      payloads,
+    };
+
+    if (!normalized.name) {
+      throw new Error('profileData.name is required');
+    }
+
+    return normalized;
+  }
+
+  private buildModernConfigurationProfilePayload(type: ConfigurationProfileType, profileData: any): any {
+    const payload: any = {
+      name: profileData.name,
+      payloads: profileData.payloads,
+    };
+
+    if (profileData.description !== undefined) payload.description = profileData.description;
+    if (profileData.categoryId !== undefined) payload.categoryId = Number(profileData.categoryId);
+    if (profileData.siteId !== undefined) payload.siteId = Number(profileData.siteId);
+    if (profileData.distributionMethod !== undefined) payload.distributionMethod = String(profileData.distributionMethod);
+    if (profileData.userRemovable !== undefined) payload.userRemovable = Boolean(profileData.userRemovable);
+    if (profileData.level !== undefined) payload.level = String(profileData.level);
+    if (profileData.redeployOnUpdate !== undefined) payload.redeployOnUpdate = Boolean(profileData.redeployOnUpdate);
+    if (profileData.scope !== undefined) payload.scope = profileData.scope;
+
+    if (type === 'mobiledevice' && payload.distributionMethod === undefined) {
+      // Mobile profiles commonly rely on installAutomatically if distribution method isn't explicitly set.
+      payload.distributionMethod = 'Install Automatically';
+    }
+
+    return payload;
+  }
+
+  private buildClassicConfigurationProfilePayload(type: ConfigurationProfileType, profileData: any): any {
+    const wrapper = this.getConfigurationProfileClassicWrapperKey(type);
+    const general: any = {
+      name: profileData.name,
+      payloads: profileData.payloads,
+    };
+    if (profileData.description !== undefined) general.description = profileData.description;
+    if (profileData.distributionMethod !== undefined) general.distribution_method = String(profileData.distributionMethod);
+    if (profileData.userRemovable !== undefined) general.user_removable = Boolean(profileData.userRemovable);
+    if (profileData.level !== undefined) general.level = String(profileData.level);
+    if (profileData.redeployOnUpdate !== undefined) general.redeploy_on_update = Boolean(profileData.redeployOnUpdate);
+    if (profileData.categoryId !== undefined) general.category = { id: Number(profileData.categoryId) };
+    if (profileData.siteId !== undefined) general.site = { id: Number(profileData.siteId) };
+
+    const scope = this.normalizeConfigurationProfileScopeForClassic(type, profileData.scope);
+    const payload: any = {
+      [wrapper]: {
+        general,
+      },
+    };
+    if (scope) payload[wrapper].scope = scope;
+    return payload;
+  }
+
+  private extractConfigurationProfileId(data: any): string | null {
+    const idCandidates = [
+      data?.id,
+      data?.configurationProfileId,
+      data?.profileId,
+      data?.os_x_configuration_profile?.id,
+      data?.configuration_profile?.id,
+    ];
+    for (const candidate of idCandidates) {
+      if (candidate === undefined || candidate === null) continue;
+      const value = String(candidate).trim();
+      if (value) return value;
+    }
+    return null;
+  }
+
+  private extractIdFromLocationHeader(locationHeader: unknown): string | null {
+    if (!locationHeader) return null;
+    const location = String(locationHeader);
+    const id = location.split('/').pop();
+    const value = String(id ?? '').trim();
+    return value ? value : null;
+  }
+
+  private async resolveCreatedConfigurationProfileId(
+    type: ConfigurationProfileType,
+    profileData: any,
+    response: any
+  ): Promise<string | null> {
+    const direct = this.extractConfigurationProfileId(response?.data);
+    if (direct) return direct;
+
+    const fromLocation = this.extractIdFromLocationHeader(response?.headers?.location);
+    if (fromLocation) return fromLocation;
+
+    const bySearch = await this.searchConfigurationProfiles(profileData.name, type);
+    const exact = bySearch.find((profile: any) => String(profile?.name ?? profile?.displayName ?? '').trim() === profileData.name);
+    if (!exact) return null;
+    return this.extractConfigurationProfileId(exact);
+  }
+
+  private normalizeConfigurationProfilePayloadString(payload: unknown): string {
+    if (payload === undefined || payload === null) return '';
+    const raw = typeof payload === 'string' ? payload : JSON.stringify(payload);
+    return String(raw).replace(/\s+/g, '').trim();
+  }
+
+  private extractConfigurationProfileObservedFields(profile: any, type: ConfigurationProfileType): any {
+    const scope = profile?.scope ?? {};
+    const observedScope =
+      type === 'computer'
+        ? {
+            computerIds: this.toNumericIdArray(scope.computerIds ?? scope.computers),
+            computerGroupIds: this.toNumericIdArray(scope.computerGroupIds ?? scope.computer_groups),
+          }
+        : {
+            mobileDeviceIds: this.toNumericIdArray(scope.mobileDeviceIds ?? scope.mobile_devices),
+            mobileDeviceGroupIds: this.toNumericIdArray(scope.mobileDeviceGroupIds ?? scope.mobile_device_groups),
+          };
+
+    return {
+      name: profile?.name ?? profile?.displayName ?? profile?.general?.name,
+      description: profile?.description ?? profile?.general?.description,
+      categoryId: profile?.categoryId ?? profile?.category?.id ?? profile?.category_id ?? profile?.general?.category?.id,
+      siteId: profile?.siteId ?? profile?.site?.id ?? profile?.site_id ?? profile?.general?.site?.id,
+      distribution_method:
+        profile?.distributionMethod ?? profile?.distribution_method ?? profile?.general?.distribution_method,
+      user_removable: profile?.userRemovable ?? profile?.user_removable ?? profile?.general?.user_removable,
+      level: profile?.level ?? profile?.general?.level,
+      redeploy_on_update:
+        profile?.redeployOnUpdate ?? profile?.redeploy_on_update ?? profile?.general?.redeploy_on_update,
+      scope: observedScope,
+      payloads: profile?.payloads ?? profile?.general?.payloads,
+    };
+  }
+
+  private areNumericIdSetsEqual(a: number[] = [], b: number[] = []): boolean {
+    const left = Array.from(new Set(a)).sort((x, y) => x - y);
+    const right = Array.from(new Set(b)).sort((x, y) => x - y);
+    return JSON.stringify(left) === JSON.stringify(right);
+  }
+
+  private summarizeConfigurationProfilePayload(payload: unknown): { length: number; preview: string } {
+    const value = payload === undefined || payload === null ? '' : String(payload);
+    return {
+      length: value.length,
+      preview: value.slice(0, 160),
+    };
+  }
+
+  private async verifyConfigurationProfileWritePersisted(
+    profileId: string,
+    type: ConfigurationProfileType,
+    requestedData: any,
+    context: {
+      operation: 'create' | 'update';
+      fallbackFromModern: boolean;
+      modernStatus?: number;
+      classicStatus?: number;
+      initialProfile?: any;
+    }
+  ): Promise<any> {
+    const strictEnabled = String(process.env.JAMF_CONFIG_PROFILE_VERIFY_ENABLED ?? 'true').toLowerCase() !== 'false';
+    if (!strictEnabled) {
+      return context.initialProfile ?? (await this.getConfigurationProfileDetails(profileId, type));
+    }
+
+    const attempts = Math.max(1, Number(process.env.JAMF_CONFIG_PROFILE_VERIFY_ATTEMPTS ?? 12));
+    const delayMs = Math.max(0, Number(process.env.JAMF_CONFIG_PROFILE_VERIFY_DELAY_MS ?? 350));
+    const requiredConsistentReads = Math.max(
+      1,
+      Number(process.env.JAMF_CONFIG_PROFILE_VERIFY_REQUIRED_CONSISTENT_READS ?? 2)
+    );
+    const maxDurationMs = Math.max(0, Number(process.env.JAMF_CONFIG_PROFILE_VERIFY_MAX_DURATION_MS ?? 45000));
+
+    const expectedFields: Record<string, any> = {
+      name: requestedData.name,
+      ...(requestedData.description !== undefined ? { description: requestedData.description } : {}),
+      ...(requestedData.categoryId !== undefined ? { categoryId: Number(requestedData.categoryId) } : {}),
+      ...(requestedData.siteId !== undefined ? { siteId: Number(requestedData.siteId) } : {}),
+      ...(requestedData.distributionMethod !== undefined
+        ? { distribution_method: String(requestedData.distributionMethod) }
+        : {}),
+      ...(requestedData.userRemovable !== undefined ? { user_removable: Boolean(requestedData.userRemovable) } : {}),
+      ...(requestedData.level !== undefined ? { level: String(requestedData.level) } : {}),
+      ...(requestedData.redeployOnUpdate !== undefined
+        ? { redeploy_on_update: Boolean(requestedData.redeployOnUpdate) }
+        : {}),
+    };
+
+    const expectedScope = requestedData.scope ?? {};
+    if (type === 'computer') {
+      if (Array.isArray(expectedScope.computerIds)) expectedFields.scope = { ...(expectedFields.scope ?? {}), computerIds: this.toNumericIdArray(expectedScope.computerIds) };
+      if (Array.isArray(expectedScope.computerGroupIds)) expectedFields.scope = { ...(expectedFields.scope ?? {}), computerGroupIds: this.toNumericIdArray(expectedScope.computerGroupIds) };
+    } else {
+      if (Array.isArray(expectedScope.mobileDeviceIds)) expectedFields.scope = { ...(expectedFields.scope ?? {}), mobileDeviceIds: this.toNumericIdArray(expectedScope.mobileDeviceIds) };
+      if (Array.isArray(expectedScope.mobileDeviceGroupIds)) expectedFields.scope = { ...(expectedFields.scope ?? {}), mobileDeviceGroupIds: this.toNumericIdArray(expectedScope.mobileDeviceGroupIds) };
+    }
+
+    const expectedPayloadNormalized = this.normalizeConfigurationProfilePayloadString(requestedData.payloads);
+
+    let matchedReads = 0;
+    let completedChecks = 0;
+    let lastObservedFields: Record<string, unknown> = {};
+    let lastPayloadPersisted = false;
+    let lastMismatches: string[] = [];
+    let candidate: any = context.initialProfile ?? null;
+    const startedAt = Date.now();
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      const elapsedMs = Date.now() - startedAt;
+      if (maxDurationMs > 0 && elapsedMs > maxDurationMs) {
+        break;
+      }
+
+      candidate = attempt === 1 && context.initialProfile ? context.initialProfile : await this.getConfigurationProfileDetails(profileId, type);
+      completedChecks += 1;
+      const observed = this.extractConfigurationProfileObservedFields(candidate, type);
+      const observedPayloadNormalized = this.normalizeConfigurationProfilePayloadString(observed.payloads);
+      const payloadPersisted = observedPayloadNormalized === expectedPayloadNormalized;
+      const mismatches: string[] = [];
+
+      for (const [field, expectedValue] of Object.entries(expectedFields)) {
+        if (field === 'scope') {
+          const expectedScopeValue = expectedValue as Record<string, number[]>;
+          const observedScopeValue = (observed.scope ?? {}) as Record<string, number[]>;
+          for (const [scopeField, expectedIds] of Object.entries(expectedScopeValue)) {
+            const observedIds = this.toNumericIdArray(observedScopeValue[scopeField]);
+            if (!this.areNumericIdSetsEqual(expectedIds, observedIds)) {
+              mismatches.push(
+                `scope.${scopeField}(expected=${JSON.stringify(expectedIds)}, actual=${JSON.stringify(observedIds)})`
+              );
+            }
+          }
+          continue;
+        }
+
+        const actualValue = observed[field];
+        if (!this.policyValuesEqual(actualValue, expectedValue)) {
+          mismatches.push(`${field}(expected=${JSON.stringify(expectedValue)}, actual=${JSON.stringify(actualValue)})`);
+        }
+      }
+
+      if (mismatches.length === 0 && payloadPersisted) {
+        matchedReads += 1;
+        if (matchedReads >= requiredConsistentReads) {
+          return candidate;
+        }
+      } else {
+        matchedReads = 0;
+        lastObservedFields = observed;
+        lastPayloadPersisted = payloadPersisted;
+        lastMismatches = mismatches;
+      }
+
+      if (attempt < attempts) {
+        await this.sleep(delayMs * attempt);
+      }
+    }
+
+    const diagnostics = {
+      requestedFields: {
+        ...expectedFields,
+        payloads: this.summarizeConfigurationProfilePayload(requestedData.payloads),
+      },
+      observedFields: {
+        ...lastObservedFields,
+        payloads: this.summarizeConfigurationProfilePayload((lastObservedFields as any).payloads),
+      },
+      payloadPersisted: lastPayloadPersisted,
+      fallbackFromModern: context.fallbackFromModern,
+      modernStatus: context.modernStatus ?? null,
+      classicStatus: context.classicStatus ?? null,
+      verifyAttempts: completedChecks,
+    };
+    const sample = lastMismatches.slice(0, 8).join('; ');
+    throw new Error(
+      `Configuration profile ${profileId} ${context.operation} did not persist requested fields${sample ? `: ${sample}` : ''}. ${JSON.stringify(diagnostics)}`
+    );
+  }
+
+  /**
+   * Create configuration profile.
+   */
+  async createConfigurationProfile(type: ConfigurationProfileTypeInput, profileData: any): Promise<any> {
+    if (this._readOnlyMode) {
+      throw new Error('Cannot create configuration profiles in read-only mode');
+    }
+    await this.ensureAuthenticated();
+
+    const normalizedType = this.normalizeConfigurationProfileType(type);
+    const normalizedData = this.normalizeConfigurationProfileWriteData(normalizedType, profileData);
+
+    let fallbackFromModern = false;
+    let modernStatus: number | undefined;
+    let classicStatus: number | undefined;
+
+    try {
+      const modernPayload = this.buildModernConfigurationProfilePayload(normalizedType, normalizedData);
+      const response = await this.with409Retry(
+        async () => await this.axiosInstance.post(this.getConfigurationProfileModernEndpoint(normalizedType), modernPayload),
+        { operation: 'createConfigurationProfile', resourceType: 'configurationProfile', resourceId: normalizedData.name }
+      );
+      modernStatus = response.status;
+      const profileId = await this.resolveCreatedConfigurationProfileId(normalizedType, normalizedData, response);
+      if (!profileId) {
+        throw new Error(
+          `Configuration profile create did not return an id for strict verification. ${JSON.stringify({
+            requestedFields: {
+              name: normalizedData.name,
+            },
+            observedFields: {},
+            payloadPersisted: false,
+            fallbackFromModern: false,
+            modernStatus: modernStatus ?? null,
+            classicStatus: null,
+            verifyAttempts: 0,
+          })}`
+        );
+      }
+      return await this.verifyConfigurationProfileWritePersisted(profileId, normalizedType, normalizedData, {
+        operation: 'create',
+        fallbackFromModern,
+        modernStatus,
+        classicStatus,
+      });
+    } catch (error) {
+      modernStatus = getAxiosErrorStatus(error);
+      if (!this.shouldFallbackToClassicOnModernError(error)) {
+        throw error;
+      }
+      fallbackFromModern = true;
+    }
+
+    const classicPayload = this.buildClassicConfigurationProfilePayload(normalizedType, normalizedData);
+    try {
+      const response = await this.with409Retry(
+        async () => await this.axiosInstance.post(this.getConfigurationProfileClassicEndpoint(normalizedType), classicPayload),
+        { operation: 'createConfigurationProfileClassic', resourceType: 'configurationProfile', resourceId: normalizedData.name }
+      );
+      classicStatus = response.status;
+      const profileId = await this.resolveCreatedConfigurationProfileId(normalizedType, normalizedData, response);
+      if (!profileId) {
+        throw new Error(
+          `Configuration profile create did not return an id for strict verification. ${JSON.stringify({
+            requestedFields: {
+              name: normalizedData.name,
+            },
+            observedFields: {},
+            payloadPersisted: false,
+            fallbackFromModern,
+            modernStatus: modernStatus ?? null,
+            classicStatus: classicStatus ?? null,
+            verifyAttempts: 0,
+          })}`
+        );
+      }
+      return await this.verifyConfigurationProfileWritePersisted(profileId, normalizedType, normalizedData, {
+        operation: 'create',
+        fallbackFromModern,
+        modernStatus,
+        classicStatus,
+      });
+    } catch (error) {
+      classicStatus = getAxiosErrorStatus(error);
+      throw error;
+    }
+  }
+
+  /**
+   * Update configuration profile.
+   */
+  async updateConfigurationProfile(profileId: string, type: ConfigurationProfileTypeInput, profileData: any): Promise<any> {
+    if (this._readOnlyMode) {
+      throw new Error('Cannot update configuration profiles in read-only mode');
+    }
+    await this.ensureAuthenticated();
+
+    const normalizedType = this.normalizeConfigurationProfileType(type);
+    const lockKey = `${normalizedType}:${String(profileId)}`;
+    const normalizedData = this.normalizeConfigurationProfileWriteData(normalizedType, profileData);
+
+    return await this.withConfigurationProfileWriteLock(lockKey, async () => {
+      let fallbackFromModern = false;
+      let modernStatus: number | undefined;
+      let classicStatus: number | undefined;
+
+      try {
+        const existingProfile = await this.getConfigurationProfileDetails(profileId, normalizedType);
+        const modernPayload = {
+          ...existingProfile,
+          ...this.buildModernConfigurationProfilePayload(normalizedType, normalizedData),
+        };
+        const response = await this.with409Retry(
+          async () =>
+            await this.axiosInstance.put(
+              this.getConfigurationProfileModernEndpoint(normalizedType, profileId),
+              modernPayload
+            ),
+          { operation: 'updateConfigurationProfile', resourceType: 'configurationProfile', resourceId: String(profileId) }
+        );
+        modernStatus = response.status;
+        return await this.verifyConfigurationProfileWritePersisted(profileId, normalizedType, normalizedData, {
+          operation: 'update',
+          fallbackFromModern,
+          modernStatus,
+          classicStatus,
+        });
+      } catch (error) {
+        modernStatus = getAxiosErrorStatus(error);
+        if (!this.shouldFallbackToClassicOnModernError(error)) {
+          throw error;
+        }
+        fallbackFromModern = true;
+      }
+
+      const classicPayload = this.buildClassicConfigurationProfilePayload(normalizedType, normalizedData);
+      try {
+        const response = await this.with409Retry(
+          async () =>
+            await this.axiosInstance.put(
+              this.getConfigurationProfileClassicEndpoint(normalizedType, profileId),
+              classicPayload
+            ),
+          { operation: 'updateConfigurationProfileClassic', resourceType: 'configurationProfile', resourceId: String(profileId) }
+        );
+        classicStatus = response.status;
+        return await this.verifyConfigurationProfileWritePersisted(profileId, normalizedType, normalizedData, {
+          operation: 'update',
+          fallbackFromModern,
+          modernStatus,
+          classicStatus,
+        });
+      } catch (error) {
+        classicStatus = getAxiosErrorStatus(error);
+        throw error;
+      }
+    });
+  }
+
   /**
    * List all configuration profiles (both Computer and Mobile Device)
    * 
@@ -3149,15 +3751,14 @@ export class JamfApiClientHybrid {
    * 'os_x_configuration_profiles' (with underscores), not 'osx_configuration_profiles'.
    * This method handles both field names for compatibility.
    */
-  async listConfigurationProfiles(type: 'computer' | 'mobiledevice' = 'computer'): Promise<any[]> {
+  async listConfigurationProfiles(type: ConfigurationProfileTypeInput = 'computer'): Promise<any[]> {
     await this.ensureAuthenticated();
+    const normalizedType = this.normalizeConfigurationProfileType(type);
     
     try {
       // Try Modern API first
-      logger.info(`Listing ${type} configuration profiles using Modern API...`);
-      const endpoint = type === 'computer' 
-        ? '/api/v2/computer-configuration-profiles' 
-        : '/api/v2/mobile-device-configuration-profiles';
+      logger.info(`Listing ${normalizedType} configuration profiles using Modern API...`);
+      const endpoint = this.getConfigurationProfileModernEndpoint(normalizedType);
       
       const response = await this.axiosInstance.get(endpoint);
       return response.data.results || [];
@@ -3173,7 +3774,7 @@ export class JamfApiClientHybrid {
       
       // Fall back to Classic API
       try {
-        const endpoint = type === 'computer'
+        const endpoint = normalizedType === 'computer'
           ? '/JSSResource/osxconfigurationprofiles'
           : '/JSSResource/mobiledeviceconfigurationprofiles';
         
@@ -3183,11 +3784,11 @@ export class JamfApiClientHybrid {
         logger.info(`Classic API response data keys:`, Object.keys(response.data));
         
         // Classic API returns os_x_configuration_profiles (with underscores) for computers
-        const profiles = type === 'computer' 
+        const profiles = normalizedType === 'computer' 
           ? (response.data.os_x_configuration_profiles || response.data.osx_configuration_profiles || [])
           : (response.data.configuration_profiles || response.data.mobiledeviceconfigurationprofiles || []);
         
-        logger.info(`Found ${profiles ? profiles.length : 0} ${type} configuration profiles from Classic API`);
+        logger.info(`Found ${profiles ? profiles.length : 0} ${normalizedType} configuration profiles from Classic API`);
         return profiles || [];
       } catch (classicError) {
         logger.info('Classic API also failed:', classicError);
@@ -3199,17 +3800,22 @@ export class JamfApiClientHybrid {
   /**
    * Get configuration profile details
    */
-  async getConfigurationProfileDetails(profileId: string, type: 'computer' | 'mobiledevice' = 'computer'): Promise<any> {
+  async getConfigurationProfileDetails(profileId: string, type: ConfigurationProfileTypeInput = 'computer'): Promise<any> {
     await this.ensureAuthenticated();
+    const normalizedType = this.normalizeConfigurationProfileType(type);
     
     try {
       // Try Modern API first
-      logger.info(`Getting ${type} configuration profile ${profileId} using Modern API...`);
-      const endpoint = type === 'computer'
-        ? `/api/v2/computer-configuration-profiles/${profileId}`
-        : `/api/v2/mobile-device-configuration-profiles/${profileId}`;
+      logger.info(`Getting ${normalizedType} configuration profile ${profileId} using Modern API...`);
+      const endpoint = this.getConfigurationProfileModernEndpoint(normalizedType, profileId);
       
-      const response = await this.axiosInstance.get(endpoint);
+      const response = await this.axiosInstance.get(endpoint, {
+        headers: {
+          'Cache-Control': 'no-cache',
+          Pragma: 'no-cache',
+        },
+        params: { _ts: Date.now() },
+      });
       return response.data;
     } catch (error) {
       logger.info(`Modern API failed, trying Classic API...`, {
@@ -3223,22 +3829,28 @@ export class JamfApiClientHybrid {
       
       // Fall back to Classic API
       try {
-        const endpoint = type === 'computer'
+        const endpoint = normalizedType === 'computer'
           ? `/JSSResource/osxconfigurationprofiles/id/${profileId}`
           : `/JSSResource/mobiledeviceconfigurationprofiles/id/${profileId}`;
         
-        const response = await this.axiosInstance.get(endpoint);
+        const response = await this.axiosInstance.get(endpoint, {
+          headers: {
+            'Cache-Control': 'no-cache',
+            Pragma: 'no-cache',
+          },
+          params: { _ts: Date.now() },
+        });
         
         // Debug logging to see response structure
         logger.info(`Classic API response data keys:`, Object.keys(response.data));
         
         // Classic API returns os_x_configuration_profile (with underscores) for computers in detail responses
-        const profile = type === 'computer' 
+        const profile = normalizedType === 'computer' 
           ? (response.data.os_x_configuration_profile || response.data.osx_configuration_profile)
           : (response.data.configuration_profile || response.data.mobiledeviceconfigurationprofile);
           
         if (!profile) {
-          throw new Error(`Profile data not found in response for ${type} profile ${profileId}`);
+          throw new Error(`Profile data not found in response for ${normalizedType} profile ${profileId}`);
         }
           
         return profile;
@@ -3252,8 +3864,9 @@ export class JamfApiClientHybrid {
   /**
    * Search configuration profiles by name
    */
-  async searchConfigurationProfiles(query: string, type: 'computer' | 'mobiledevice' = 'computer'): Promise<any[]> {
-    const allProfiles = await this.listConfigurationProfiles(type);
+  async searchConfigurationProfiles(query: string, type: ConfigurationProfileTypeInput = 'computer'): Promise<any[]> {
+    const normalizedType = this.normalizeConfigurationProfileType(type);
+    const allProfiles = await this.listConfigurationProfiles(normalizedType);
     
     // Filter profiles by name (case-insensitive)
     const searchQuery = query.toLowerCase();
@@ -3266,27 +3879,25 @@ export class JamfApiClientHybrid {
   /**
    * Deploy configuration profile to devices
    */
-  async deployConfigurationProfile(profileId: string, deviceIds: string[], type: 'computer' | 'mobiledevice' = 'computer'): Promise<void> {
+  async deployConfigurationProfile(profileId: string, deviceIds: string[], type: ConfigurationProfileTypeInput = 'computer'): Promise<void> {
     if (this._readOnlyMode) {
       throw new Error('Cannot deploy configuration profiles in read-only mode');
     }
     
     await this.ensureAuthenticated();
+    const normalizedType = this.normalizeConfigurationProfileType(type);
     
     // Get current profile details to update scope
-    const profile = await this.getConfigurationProfileDetails(profileId, type);
+    const profile = await this.getConfigurationProfileDetails(profileId, normalizedType);
     
     try {
       // Modern API approach - update the profile scope
-      logger.info(`Deploying ${type} configuration profile ${profileId} using Modern API...`);
-      
-      const endpoint = type === 'computer'
-        ? `/api/v2/computer-configuration-profiles/${profileId}`
-        : `/api/v2/mobile-device-configuration-profiles/${profileId}`;
+      logger.info(`Deploying ${normalizedType} configuration profile ${profileId} using Modern API...`);
+      const endpoint = this.getConfigurationProfileModernEndpoint(normalizedType, profileId);
       
       // Add devices to the profile scope
       const currentScope = profile.scope || {};
-      const currentDevices = type === 'computer' 
+      const currentDevices = normalizedType === 'computer' 
         ? (currentScope.computerIds || [])
         : (currentScope.mobileDeviceIds || []);
       
@@ -3296,12 +3907,12 @@ export class JamfApiClientHybrid {
         ...profile,
         scope: {
           ...currentScope,
-          [type === 'computer' ? 'computerIds' : 'mobileDeviceIds']: updatedDeviceIds
+          [normalizedType === 'computer' ? 'computerIds' : 'mobileDeviceIds']: updatedDeviceIds
         }
       };
       
       await this.axiosInstance.put(endpoint, updatePayload);
-      logger.info(`Successfully deployed profile ${profileId} to ${deviceIds.length} ${type}(s)`);
+      logger.info(`Successfully deployed profile ${profileId} to ${deviceIds.length} ${normalizedType}(s)`);
     } catch (error) {
       logger.info(`Modern API failed, trying Classic API...`, {
         status: getAxiosErrorStatus(error),
@@ -3314,19 +3925,19 @@ export class JamfApiClientHybrid {
       
       // Fall back to Classic API
       try {
-        const endpoint = type === 'computer'
+        const endpoint = normalizedType === 'computer'
           ? `/JSSResource/osxconfigurationprofiles/id/${profileId}`
           : `/JSSResource/mobiledeviceconfigurationprofiles/id/${profileId}`;
         
         // For Classic API, we need to update the scope XML
-        const scopeKey = type === 'computer' ? 'computers' : 'mobile_devices';
+        const scopeKey = normalizedType === 'computer' ? 'computers' : 'mobile_devices';
         const currentDevices = profile.scope?.[scopeKey] || [];
         
         const newDevices = deviceIds.map(id => ({ id: parseInt(id) }));
         const updatedDevices = [...currentDevices, ...newDevices];
         
         const updatePayload = {
-          [type === 'computer' ? 'os_x_configuration_profile' : 'configuration_profile']: {
+          [normalizedType === 'computer' ? 'os_x_configuration_profile' : 'configuration_profile']: {
             scope: {
               [scopeKey]: updatedDevices
             }
@@ -3334,7 +3945,7 @@ export class JamfApiClientHybrid {
         };
         
         await this.axiosInstance.put(endpoint, updatePayload);
-        logger.info(`Successfully deployed profile ${profileId} to ${deviceIds.length} ${type}(s) via Classic API`);
+        logger.info(`Successfully deployed profile ${profileId} to ${deviceIds.length} ${normalizedType}(s) via Classic API`);
       } catch (classicError) {
         logger.info('Classic API also failed:', classicError);
         throw classicError;
@@ -3345,27 +3956,25 @@ export class JamfApiClientHybrid {
   /**
    * Remove configuration profile from devices
    */
-  async removeConfigurationProfile(profileId: string, deviceIds: string[], type: 'computer' | 'mobiledevice' = 'computer'): Promise<void> {
+  async removeConfigurationProfile(profileId: string, deviceIds: string[], type: ConfigurationProfileTypeInput = 'computer'): Promise<void> {
     if (this._readOnlyMode) {
       throw new Error('Cannot remove configuration profiles in read-only mode');
     }
     
     await this.ensureAuthenticated();
+    const normalizedType = this.normalizeConfigurationProfileType(type);
     
     // Get current profile details to update scope
-    const profile = await this.getConfigurationProfileDetails(profileId, type);
+    const profile = await this.getConfigurationProfileDetails(profileId, normalizedType);
     
     try {
       // Modern API approach - update the profile scope
-      logger.info(`Removing ${type} configuration profile ${profileId} using Modern API...`);
-      
-      const endpoint = type === 'computer'
-        ? `/api/v2/computer-configuration-profiles/${profileId}`
-        : `/api/v2/mobile-device-configuration-profiles/${profileId}`;
+      logger.info(`Removing ${normalizedType} configuration profile ${profileId} using Modern API...`);
+      const endpoint = this.getConfigurationProfileModernEndpoint(normalizedType, profileId);
       
       // Remove devices from the profile scope
       const currentScope = profile.scope || {};
-      const currentDevices = type === 'computer' 
+      const currentDevices = normalizedType === 'computer' 
         ? (currentScope.computerIds || [])
         : (currentScope.mobileDeviceIds || []);
       
@@ -3375,12 +3984,12 @@ export class JamfApiClientHybrid {
         ...profile,
         scope: {
           ...currentScope,
-          [type === 'computer' ? 'computerIds' : 'mobileDeviceIds']: updatedDeviceIds
+          [normalizedType === 'computer' ? 'computerIds' : 'mobileDeviceIds']: updatedDeviceIds
         }
       };
       
       await this.axiosInstance.put(endpoint, updatePayload);
-      logger.info(`Successfully removed profile ${profileId} from ${deviceIds.length} ${type}(s)`);
+      logger.info(`Successfully removed profile ${profileId} from ${deviceIds.length} ${normalizedType}(s)`);
     } catch (error) {
       logger.info(`Modern API failed, trying Classic API...`, {
         status: getAxiosErrorStatus(error),
@@ -3393,12 +4002,12 @@ export class JamfApiClientHybrid {
       
       // Fall back to Classic API
       try {
-        const endpoint = type === 'computer'
+        const endpoint = normalizedType === 'computer'
           ? `/JSSResource/osxconfigurationprofiles/id/${profileId}`
           : `/JSSResource/mobiledeviceconfigurationprofiles/id/${profileId}`;
         
         // For Classic API, we need to update the scope XML
-        const scopeKey = type === 'computer' ? 'computers' : 'mobile_devices';
+        const scopeKey = normalizedType === 'computer' ? 'computers' : 'mobile_devices';
         const currentDevices = profile.scope?.[scopeKey] || [];
         
         const deviceIdsToRemove = deviceIds.map(id => parseInt(id));
@@ -3407,7 +4016,7 @@ export class JamfApiClientHybrid {
         );
         
         const updatePayload = {
-          [type === 'computer' ? 'os_x_configuration_profile' : 'configuration_profile']: {
+          [normalizedType === 'computer' ? 'os_x_configuration_profile' : 'configuration_profile']: {
             scope: {
               [scopeKey]: updatedDevices
             }
@@ -3415,7 +4024,7 @@ export class JamfApiClientHybrid {
         };
         
         await this.axiosInstance.put(endpoint, updatePayload);
-        logger.info(`Successfully removed profile ${profileId} from ${deviceIds.length} ${type}(s) via Classic API`);
+        logger.info(`Successfully removed profile ${profileId} from ${deviceIds.length} ${normalizedType}(s) via Classic API`);
       } catch (classicError) {
         logger.info('Classic API also failed:', classicError);
         throw classicError;
